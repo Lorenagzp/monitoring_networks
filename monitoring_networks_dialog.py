@@ -959,6 +959,10 @@ class MonitoringNetworksDialog(QDialog):
             zorder=5,
         )
 
+        point_ids = param_data.get('point_ids')
+        if point_ids is not None:
+            self._annotate_well_id_labels(ax, coordinates, point_ids)
+
         ax.set_xlabel(QCoreApplication.translate("Tab 5", "X"))
         ax.set_ylabel(QCoreApplication.translate("Tab 5", "Y"))
         ax.set_title(
@@ -1258,8 +1262,8 @@ class MonitoringNetworksDialog(QDialog):
         ax = self.variance_ax
         ax.clear()
 
-        n_points = results['n_points']
-        varianzas = results['normalized_variances']
+        n_points = np.asarray(results['n_points'], dtype=float)
+        varianzas = np.asarray(results['normalized_variances'], dtype=float)
 
         ax.plot(
             n_points,
@@ -1270,6 +1274,32 @@ class MonitoringNetworksDialog(QDialog):
             markersize=5,
             label=QCoreApplication.translate("Tab 4", "Kalman filter"),
         )
+
+        var_initial = float(varianzas[0])
+        var_final = float(varianzas[-1])
+        total_reduction = var_initial - var_final
+        if total_reduction > 0:
+            level_90 = var_initial - 0.9 * total_reduction
+            level_95 = var_initial - 0.95 * total_reduction
+            ax.axhline(
+                level_90,
+                linestyle='--',
+                color='#e67e22',
+                linewidth=1.2,
+                label=QCoreApplication.translate(
+                    "Tab 4", "90% of maximum reduction"
+                ),
+            )
+            ax.axhline(
+                level_95,
+                linestyle='--',
+                color='#c0392b',
+                linewidth=1.2,
+                label=QCoreApplication.translate(
+                    "Tab 4", "95% of maximum reduction"
+                ),
+            )
+
         ax.set_xlabel(
             QCoreApplication.translate("Tab 4", "Number of monitoring points")
         )
@@ -1283,10 +1313,48 @@ class MonitoringNetworksDialog(QDialog):
         )
         ax.set_xlim(left=0)
         ax.grid(True, alpha=0.3)
-        ax.legend(loc='best', fontsize=9)
+        ax.legend(loc='best', fontsize=8)
+
+        selection_order = results.get('selection_order')
+        param_data = self._get_mn_parameter_data(attr_name)
+        if selection_order is not None and param_data is not None:
+            point_ids = param_data.get('point_ids')
+            if point_ids is not None:
+                for step, well_idx in enumerate(selection_order, start=1):
+                    if step >= len(n_points):
+                        break
+                    ax.annotate(
+                        str(point_ids[well_idx]),
+                        (n_points[step], varianzas[step]),
+                        textcoords='offset points',
+                        xytext=(4, 4),
+                        fontsize=6,
+                        ha='left',
+                        va='bottom',
+                    )
 
         self.variance_figure.tight_layout()
         self.variance_canvas.draw()
+
+    def _annotate_well_id_labels(self, ax, coordinates, point_ids, indices=None):
+        """Draws well ID text next to each point on a spatial axes."""
+        if point_ids is None or coordinates is None:
+            return
+
+        coords = np.asarray(coordinates, dtype=float)
+        if indices is None:
+            indices = range(coords.shape[0])
+
+        for idx in indices:
+            ax.annotate(
+                str(point_ids[idx]),
+                (coords[idx, 0], coords[idx, 1]),
+                textcoords='offset points',
+                xytext=(4, 4),
+                fontsize=7,
+                ha='left',
+                va='bottom',
+            )
 
     def _get_mn_parameter_data(self, attr_name):
         """
@@ -1321,9 +1389,14 @@ class MonitoringNetworksDialog(QDialog):
                 raw_well_weights, raw_values, transform
             )
 
+        aligned_point_ids = align_point_ids_with_transform(
+            point_ids, raw_values, transform
+        )
+
         return {
             'coordinates': coordinates,
             'values': values,
+            'point_ids': aligned_point_ids,
             'well_weights': well_weights,
             'state': state,
         }
