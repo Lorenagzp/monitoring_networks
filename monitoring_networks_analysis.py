@@ -27,6 +27,7 @@ import os
 import gstools as gs
 import numpy as np
 from scipy import stats
+from scipy.spatial.distance import cdist
 
 from qgis.PyQt import uic
 from qgis.PyQt import QtWidgets
@@ -38,6 +39,11 @@ STAT_KEYS = (
 
 _ID_FIELD_HINTS = (
     'id', 'fid', 'clave', 'cve', 'pozo', 'well', 'name', 'nombre',
+)
+
+_WELL_WEIGHT_FIELD_HINTS = (
+    'peso_pozo', 'well_weight', 'w_pozo', 'peso_w',
+    'weight_well', 'pozo_peso','w'
 )
 
 class MonitoringNetworksAnalysis:
@@ -220,32 +226,72 @@ def resolve_point_id_field(layer, attribute):
     return None
 
 
-def extract_point_records_from_layer(layer, attribute, id_field=None):
+def resolve_well_weight_field(layer, attribute):
     """
-    Extracts point IDs, coordinates and values from a layer attribute.
+    Picks a layer field to use as per-well weight during prioritization.
+
+    Matches common weight column names (same keywords as geostat_app_kalman_v10).
+    Skips the analysis attribute and ID-like fields.
+    """
+    from qgis.core import QgsVectorLayer
+
+    if not isinstance(layer, QgsVectorLayer):
+        return None
+
+    attr_lower = attribute.lower()
+    for field in layer.fields():
+        name = field.name()
+        lower = name.lower().strip()
+        if lower == attr_lower:
+            continue
+        if lower in _ID_FIELD_HINTS or lower.endswith('id') or lower.endswith('cve'):
+            continue
+        if lower in _WELL_WEIGHT_FIELD_HINTS:
+            return name
+    return None
+
+
+def _sanitize_well_weights(weights):
+    """Ensures well weights are positive (non-positive values are replaced)."""
+    weights = np.asarray(weights, dtype=float)
+    if weights.size == 0:
+        return weights
+    positive = weights[weights > 0]
+    fallback = float(np.min(positive)) if positive.size > 0 else 1.0
+    return np.where(weights > 0, weights, fallback)
+
+
+def extract_point_records_from_layer(layer, attribute, id_field=None, weight_field=None):
+    """
+    Extracts point IDs, coordinates, values and optional well weights.
 
     Returns:
-        tuple: (point_ids, coordinates, values, null_count)
-        point_ids are strings (from id_field or QGIS feature id).
+        tuple: (point_ids, coordinates, values, null_count, well_weights)
+        well_weights are 1.0 when no weight field is available.
     """
     try:
         from qgis.core import QgsVectorLayer
         from PyQt5.QtCore import QVariant
 
         if not isinstance(layer, QgsVectorLayer):
-            return None, None, None, 0
+            return None, None, None, 0, None
 
         field_index = layer.fields().indexOf(attribute)
         if field_index == -1:
-            return None, None, None, 0
+            return None, None, None, 0, None
 
         if id_field is None:
             id_field = resolve_point_id_field(layer, attribute)
         id_index = layer.fields().indexOf(id_field) if id_field else -1
 
+        if weight_field is None:
+            weight_field = resolve_well_weight_field(layer, attribute)
+        weight_index = layer.fields().indexOf(weight_field) if weight_field else -1
+
         point_ids = []
         coordinates = []
         values = []
+        well_weights = []
         null_count = 0
 
         for feature in layer.getFeatures():
@@ -280,21 +326,34 @@ def extract_point_records_from_layer(layer, attribute, id_field=None):
             else:
                 point_id = str(feature.id())
 
+            weight = 1.0
+            if weight_index >= 0:
+                raw_weight = feature[weight_field]
+                if raw_weight is not None and not (
+                    isinstance(raw_weight, QVariant) and raw_weight.isNull()
+                ):
+                    try:
+                        weight = float(raw_weight)
+                    except (ValueError, TypeError):
+                        weight = 1.0
+
             point_ids.append(point_id)
             coordinates.append([point.x(), point.y()])
             values.append(float_value)
+            well_weights.append(weight)
 
         if not point_ids:
-            return None, None, None, null_count
+            return None, None, None, null_count, None
 
         return (
             np.array(point_ids, dtype=object),
             np.array(coordinates),
             np.array(values),
             null_count,
+            _sanitize_well_weights(np.array(well_weights)),
         )
     except Exception:
-        return None, None, None, 0
+        return None, None, None, 0, None
 
 
 def align_point_ids_with_transform(point_ids, raw_values, transform='none'):
@@ -304,6 +363,15 @@ def align_point_ids_with_transform(point_ids, raw_values, transform='none'):
     if transform in ('none', 0):
         return point_ids
     return point_ids[raw_values > 0]
+
+
+def align_well_weights_with_transform(well_weights, raw_values, transform='none'):
+    """Keeps well weights aligned with align_coordinates_with_transform filtering."""
+    well_weights = np.asarray(well_weights, dtype=float)
+    raw_values = np.asarray(raw_values, dtype=float)
+    if transform in ('none', 0):
+        return well_weights
+    return well_weights[raw_values > 0]
 
 
 def build_covariance_model(model_type, nugget, sill, range_val):
@@ -392,28 +460,56 @@ def run_leave_one_out_cross_validation(
     return {'summary': summary, 'rows': rows}
 
 
-def _mean_simple_kriging_variance(cond_coords, cond_vals, grid_coords, model, mean):
-    """Mean simple-kriging variance over a set of grid nodes."""
+def normalized_grid_weights(grid_weights):
+    """
+    Normalizes grid node weights for weighted variance aggregation.
+
+    Same convention as geostat_app_kalman_v10: pesos_norm = pesos * n / sum(pesos).
+    """
+    weights = _sanitize_well_weights(np.asarray(grid_weights, dtype=float).ravel())
+    if weights.size == 0:
+        return None
+    return weights * weights.size / np.sum(weights)
+
+
+def _mean_simple_kriging_variance(cond_coords, cond_vals, grid_coords, model, grid_weights=None):
+    """
+    Normalized sum of ordinary-kriging variances on the estimation grid.
+
+    Same metric as calcular_varianza_kriging in geostat_app_kalman_v10 (phase 2),
+    without grid or well weights.
+    """
     grid_coords = np.asarray(grid_coords, dtype=float)
-    if cond_coords is None or len(np.asarray(cond_vals).ravel()) == 0:
-        return float(model.var + model.nugget)
+    cond_vals = np.asarray(cond_vals, dtype=float).ravel()
+    if cond_coords is None or cond_vals.size == 0:
+        return np.inf
 
     cond_coords = np.asarray(cond_coords, dtype=float)
-    cond_vals = np.asarray(cond_vals, dtype=float).ravel()
     gx = grid_coords[:, 0]
     gy = grid_coords[:, 1]
     cx = cond_coords[:, 0]
     cy = cond_coords[:, 1]
 
-    krige = gs.krige.Simple(
+    partial_sill = float(model.var)
+    nugget_value = float(model.nugget)
+    sill_total = partial_sill + nugget_value
+    norm_factor = sill_total if sill_total > 0 else 1.0
+
+    krige = gs.krige.Ordinary(
         model,
         cond_pos=(cx, cy),
         cond_val=cond_vals,
-        mean=float(mean),
     )
-    _, variance = krige((gx, gy), return_var=True)
-    variance = np.asarray(variance, dtype=float).ravel()
-    return float(np.mean(variance))
+    krige((gx, gy))
+    krige_var = np.asarray(krige.krige_var, dtype=float).ravel()
+
+    if grid_weights is not None:
+        grid_weights = np.asarray(grid_weights, dtype=float).ravel()
+        if grid_weights.size == krige_var.size:
+            pesos_norm = normalized_grid_weights(grid_weights)
+            return float(np.dot(krige_var, pesos_norm) / norm_factor / 2.0)
+
+    return float(np.sum(krige_var) / norm_factor / 2.0)
 
 
 def compute_simple_kriging_variance_reduction_curve(
@@ -425,74 +521,198 @@ def compute_simple_kriging_variance_reduction_curve(
     sill,
     range_val,
     max_grid_nodes=500,
+    well_weights=None,
+    grid_weights=None,
 ):
     """
-    Greedy simple-kriging variance reduction curve for network optimization.
+    Kalman-filter well prioritization (geostat_app_kalman_v10 ejecutar_kalman).
 
-    Wells are added one at a time: at each step the remaining well that yields
-    the lowest mean simple-kriging variance on the estimation grid is selected.
+    Phase 1: greedy rank-1 Kalman updates on the covariance matrices determine
+    the optimal selection order (equivalent to simple kriging, fast).
+
+    Phase 2: normalized ordinary-kriging variance is evaluated along that
+    order for a comparable variance-reduction curve.
+
+    When well_weights is provided, phase 1 scores each candidate as
+    well_weights[k] * weighted grid variance reduction.
+
+    When grid_weights is provided, phase 1 uses dot(reduction, pesos_norm) and
+    phase 2 uses weighted OK variance aggregation (geostat_app_kalman_v10).
 
     Returns:
-        dict with n_points, mean_variance, variance_reduction (%), selection_order;
-        None when there are fewer than two wells or grid nodes.
+        dict with n_points, normalized_variances, variance_reduction (%),
+        selection_order, grid_nodes_used; None if inputs are insufficient.
     """
     well_coordinates = np.asarray(well_coordinates, dtype=float)
     well_values = np.asarray(well_values, dtype=float).ravel()
     grid_coordinates = np.asarray(grid_coordinates, dtype=float)
-    n_wells = well_coordinates.shape[0]
+    n_candidates = well_coordinates.shape[0]
+    n_grid = grid_coordinates.shape[0]
 
-    if n_wells < 2 or grid_coordinates.shape[0] < 1:
+    if well_weights is not None:
+        well_weights = np.asarray(well_weights, dtype=float).ravel()
+        if well_weights.size != n_candidates:
+            well_weights = None
+
+    pesos_norm = None
+    if grid_weights is not None:
+        grid_weights = np.asarray(grid_weights, dtype=float).ravel()
+        if grid_weights.size != n_grid:
+            grid_weights = None
+        else:
+            pesos_norm = normalized_grid_weights(grid_weights)
+
+    if n_candidates < 1 or n_grid < 1:
         return None
 
-    if grid_coordinates.shape[0] > max_grid_nodes:
+    if n_grid > max_grid_nodes:
         rng = np.random.default_rng(0)
-        pick = rng.choice(
-            grid_coordinates.shape[0], size=max_grid_nodes, replace=False
-        )
+        pick = rng.choice(n_grid, size=max_grid_nodes, replace=False)
         grid_coordinates = grid_coordinates[pick]
+        if grid_weights is not None:
+            grid_weights = grid_weights[pick]
+            pesos_norm = normalized_grid_weights(grid_weights)
+        n_grid = grid_coordinates.shape[0]
 
     model = build_covariance_model(model_type, nugget, sill, range_val)
-    sk_mean = float(np.mean(well_values))
-    prior_variance = float(model.var + model.nugget)
+    partial_sill = float(model.var)
+    R = max(float(model.nugget), 1e-6)
 
-    available = list(range(n_wells))
+    dist_gc = cdist(grid_coordinates, well_coordinates)
+    C_gc = model.covariance(dist_gc).astype(np.float64)
+
+    dist_cc = cdist(well_coordinates, well_coordinates)
+    C_cc = model.covariance(dist_cc).astype(np.float64)
+
+    var_grid = np.full(n_grid, partial_sill, dtype=np.float64)
+
+    def kalman_update(k):
+        nonlocal var_grid, C_gc, C_cc
+        c_gk = C_gc[:, k].copy()
+        c_ck = C_cc[:, k].copy()
+        sigma_kk = C_cc[k, k]
+        S = sigma_kk + R
+        if S <= 1e-12:
+            return
+        inv_S = 1.0 / S
+        var_grid -= (c_gk ** 2) * inv_S
+        np.maximum(var_grid, 0.0, out=var_grid)
+        C_gc -= np.outer(c_gk, c_ck) * inv_S
+        C_cc -= np.outer(c_ck, c_ck) * inv_S
+
     selected = []
-    n_points = [0]
-    mean_variances = [prior_variance]
-    selection_order = []
+    disponibles = list(range(n_candidates))
 
-    while available:
-        best_idx = None
-        best_variance = np.inf
-        for idx in available:
-            trial_idx = selected + [idx]
-            trial_coords = well_coordinates[trial_idx]
-            trial_vals = well_values[trial_idx]
-            trial_var = _mean_simple_kriging_variance(
-                trial_coords, trial_vals, grid_coordinates, model, sk_mean
-            )
-            if trial_var < best_variance:
-                best_variance = trial_var
-                best_idx = idx
+    for _step in range(len(disponibles)):
+        mejor_idx = None
+        mejor_score = -np.inf
 
-        selected.append(best_idx)
-        available.remove(best_idx)
-        selection_order.append(best_idx)
-        n_points.append(len(selected))
-        mean_variances.append(best_variance)
+        for k in disponibles:
+            c_gk = C_gc[:, k]
+            sigma_kk = C_cc[k, k]
+            S = sigma_kk + R
+            if S <= 1e-12:
+                continue
+            reduccion_por_nodo = (c_gk ** 2) / S
+            if pesos_norm is not None:
+                reduccion_total = float(np.dot(reduccion_por_nodo, pesos_norm))
+            else:
+                reduccion_total = float(np.sum(reduccion_por_nodo))
+            peso_k = well_weights[k] if well_weights is not None else 1.0
+            score = peso_k * reduccion_total
+            if score > mejor_score:
+                mejor_score = score
+                mejor_idx = k
 
-    mean_variances = np.asarray(mean_variances, dtype=float)
-    if prior_variance > 0:
-        variance_reduction = (1.0 - mean_variances / prior_variance) * 100.0
+        if mejor_idx is not None and mejor_score > 1e-15:
+            kalman_update(mejor_idx)
+            selected.append(mejor_idx)
+            disponibles.remove(mejor_idx)
+        else:
+            selected.extend(disponibles)
+            break
+
+    num_puntos = [0]
+    varianzas = [float(n_grid)]
+
+    indices_acumulados = []
+    for idx in selected:
+        indices_acumulados.append(idx)
+        sel_coords = well_coordinates[indices_acumulados]
+        sel_vals = well_values[indices_acumulados]
+        var_ok = _mean_simple_kriging_variance(
+            sel_coords, sel_vals, grid_coordinates, model, grid_weights=grid_weights
+        )
+        varianzas.append(var_ok)
+        num_puntos.append(len(indices_acumulados))
+
+    varianzas = np.asarray(varianzas, dtype=float)
+    num_puntos = np.asarray(num_puntos, dtype=int)
+    var_inicial = varianzas[0]
+    if var_inicial > 0:
+        variance_reduction = (1.0 - varianzas / var_inicial) * 100.0
     else:
-        variance_reduction = np.zeros_like(mean_variances)
+        variance_reduction = np.zeros_like(varianzas)
 
     return {
-        'n_points': np.asarray(n_points, dtype=int),
-        'mean_variance': mean_variances,
+        'n_points': num_puntos,
+        'normalized_variances': varianzas,
         'variance_reduction': variance_reduction,
-        'selection_order': np.asarray(selection_order, dtype=int),
-        'prior_variance': prior_variance,
-        'sk_mean': sk_mean,
-        'grid_nodes_used': int(grid_coordinates.shape[0]),
+        'selection_order': np.asarray(selected, dtype=int),
+        'grid_nodes_used': int(n_grid),
     }
+
+
+def ordinary_kriging_interpolation(
+    well_coordinates,
+    well_values,
+    grid_coordinates,
+    model_type,
+    nugget,
+    sill,
+    range_val,
+):
+    """
+    Ordinary-kriging estimates at grid nodes using the fitted variogram model.
+
+    Returns:
+        1-D array of estimated values at each grid point, or None on failure.
+    """
+    well_coordinates = np.asarray(well_coordinates, dtype=float)
+    well_values = np.asarray(well_values, dtype=float).ravel()
+    grid_coordinates = np.asarray(grid_coordinates, dtype=float)
+
+    if well_values.size < 1 or grid_coordinates.shape[0] < 1:
+        return None
+
+    model = build_covariance_model(model_type, nugget, sill, range_val)
+    cx = well_coordinates[:, 0]
+    cy = well_coordinates[:, 1]
+    gx = grid_coordinates[:, 0]
+    gy = grid_coordinates[:, 1]
+
+    krige = gs.krige.Ordinary(
+        model,
+        cond_pos=(cx, cy),
+        cond_val=well_values,
+    )
+    result = krige((gx, gy))
+    n_grid = grid_coordinates.shape[0]
+
+    # Prefer the field stored on the krige object after evaluation
+    if hasattr(krige, 'field') and krige.field is not None:
+        estimates = np.asarray(krige.field, dtype=float)
+    elif isinstance(result, tuple):
+        estimates = np.asarray(result[0], dtype=float)
+    else:
+        estimates = np.asarray(result, dtype=float)
+
+    estimates = np.asarray(estimates, dtype=float).ravel()
+    if estimates.size != n_grid and estimates.size > n_grid:
+        # Avoid duplicated values when gstools returns stacked outputs
+        estimates = estimates[:n_grid]
+
+    if estimates.size != n_grid:
+        return None
+
+    return estimates
