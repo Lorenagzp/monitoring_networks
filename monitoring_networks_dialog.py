@@ -30,7 +30,7 @@ from qgis.PyQt.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
                                 QTabWidget, QWidget, QComboBox, QListWidget,
                                 QTableWidget, QTableWidgetItem, QSpinBox, QDoubleSpinBox,
                                 QLabel, QGroupBox, QCheckBox,
-                                QProgressBar, QTextEdit, QMessageBox,
+                                QProgressBar, QTextEdit, QMessageBox, QFileDialog,
                                 QAbstractItemView, QHeaderView, QGridLayout, QScrollArea,
                                 QApplication,
                                 QSizePolicy)
@@ -54,8 +54,12 @@ from .monitoring_networks_analysis import (
     resolve_well_weight_field,
     compute_descriptive_stats,
     run_leave_one_out_cross_validation,
+    run_network_cross_validation,
     compute_simple_kriging_variance_reduction_curve,
+    compute_weighted_multi_parameter_variance_reduction_curve,
     ordinary_kriging_interpolation,
+    write_excel_sheets,
+    read_excel_table_rows,
     STAT_KEYS,
 )
 
@@ -91,6 +95,9 @@ CV_COL_ERROR = 4
 CV_COL_SE = 5
 CV_COL_STD_ERROR = 6
 
+# Internal combo item data for tab 4 multi-parameter optimization (not translated).
+MN_COMBINED_PARAMETERS_KEY = '__mn_combined_parameters__'
+
 
 class MonitoringNetworksDialog(QDialog):
     """Main dialog of the plugin"""
@@ -108,7 +115,9 @@ class MonitoringNetworksDialog(QDialog):
         self._cached_point_ids = None
         self._cached_null_count = 0
         self.stats_map_colorbar = None
-        self.results_interp_colorbar = None
+        self.results_all_interp_colorbar = None
+        self.results_sel_interp_colorbar = None
+        self.results_interp_color_limits = None
         self._syncing_variogram = False
         self.init_ui()
         self.current_grid_points = None  # Store grid generated in tab 3 (array of points)
@@ -645,6 +654,13 @@ class MonitoringNetworksDialog(QDialog):
         )
         self.mn_optimize_btn.clicked.connect(self.optimize_monitoring_network)
         optimize_btn_row.addWidget(self.mn_optimize_btn)
+        self.mn_download_prioritization_btn = QPushButton(
+            QCoreApplication.translate("Tab 4", "Download prioritization")
+        )
+        self.mn_download_prioritization_btn.clicked.connect(
+            self.download_prioritization
+        )
+        optimize_btn_row.addWidget(self.mn_download_prioritization_btn)
         optimize_btn_row.addStretch()
         variance_layout.addLayout(optimize_btn_row)
 
@@ -685,8 +701,72 @@ class MonitoringNetworksDialog(QDialog):
         self._update_mn_grid_weight_info()
 
 
+    def _build_cv_tables_widget(self, context_name):
+        """Creates summary/results CV tables and info label for tab 5 columns."""
+        container = QWidget()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        summary_label = QLabel(
+            QCoreApplication.translate(context_name, "Cross-Validation Summary")
+        )
+        layout.addWidget(summary_label)
+
+        summary_table = QTableWidget()
+        summary_table.setColumnCount(len(CV_SUMMARY_KEYS))
+        summary_table.setRowCount(1)
+        summary_table.setHorizontalHeaderLabels([
+            QCoreApplication.translate(context_name, "Min"),
+            QCoreApplication.translate(context_name, "Max"),
+            QCoreApplication.translate(context_name, "Mean"),
+            QCoreApplication.translate(context_name, "MAE"),
+            QCoreApplication.translate(context_name, "MSE"),
+            QCoreApplication.translate(context_name, "RMSE"),
+        ])
+        summary_table.verticalHeader().setVisible(False)
+        summary_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        summary_table.setFixedHeight(70)
+        summary_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(summary_table)
+
+        results_label = QLabel(
+            QCoreApplication.translate(context_name, "Cross-Validation Results")
+        )
+        layout.addWidget(results_label)
+
+        results_table = QTableWidget()
+        results_table.setColumnCount(7)
+        results_table.setHorizontalHeaderLabels([
+            QCoreApplication.translate(context_name, "ID"),
+            QCoreApplication.translate(context_name, "Included?"),
+            QCoreApplication.translate(context_name, "Measured"),
+            QCoreApplication.translate(context_name, "Predicted"),
+            QCoreApplication.translate(context_name, "Error"),
+            QCoreApplication.translate(context_name, "SE"),
+            QCoreApplication.translate(context_name, "Standardized Error"),
+        ])
+        results_table.verticalHeader().setVisible(True)
+        results_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        results_table.setMinimumHeight(140)
+        results_table.setMaximumHeight(200)
+        results_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(results_table)
+
+        info_label = QLabel(
+            QCoreApplication.translate(
+                context_name,
+                "Run Kalman optimization on tab 4 to compute cross-validation.",
+            )
+        )
+        info_label.setStyleSheet("color: gray; font-style: italic;")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        container.setLayout(layout)
+        return container, summary_table, results_table, info_label
+
     def setup_results_tab(self):
-        """Configures the results tab (ordinary-kriging map from Kalman-ordered wells)."""
+        """Configures the results tab (OK maps and CV for all vs selected wells)."""
         results_layout = QVBoxLayout()
 
         interp_group = QGroupBox(
@@ -704,36 +784,64 @@ class MonitoringNetworksDialog(QDialog):
         self.results_well_spin.setValue(3)
         self.results_well_spin.setEnabled(False)
         self.results_well_spin.valueChanged.connect(
-            self._refresh_ok_interpolation_plot
+            self._refresh_ok_interpolation_selected_wells
         )
         wells_row.addWidget(self.results_well_spin)
+        self.save_selected_wells_btn = QPushButton(
+            QCoreApplication.translate("Tab 5", "Download selected wells as layer")
+        )
+        self.save_selected_wells_btn.clicked.connect(
+            self.save_selected_wells_as_layer
+        )
+        wells_row.addWidget(self.save_selected_wells_btn)
         wells_row.addStretch()
         interp_layout.addLayout(wells_row)
 
-        self.results_interp_info_label = QLabel(
-            QCoreApplication.translate(
-                "Tab 5",
-                "Run Kalman optimization on tab 4 to enable interpolation.",
-            )
-        )
-        self.results_interp_info_label.setStyleSheet(
-            "color: gray; font-style: italic;"
-        )
-        self.results_interp_info_label.setWordWrap(True)
-        interp_layout.addWidget(self.results_interp_info_label)
+        plots_row = QHBoxLayout()
+        RESULTS_PLOT_HEIGHT = 280
 
-        RESULTS_PLOT_HEIGHT = 360
-        self.results_interp_figure = Figure(figsize=(7, 5))
-        self.results_interp_canvas = FigureCanvas(self.results_interp_figure)
-        self.results_interp_canvas.setMinimumHeight(RESULTS_PLOT_HEIGHT)
-        self.results_interp_ax = self.results_interp_figure.add_subplot(111)
-        interp_layout.addWidget(self.results_interp_canvas)
+        all_column = QVBoxLayout()
+        all_column.addWidget(QLabel(
+            QCoreApplication.translate("Tab 5", "All wells")
+        ))
+        self.results_all_interp_figure = Figure(figsize=(5, 4))
+        self.results_all_interp_canvas = FigureCanvas(self.results_all_interp_figure)
+        self.results_all_interp_canvas.setMinimumHeight(RESULTS_PLOT_HEIGHT)
+        self.results_all_interp_ax = self.results_all_interp_figure.add_subplot(111)
+        all_column.addWidget(self.results_all_interp_canvas)
+        (
+            all_cv_widget,
+            self.results_all_cv_summary_table,
+            self.results_all_cv_results_table,
+            self.results_all_cv_info_label,
+        ) = self._build_cv_tables_widget("Tab 5")
+        all_column.addWidget(all_cv_widget)
+        plots_row.addLayout(all_column, stretch=1)
 
+        sel_column = QVBoxLayout()
+        sel_column.addWidget(QLabel(
+            QCoreApplication.translate("Tab 5", "Selected wells")
+        ))
+        self.results_sel_interp_figure = Figure(figsize=(5, 4))
+        self.results_sel_interp_canvas = FigureCanvas(self.results_sel_interp_figure)
+        self.results_sel_interp_canvas.setMinimumHeight(RESULTS_PLOT_HEIGHT)
+        self.results_sel_interp_ax = self.results_sel_interp_figure.add_subplot(111)
+        sel_column.addWidget(self.results_sel_interp_canvas)
+        (
+            sel_cv_widget,
+            self.results_sel_cv_summary_table,
+            self.results_sel_cv_results_table,
+            self.results_sel_cv_info_label,
+        ) = self._build_cv_tables_widget("Tab 5")
+        sel_column.addWidget(sel_cv_widget)
+        plots_row.addLayout(sel_column, stretch=1)
+
+        interp_layout.addLayout(plots_row)
         interp_group.setLayout(interp_layout)
         results_layout.addWidget(interp_group)
 
         self.tab_results.setLayout(results_layout)
-        self._clear_ok_interpolation_plot()
+        self._clear_ok_interpolation_plots()
 
     def _count_layer_wells(self, attr_name):
         """Returns the number of valid measurement points in the input layer."""
@@ -753,7 +861,11 @@ class MonitoringNetworksDialog(QDialog):
             return
 
         attr_name = self._current_mn_parameter()
-        n_wells = self._count_layer_wells(attr_name) if attr_name else 0
+        count_attr = attr_name
+        if self._is_combined_mn_parameter(attr_name):
+            selected = self._selected_analysis_parameters()
+            count_attr = selected[0] if selected else None
+        n_wells = self._count_layer_wells(count_attr) if count_attr else 0
 
         self.results_well_spin.blockSignals(True)
         if n_wells < 3:
@@ -772,182 +884,344 @@ class MonitoringNetworksDialog(QDialog):
                 self.results_well_spin.setValue(3)
         self.results_well_spin.blockSignals(False)
 
-    def _clear_ok_interpolation_plot(self, message=...):
-        """
-        Resets the OK interpolation figure.
-
-        Pass message=None to recreate a blank axes only (used before redraw).
-        Omit message to show the default placeholder text.
-        """
-        if not hasattr(self, 'results_interp_figure'):
+    def _clear_results_cv_tables(self, summary_table, results_table, info_label, message):
+        """Resets tab 5 cross-validation tables and info label."""
+        if summary_table is None or results_table is None:
             return
 
-        self.results_interp_figure.clear()
-        self.results_interp_ax = self.results_interp_figure.add_subplot(111)
-        self.results_interp_colorbar = None
+        read_only = Qt.ItemIsSelectable | Qt.ItemIsEnabled
+        for col in range(summary_table.columnCount()):
+            item = summary_table.item(0, col)
+            if item is None:
+                item = QTableWidgetItem("")
+                summary_table.setItem(0, col, item)
+            else:
+                item.setText("")
+            item.setFlags(read_only)
+
+        results_table.setRowCount(0)
+        if info_label is not None:
+            info_label.setText(message)
+            info_label.setStyleSheet("color: gray; font-style: italic;")
+
+    def _populate_results_cv_summary(self, summary_table, summary):
+        """Fills a one-row CV summary table."""
+        read_only = Qt.ItemIsSelectable | Qt.ItemIsEnabled
+        formats = {
+            'min': '{:.2f}',
+            'max': '{:.2f}',
+            'mean': '{:.2f}',
+            'mae': '{:.3f}',
+            'mse': '{:.3f}',
+            'rmse': '{:.3f}',
+        }
+        for col, key in enumerate(CV_SUMMARY_KEYS):
+            value = summary.get(key, np.nan)
+            text = "—" if np.isnan(value) else formats[key].format(value)
+            item = summary_table.item(0, col)
+            if item is None:
+                item = QTableWidgetItem(text)
+                summary_table.setItem(0, col, item)
+            else:
+                item.setText(text)
+            item.setFlags(read_only)
+        summary_table.resizeColumnsToContents()
+
+    def _populate_results_cv_results(self, results_table, point_ids, cv_rows):
+        """Fills a per-point CV table with optional Included? column."""
+        yes_text = QCoreApplication.translate("Tab 5", "Yes")
+        no_text = QCoreApplication.translate("Tab 5", "No")
+        read_only = Qt.ItemIsSelectable | Qt.ItemIsEnabled
+        results_table.setRowCount(len(cv_rows))
+
+        for row, (point_id, row_data) in enumerate(zip(point_ids, cv_rows)):
+            included = row_data.get('included', True)
+            cells = [
+                str(point_id),
+                yes_text if included else no_text,
+                f"{row_data['measured']:.3f}",
+                f"{row_data['predicted']:.3f}",
+                f"{row_data['error']:.3f}",
+                f"{row_data['se']:.3f}",
+                f"{row_data['standardized_error']:.3f}",
+            ]
+            for col, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                item.setFlags(read_only)
+                results_table.setItem(row, col, item)
+
+        results_table.resizeColumnsToContents()
+
+    def _clear_ok_interpolation_plot_side(
+        self, figure, canvas, colorbar_attr, message=...
+    ):
+        """Resets one tab 5 interpolation figure."""
+        if figure is None or canvas is None:
+            return
+
+        figure.clear()
+        ax = figure.add_subplot(111)
+        colorbar = getattr(self, colorbar_attr, None)
+        if colorbar is not None:
+            setattr(self, colorbar_attr, None)
 
         if message is None:
-            self.results_interp_canvas.draw()
-            return
+            canvas.draw()
+            return ax
 
         placeholder = (
             QCoreApplication.translate("Tab 5", "No interpolation map available")
             if message is ...
             else message
         )
-        self.results_interp_ax.text(
+        ax.text(
             0.5,
             0.5,
             placeholder,
             ha='center',
             va='center',
-            transform=self.results_interp_ax.transAxes,
+            transform=ax.transAxes,
             color='gray',
         )
-        self.results_interp_ax.set_xticks([])
-        self.results_interp_ax.set_yticks([])
-        self.results_interp_canvas.draw()
+        ax.set_xticks([])
+        ax.set_yticks([])
+        canvas.draw()
+        return ax
 
-    def _refresh_ok_interpolation_plot(self):
+    def _clear_ok_interpolation_plots(self, message=...):
+        """Resets both tab 5 interpolation maps and CV tables."""
+        self.results_interp_color_limits = None
+        default_cv_message = (
+            QCoreApplication.translate(
+                "Tab 5",
+                "Run Kalman optimization on tab 4 to compute cross-validation.",
+            )
+            if message is ...
+            else message
+        )
+        self._clear_ok_interpolation_plot_side(
+            getattr(self, 'results_all_interp_figure', None),
+            getattr(self, 'results_all_interp_canvas', None),
+            'results_all_interp_colorbar',
+            message,
+        )
+        self._clear_ok_interpolation_plot_side(
+            getattr(self, 'results_sel_interp_figure', None),
+            getattr(self, 'results_sel_interp_canvas', None),
+            'results_sel_interp_colorbar',
+            message,
+        )
+        self.results_all_interp_ax = (
+            self.results_all_interp_figure.axes[0]
+            if hasattr(self, 'results_all_interp_figure')
+            and self.results_all_interp_figure.axes
+            else None
+        )
+        self.results_sel_interp_ax = (
+            self.results_sel_interp_figure.axes[0]
+            if hasattr(self, 'results_sel_interp_figure')
+            and self.results_sel_interp_figure.axes
+            else None
+        )
+        self._clear_results_cv_tables(
+            getattr(self, 'results_all_cv_summary_table', None),
+            getattr(self, 'results_all_cv_results_table', None),
+            getattr(self, 'results_all_cv_info_label', None),
+            default_cv_message,
+        )
+        self._clear_results_cv_tables(
+            getattr(self, 'results_sel_cv_summary_table', None),
+            getattr(self, 'results_sel_cv_results_table', None),
+            getattr(self, 'results_sel_cv_info_label', None),
+            default_cv_message,
+        )
+
+    def _get_ok_interpolation_context(self):
         """
-        Builds an OK map on the estimation grid using the top-N Kalman-ordered wells.
+        Shared validation for tab 5 interpolation/CV.
 
-        Wells are taken from selection_order (tab 4): index 0 is the most
-        informative well, so N=10 uses the first 10 entries in that order.
+        Returns (context_dict, error_message). context_dict is None on error.
         """
-        if not hasattr(self, 'results_interp_ax'):
-            return
-
         attr_name = self._current_mn_parameter()
         if not attr_name:
-            self._clear_ok_interpolation_plot(
-                QCoreApplication.translate("Tab 5", "Select a parameter on tab 4.")
+            return None, QCoreApplication.translate(
+                "Tab 5", "Select a parameter on tab 4."
             )
-            self.results_interp_info_label.setText(
-                QCoreApplication.translate(
-                    "Tab 5", "Select a parameter on tab 4."
-                )
-            )
-            return
 
         if attr_name not in self.variance_results:
-            self._clear_ok_interpolation_plot(
-                QCoreApplication.translate(
-                    "Tab 5", "Run Kalman optimization on tab 4 first."
-                )
+            return None, QCoreApplication.translate(
+                "Tab 5", "Run Kalman optimization on tab 4 first."
             )
-            self.results_interp_info_label.setText(
-                QCoreApplication.translate(
-                    "Tab 5",
-                    "Run Kalman optimization on tab 4 to enable interpolation.",
-                )
-            )
-            return
 
         if (
             not hasattr(self, 'current_grid_points')
             or self.current_grid_points is None
             or len(self.current_grid_points) == 0
         ):
-            self._clear_ok_interpolation_plot(
-                QCoreApplication.translate(
-                    "Tab 5", "Generate an estimation grid on tab 3 first."
-                )
+            return None, QCoreApplication.translate(
+                "Tab 5", "Generate an estimation grid on tab 3 first."
             )
-            return
 
         param_data = self._get_mn_parameter_data(attr_name)
         if param_data is None:
-            self._clear_ok_interpolation_plot(
-                QCoreApplication.translate(
-                    "Tab 5",
-                    "Run geostatistics on tab 2 for this parameter first.",
-                )
+            return None, QCoreApplication.translate(
+                "Tab 5",
+                "Run geostatistics on tab 2 for this parameter first.",
             )
-            return
 
-        n_requested = self.results_well_spin.value()
-        selection_order = self.variance_results[attr_name]['selection_order']
-        n_use = min(n_requested, len(selection_order))
-        if n_use < 1:
-            self._clear_ok_interpolation_plot()
-            return
+        return {
+            'attr_name': attr_name,
+            'param_data': param_data,
+            'state': param_data['state'],
+            'coordinates': param_data['coordinates'],
+            'values': param_data['values'],
+            'point_ids': param_data.get('point_ids'),
+            'grid': np.asarray(self.current_grid_points, dtype=float),
+            'selection_order': self.variance_results[attr_name]['selection_order'],
+        }, None
 
-        indices = selection_order[:n_use]
-        coordinates = param_data['coordinates']
-        values = param_data['values']
-        state = param_data['state']
-        grid = np.asarray(self.current_grid_points, dtype=float)
+    def _compute_ok_estimates(self, context, well_indices):
+        """Runs ordinary kriging on the grid for the given well indices."""
+        coordinates = context['coordinates']
+        values = context['values']
+        state = context['state']
+        grid = context['grid']
+        indices = np.asarray(well_indices, dtype=int)
 
-        sel_coords = coordinates[indices]
-        sel_values = values[indices]
+        return ordinary_kriging_interpolation(
+            coordinates[indices],
+            values[indices],
+            grid,
+            state.get('model_type', 'spherical'),
+            state.get('nugget', 0),
+            state.get('sill', 0),
+            state.get('range', 0),
+        )
 
+    def _ok_interpolation_color_limits(self, estimates):
+        """Returns (vmin, vmax) for tab 5 maps from grid estimates."""
+        valid = np.asarray(estimates, dtype=float)
+        valid = valid[np.isfinite(valid)]
+        if valid.size == 0:
+            return None
+        vmin = float(np.min(valid))
+        vmax = float(np.max(valid))
+        if vmin == vmax:
+            pad = max(abs(vmin) * 0.05, 0.5)
+            vmin -= pad
+            vmax += pad
+        return vmin, vmax
+
+    def _ensure_ok_interpolation_color_limits(self, context):
+        """
+        Shared color ramp limits for tab 5 maps.
+
+        Uses the all-wells interpolation range so the selected-wells map stays
+        comparable to the left panel without redrawing it.
+        """
+        if self.results_interp_color_limits is not None:
+            return self.results_interp_color_limits
+
+        n_wells = context['coordinates'].shape[0]
         try:
-            estimates = ordinary_kriging_interpolation(
-                sel_coords,
-                sel_values,
-                grid,
-                state.get('model_type', 'spherical'),
-                state.get('nugget', 0),
-                state.get('sill', 0),
-                state.get('range', 0),
+            all_estimates = self._compute_ok_estimates(
+                context, np.arange(n_wells)
             )
         except Exception:
-            self._clear_ok_interpolation_plot(
-                QCoreApplication.translate(
-                    "Tab 5", "Interpolation could not be computed."
-                )
-            )
-            return
+            return None
+        if all_estimates is None:
+            return None
 
-        if estimates is None or estimates.size != grid.shape[0]:
-            self._clear_ok_interpolation_plot(
-                QCoreApplication.translate(
-                    "Tab 5", "Interpolation returned invalid grid values."
-                )
-            )
-            return
+        self.results_interp_color_limits = self._ok_interpolation_color_limits(
+            all_estimates
+        )
+        return self.results_interp_color_limits
 
-        self._clear_ok_interpolation_plot(message=None)
-        ax = self.results_interp_ax
+    def _draw_ok_interpolation_map(
+        self,
+        figure,
+        canvas,
+        colorbar_attr,
+        ax,
+        context,
+        estimates,
+        selected_indices,
+        title,
+        color_limits=None,
+    ):
+        """Draws an OK interpolation map with selected/unselected well markers."""
+        coordinates = context['coordinates']
+        attr_name = context['attr_name']
+        selected_indices = np.asarray(selected_indices, dtype=int)
+        n_selected = selected_indices.size
 
-        gx = grid[:, 0]
-        gy = grid[:, 1]
+        gx = context['grid'][:, 0]
+        gy = context['grid'][:, 1]
+        ax.clear()
+
+        if color_limits is None:
+            color_limits = self._ok_interpolation_color_limits(estimates)
+        vmin = vmax = None
+        if color_limits is not None:
+            vmin, vmax = color_limits
 
         try:
             import matplotlib.tri as mtri
             triangulation = mtri.Triangulation(gx, gy)
-            contour = ax.tricontourf(
-                triangulation,
-                estimates,
-                levels=20,
-                cmap='viridis',
-            )
-            self.results_interp_colorbar = self.results_interp_figure.colorbar(
-                contour, ax=ax, label=attr_name
-            )
+            if vmin is not None and vmax is not None:
+                levels = np.linspace(vmin, vmax, 21)
+                contour = ax.tricontourf(
+                    triangulation,
+                    estimates,
+                    levels=levels,
+                    cmap='viridis',
+                    vmin=vmin,
+                    vmax=vmax,
+                )
+            else:
+                contour = ax.tricontourf(
+                    triangulation,
+                    estimates,
+                    levels=20,
+                    cmap='viridis',
+                )
+            colorbar = figure.colorbar(contour, ax=ax, label=attr_name)
         except Exception:
             scatter = ax.scatter(
-                gx, gy, c=estimates, cmap='viridis', s=12, alpha=0.9
+                gx,
+                gy,
+                c=estimates,
+                cmap='viridis',
+                s=12,
+                alpha=0.9,
+                vmin=vmin,
+                vmax=vmax,
             )
-            self.results_interp_colorbar = self.results_interp_figure.colorbar(
-                scatter, ax=ax, label=attr_name
-            )
+            colorbar = figure.colorbar(scatter, ax=ax, label=attr_name)
+        setattr(self, colorbar_attr, colorbar)
 
-        unused_mask = np.ones(coordinates.shape[0], dtype=bool)
-        unused_mask[indices] = False
-        if np.any(unused_mask):
-            ax.scatter(
-                coordinates[unused_mask, 0],
-                coordinates[unused_mask, 1],
-                c='lightgray',
-                s=28,
-                edgecolors='k',
-                linewidths=0.3,
-                label=QCoreApplication.translate("Tab 5", "Not used"),
-                zorder=4,
-            )
+        all_selected = n_selected == coordinates.shape[0]
+        if not all_selected:
+            unused_mask = np.ones(coordinates.shape[0], dtype=bool)
+            unused_mask[selected_indices] = False
+            if np.any(unused_mask):
+                ax.scatter(
+                    coordinates[unused_mask, 0],
+                    coordinates[unused_mask, 1],
+                    c='lightgray',
+                    s=28,
+                    edgecolors='k',
+                    linewidths=0.3,
+                    label=QCoreApplication.translate("Tab 5", "Not used"),
+                    zorder=4,
+                )
 
+        sel_coords = coordinates[selected_indices]
+        well_label = (
+            QCoreApplication.translate("Tab 5", "All wells")
+            if all_selected
+            else QCoreApplication.translate("Tab 5", "Selected wells")
+        )
         ax.scatter(
             sel_coords[:, 0],
             sel_coords[:, 1],
@@ -955,41 +1229,406 @@ class MonitoringNetworksDialog(QDialog):
             s=55,
             edgecolors='k',
             linewidths=0.5,
-            label=QCoreApplication.translate("Tab 5", "Selected wells"),
+            label=well_label,
             zorder=5,
         )
 
-        point_ids = param_data.get('point_ids')
+        point_ids = context.get('point_ids')
         if point_ids is not None:
             self._annotate_well_id_labels(ax, coordinates, point_ids)
 
         ax.set_xlabel(QCoreApplication.translate("Tab 5", "X"))
         ax.set_ylabel(QCoreApplication.translate("Tab 5", "Y"))
-        ax.set_title(
-            QCoreApplication.translate(
-                "Tab 5",
-                "Ordinary Kriging – {param} ({n} wells)",
-            ).format(param=attr_name, n=n_use)
-        )
+        ax.set_title(title)
         ax.legend(loc='best', fontsize=8)
         ax.set_aspect('equal')
         ax.grid(True, alpha=0.3)
-        self.results_interp_figure.subplots_adjust(right=0.88)
-        self.results_interp_canvas.draw()
+        figure.subplots_adjust(right=0.88)
+        canvas.draw()
 
-        info = QCoreApplication.translate(
+    def _update_results_cross_validation(
+        self,
+        context,
+        network_indices,
+        summary_table,
+        results_table,
+        info_label,
+    ):
+        """Computes and displays CV tables for a well network."""
+        state = context['state']
+        try:
+            cv_result = run_network_cross_validation(
+                context['coordinates'],
+                context['values'],
+                state.get('model_type', 'spherical'),
+                state.get('nugget', 0),
+                state.get('sill', 0),
+                state.get('range', 0),
+                network_indices=network_indices,
+            )
+        except Exception:
+            cv_result = None
+
+        default_message = QCoreApplication.translate(
             "Tab 5",
-            "Using the first {n} well(s) from the Kalman order for «{param}».",
-        ).format(n=n_use, param=attr_name)
-        if n_use < n_requested:
-            info += " " + QCoreApplication.translate(
-                "Tab 5",
-                "Only {available} well(s) are available in the Kalman ordering.",
-            ).format(available=n_use)
-        self.results_interp_info_label.setText(info)
-        self.results_interp_info_label.setStyleSheet(
-            "color: gray; font-style: italic;"
+            "Cross-validation could not be computed.",
         )
+        if cv_result is None:
+            self._clear_results_cv_tables(
+                summary_table, results_table, info_label, default_message
+            )
+            info_label.setStyleSheet("color: red; font-style: italic;")
+            return
+
+        point_ids = context.get('point_ids')
+        if point_ids is None:
+            point_ids = [str(i) for i in range(context['values'].size)]
+
+        self._populate_results_cv_summary(summary_table, cv_result['summary'])
+        self._populate_results_cv_results(
+            results_table, point_ids, cv_result['rows']
+        )
+
+        n_total = context['values'].size
+        if network_indices is None:
+            info_label.setText(
+                QCoreApplication.translate(
+                    "Tab 5",
+                    "Leave-one-out cross-validation for «{param}» ({n} points).",
+                ).format(param=context['attr_name'], n=n_total)
+            )
+        else:
+            info_label.setText(
+                QCoreApplication.translate(
+                    "Tab 5",
+                    "Cross-validation for «{param}» using {n_network} network "
+                    "wells ({n_total} points).",
+                ).format(
+                    param=context['attr_name'],
+                    n_network=len(network_indices),
+                    n_total=n_total,
+                )
+            )
+        info_label.setStyleSheet("color: gray; font-style: italic;")
+
+    def _refresh_ok_interpolation_all_wells(self):
+        """Builds the all-wells OK map and CV (not tied to the well-count spinbox)."""
+        if not hasattr(self, 'results_all_interp_ax'):
+            return
+
+        context, error = self._get_ok_interpolation_context()
+        if context is None:
+            self._clear_ok_interpolation_plot_side(
+                self.results_all_interp_figure,
+                self.results_all_interp_canvas,
+                'results_all_interp_colorbar',
+                error,
+            )
+            self._clear_results_cv_tables(
+                self.results_all_cv_summary_table,
+                self.results_all_cv_results_table,
+                self.results_all_cv_info_label,
+                error,
+            )
+            self.results_all_cv_info_label.setStyleSheet(
+                "color: gray; font-style: italic;"
+            )
+            return
+
+        n_wells = context['coordinates'].shape[0]
+        all_indices = np.arange(n_wells)
+
+        try:
+            estimates = self._compute_ok_estimates(context, all_indices)
+        except Exception:
+            estimates = None
+
+        if estimates is None or estimates.size != context['grid'].shape[0]:
+            message = QCoreApplication.translate(
+                "Tab 5", "Interpolation could not be computed."
+            )
+            self._clear_ok_interpolation_plot_side(
+                self.results_all_interp_figure,
+                self.results_all_interp_canvas,
+                'results_all_interp_colorbar',
+                message,
+            )
+            self._clear_results_cv_tables(
+                self.results_all_cv_summary_table,
+                self.results_all_cv_results_table,
+                self.results_all_cv_info_label,
+                message,
+            )
+            return
+
+        self._clear_ok_interpolation_plot_side(
+            self.results_all_interp_figure,
+            self.results_all_interp_canvas,
+            'results_all_interp_colorbar',
+            message=None,
+        )
+        self.results_all_interp_ax = self.results_all_interp_figure.axes[0]
+        color_limits = self._ok_interpolation_color_limits(estimates)
+        self.results_interp_color_limits = color_limits
+        title = QCoreApplication.translate(
+            "Tab 5",
+            "Ordinary Kriging – {param} (all {n} wells)",
+        ).format(param=context['attr_name'], n=n_wells)
+        self._draw_ok_interpolation_map(
+            self.results_all_interp_figure,
+            self.results_all_interp_canvas,
+            'results_all_interp_colorbar',
+            self.results_all_interp_ax,
+            context,
+            estimates,
+            all_indices,
+            title,
+            color_limits=color_limits,
+        )
+        self._update_results_cross_validation(
+            context,
+            network_indices=None,
+            summary_table=self.results_all_cv_summary_table,
+            results_table=self.results_all_cv_results_table,
+            info_label=self.results_all_cv_info_label,
+        )
+
+    def _refresh_ok_interpolation_selected_wells(self):
+        """Builds the selected-wells OK map and CV (responds to the spinbox)."""
+        if not hasattr(self, 'results_sel_interp_ax'):
+            return
+
+        context, error = self._get_ok_interpolation_context()
+        if context is None:
+            self._clear_ok_interpolation_plot_side(
+                self.results_sel_interp_figure,
+                self.results_sel_interp_canvas,
+                'results_sel_interp_colorbar',
+                error,
+            )
+            self._clear_results_cv_tables(
+                self.results_sel_cv_summary_table,
+                self.results_sel_cv_results_table,
+                self.results_sel_cv_info_label,
+                error,
+            )
+            self.results_sel_cv_info_label.setStyleSheet(
+                "color: gray; font-style: italic;"
+            )
+            return
+
+        n_requested = self.results_well_spin.value()
+        selection_order = context['selection_order']
+        n_use = min(n_requested, len(selection_order))
+        if n_use < 1:
+            self._clear_ok_interpolation_plot_side(
+                self.results_sel_interp_figure,
+                self.results_sel_interp_canvas,
+                'results_sel_interp_colorbar',
+            )
+            return
+
+        indices = selection_order[:n_use]
+
+        try:
+            estimates = self._compute_ok_estimates(context, indices)
+        except Exception:
+            estimates = None
+
+        if estimates is None or estimates.size != context['grid'].shape[0]:
+            message = QCoreApplication.translate(
+                "Tab 5", "Interpolation could not be computed."
+            )
+            self._clear_ok_interpolation_plot_side(
+                self.results_sel_interp_figure,
+                self.results_sel_interp_canvas,
+                'results_sel_interp_colorbar',
+                message,
+            )
+            self._clear_results_cv_tables(
+                self.results_sel_cv_summary_table,
+                self.results_sel_cv_results_table,
+                self.results_sel_cv_info_label,
+                message,
+            )
+            return
+
+        self._clear_ok_interpolation_plot_side(
+            self.results_sel_interp_figure,
+            self.results_sel_interp_canvas,
+            'results_sel_interp_colorbar',
+            message=None,
+        )
+        self.results_sel_interp_ax = self.results_sel_interp_figure.axes[0]
+        color_limits = self._ensure_ok_interpolation_color_limits(context)
+        title = QCoreApplication.translate(
+            "Tab 5",
+            "Ordinary Kriging – {param} ({n} wells)",
+        ).format(param=context['attr_name'], n=n_use)
+        self._draw_ok_interpolation_map(
+            self.results_sel_interp_figure,
+            self.results_sel_interp_canvas,
+            'results_sel_interp_colorbar',
+            self.results_sel_interp_ax,
+            context,
+            estimates,
+            indices,
+            title,
+            color_limits=color_limits,
+        )
+        self._update_results_cross_validation(
+            context,
+            network_indices=indices,
+            summary_table=self.results_sel_cv_summary_table,
+            results_table=self.results_sel_cv_results_table,
+            info_label=self.results_sel_cv_info_label,
+        )
+
+    def _refresh_ok_interpolation_plots(
+        self, refresh_all=True, refresh_selected=True
+    ):
+        """Refreshes tab 5 maps/CV; the all-wells side skips spinbox-only updates."""
+        if refresh_all:
+            self._refresh_ok_interpolation_all_wells()
+        if refresh_selected:
+            self._refresh_ok_interpolation_selected_wells()
+
+    def _refresh_ok_interpolation_plot(self):
+        """Refreshes both tab 5 interpolation panels."""
+        self._refresh_ok_interpolation_plots(
+            refresh_all=True, refresh_selected=True
+        )
+
+    def save_selected_wells_as_layer(self):
+        """Adds the Kalman-selected wells as a temporary point layer in QGIS."""
+        context, error = self._get_ok_interpolation_context()
+        if context is None:
+            QMessageBox.warning(
+                self,
+                QCoreApplication.translate("Tab 5", "Download selected wells as layer"),
+                error,
+            )
+            return
+
+        layer = self.input_data_layer.currentLayer()
+        if not layer:
+            QMessageBox.warning(
+                self,
+                QCoreApplication.translate("Tab 5", "Download selected wells as layer"),
+                QCoreApplication.translate("Tab 5", "No input point layer is selected."),
+            )
+            return
+
+        n_requested = self.results_well_spin.value()
+        selection_order = np.asarray(context['selection_order'], dtype=int)
+        n_use = min(n_requested, selection_order.size)
+        if n_use < 1:
+            QMessageBox.warning(
+                self,
+                QCoreApplication.translate("Tab 5", "Download selected wells as layer"),
+                QCoreApplication.translate(
+                    "Tab 5", "No selected wells are available to export."
+                ),
+            )
+            return
+
+        attr_name = context['attr_name']
+        display_name = self._mn_parameter_display_name(attr_name)
+        coordinates = context['coordinates']
+        values = context['values']
+        point_ids = context.get('point_ids')
+        selected_indices = selection_order[:n_use]
+
+        results = self.variance_results[attr_name]
+        normalized_variances = np.asarray(
+            results.get('normalized_variances', []), dtype=float
+        )
+        variance_reduction = np.asarray(
+            results.get('variance_reduction', []), dtype=float
+        )
+
+        try:
+            crs = layer.crs()
+            layer_name = QCoreApplication.translate(
+                "Tab 5", "Selected Monitoring Wells - {param}"
+            ).format(param=display_name)
+            temp_layer = QgsVectorLayer(
+                f"Point?crs={crs.authid()}",
+                layer_name,
+                "memory",
+            )
+
+            fields = QgsFields()
+            fields.append(QgsField('Well_ID', QVariant.String))
+            fields.append(QgsField('Prioritization_Rank', QVariant.Int))
+            fields.append(QgsField('Parameter', QVariant.String))
+            fields.append(QgsField('Measured', QVariant.Double))
+            fields.append(QgsField('Normalized_Variance', QVariant.Double))
+            fields.append(QgsField('Variance_Reduction_pct', QVariant.Double))
+            fields.append(QgsField('Coord_X', QVariant.Double))
+            fields.append(QgsField('Coord_Y', QVariant.Double))
+
+            temp_layer.dataProvider().addAttributes(fields)
+            temp_layer.updateFields()
+
+            features = []
+            for rank, well_idx in enumerate(selected_indices, start=1):
+                well_idx = int(well_idx)
+                coord = coordinates[well_idx]
+                well_id = (
+                    str(point_ids[well_idx])
+                    if point_ids is not None
+                    else str(well_idx)
+                )
+                norm_var = (
+                    float(normalized_variances[rank])
+                    if rank < normalized_variances.size
+                    else None
+                )
+                var_red = (
+                    float(variance_reduction[rank])
+                    if rank < variance_reduction.size
+                    else None
+                )
+
+                feature = QgsFeature()
+                feature.setGeometry(
+                    QgsGeometry.fromPointXY(QgsPointXY(float(coord[0]), float(coord[1])))
+                )
+                feature.setAttributes([
+                    well_id,
+                    rank,
+                    display_name,
+                    float(values[well_idx]),
+                    norm_var,
+                    var_red,
+                    float(coord[0]),
+                    float(coord[1]),
+                ])
+                features.append(feature)
+
+            temp_layer.dataProvider().addFeatures(features)
+            temp_layer.updateExtents()
+            QgsProject.instance().addMapLayer(temp_layer)
+
+            QMessageBox.information(
+                self,
+                QCoreApplication.translate("Tab 5", "Download selected wells as layer"),
+                QCoreApplication.translate(
+                    "Tab 5",
+                    "Saved {n} selected well(s) as a temporary layer for «{param}».",
+                ).format(n=len(features), param=display_name),
+            )
+        except Exception as exc:
+            import traceback
+            QMessageBox.warning(
+                self,
+                QCoreApplication.translate("Tab 5", "Download selected wells as layer"),
+                QCoreApplication.translate(
+                    "Tab 5",
+                    "Could not create the wells layer:\n{error}\n{details}",
+                ).format(error=str(exc), details=traceback.format_exc()),
+            )
 
     def previous_tab(self):
         """Go to previous tab"""
@@ -1018,7 +1657,7 @@ class MonitoringNetworksDialog(QDialog):
         self._sync_attr_name_combo()
         self._clear_variance_reduction_plot()
         self._update_results_well_spinbox()
-        self._clear_ok_interpolation_plot()
+        self._clear_ok_interpolation_plots()
         self._update_mn_well_weight_info()
         self._update_mn_grid_weight_info()
         self.selected_data_parameters.clear()
@@ -1077,6 +1716,7 @@ class MonitoringNetworksDialog(QDialog):
             return
 
         previous = self.mn_param_select_combo.currentText()
+        previous_data = self.mn_param_select_combo.currentData()
         selected = [
             item.text()
             for item in self.selected_data_parameters.selectedItems()
@@ -1090,10 +1730,22 @@ class MonitoringNetworksDialog(QDialog):
             )
             self.mn_param_select_combo.setEnabled(False)
         else:
-            self.mn_param_select_combo.addItems(selected)
+            for param in selected:
+                self.mn_param_select_combo.addItem(param, param)
+            if len(selected) >= 2:
+                combined_label = QCoreApplication.translate(
+                    "Tab 4", "Parameters combined"
+                )
+                self.mn_param_select_combo.addItem(
+                    combined_label, MN_COMBINED_PARAMETERS_KEY
+                )
             self.mn_param_select_combo.setEnabled(True)
-            restore_idx = self.mn_param_select_combo.findText(previous)
-            if restore_idx >= 0 and previous in selected:
+            restore_idx = -1
+            if previous_data is not None:
+                restore_idx = self.mn_param_select_combo.findData(previous_data)
+            if restore_idx < 0 and previous in selected:
+                restore_idx = self.mn_param_select_combo.findText(previous)
+            if restore_idx >= 0:
                 self.mn_param_select_combo.setCurrentIndex(restore_idx)
             else:
                 self.mn_param_select_combo.setCurrentIndex(0)
@@ -1178,8 +1830,12 @@ class MonitoringNetworksDialog(QDialog):
         layer = self.input_data_layer.currentLayer()
         attr_name = self._current_mn_parameter()
         weight_field = None
-        if layer and attr_name:
-            weight_field = resolve_well_weight_field(layer, attr_name)
+        lookup_attr = attr_name
+        if self._is_combined_mn_parameter(attr_name):
+            selected = self._selected_analysis_parameters()
+            lookup_attr = selected[0] if selected else None
+        if layer and lookup_attr:
+            weight_field = resolve_well_weight_field(layer, lookup_attr)
 
         has_field = weight_field is not None
         self.mn_use_well_weights.setEnabled(has_field)
@@ -1217,14 +1873,131 @@ class MonitoringNetworksDialog(QDialog):
         self._update_mn_grid_weight_info()
         self._refresh_ok_interpolation_plot()
 
+    def _mn_combined_parameters_label(self):
+        return QCoreApplication.translate("Tab 4", "Parameters combined")
+
+    def _is_combined_mn_parameter(self, attr_name=None):
+        if attr_name is None:
+            if not hasattr(self, 'mn_param_select_combo'):
+                return False
+            attr_name = self.mn_param_select_combo.currentData()
+        return attr_name == MN_COMBINED_PARAMETERS_KEY
+
+    def _mn_parameter_display_name(self, attr_name):
+        if self._is_combined_mn_parameter(attr_name):
+            return self._mn_combined_parameters_label()
+        return attr_name
+
+    def _selected_analysis_parameters(self):
+        if not hasattr(self, 'selected_data_parameters'):
+            return []
+        return [
+            item.text()
+            for item in self.selected_data_parameters.selectedItems()
+        ]
+
     def _current_mn_parameter(self):
-        """Returns the parameter selected on tab 4, or None."""
+        """Returns tab-4 parameter key (name or MN_COMBINED_PARAMETERS_KEY), or None."""
         if (
             not hasattr(self, 'mn_param_select_combo')
             or not self.mn_param_select_combo.isEnabled()
         ):
             return None
-        return self.mn_param_select_combo.currentText()
+        data = self.mn_param_select_combo.currentData()
+        if data == MN_COMBINED_PARAMETERS_KEY:
+            return MN_COMBINED_PARAMETERS_KEY
+        if data:
+            return str(data)
+        text = self.mn_param_select_combo.currentText()
+        if text == QCoreApplication.translate("Tab 4", "No parameter selected"):
+            return None
+        return text
+
+    def _get_multi_parameter_optimization_specs(self):
+        """
+        Builds aligned per-parameter inputs for combined Kalman optimization.
+
+        Returns (specs, error_message). specs is None when validation fails.
+        """
+        layer = self.input_data_layer.currentLayer()
+        if not layer:
+            return None, QCoreApplication.translate(
+                "Tab 4", "Select an input point layer first."
+            )
+
+        param_names = self._selected_analysis_parameters()
+        if len(param_names) < 2:
+            return None, QCoreApplication.translate(
+                "Tab 4",
+                "Select at least two parameters on tab 1 for combined optimization.",
+            )
+
+        specs = []
+        reference_coords = None
+
+        for name in param_names:
+            state = self._get_variogram_state(name)
+            if not state:
+                return None, QCoreApplication.translate(
+                    "Tab 4",
+                    "Run geostatistics on tab 2 for «{param}» first.",
+                ).format(param=name)
+
+            point_ids, coordinates, raw_values, _, raw_well_weights = (
+                extract_point_records_from_layer(layer, name)
+            )
+            if coordinates is None or raw_values is None:
+                return None, QCoreApplication.translate(
+                    "Tab 4",
+                    "No valid data found for «{param}».",
+                ).format(param=name)
+
+            transform = 'log' if state.get('log_transform') else 'none'
+            coordinates, values, _, error = align_coordinates_with_transform(
+                coordinates, raw_values, transform
+            )
+            if error or coordinates is None or values is None:
+                return None, error or QCoreApplication.translate(
+                    "Tab 4",
+                    "Could not align data for «{param}».",
+                ).format(param=name)
+
+            point_ids = align_point_ids_with_transform(
+                point_ids, raw_values, transform
+            )
+
+            if reference_coords is None:
+                reference_coords = coordinates
+            elif (
+                coordinates.shape != reference_coords.shape
+                or not np.allclose(coordinates, reference_coords)
+            ):
+                return None, QCoreApplication.translate(
+                    "Tab 4",
+                    "Combined optimization requires the same valid wells for "
+                    "every parameter (check null values and log transforms).",
+                )
+
+            well_weights = None
+            if raw_well_weights is not None:
+                well_weights = align_well_weights_with_transform(
+                    raw_well_weights, raw_values, transform
+                )
+
+            specs.append({
+                'name': name,
+                'coordinates': coordinates,
+                'values': values,
+                'point_ids': point_ids,
+                'well_weights': well_weights,
+                'model_type': state.get('model_type', 'spherical'),
+                'nugget': state.get('nugget', 0),
+                'sill': state.get('sill', 0),
+                'range': state.get('range', 0),
+                'weight': float(state.get('weight', 1.0)),
+            })
+
+        return specs, None
 
     def _clear_variance_reduction_plot(self):
         """Resets the variance reduction plot and info label."""
@@ -1336,6 +2109,189 @@ class MonitoringNetworksDialog(QDialog):
         self.variance_figure.tight_layout()
         self.variance_canvas.draw()
 
+    def _file_dialog_parent(self):
+        """Parent widget for file dialogs (main window avoids Windows native crashes)."""
+        if getattr(self, 'iface', None):
+            main_window = self.iface.mainWindow()
+            if main_window is not None:
+                return main_window
+        return self
+
+    def _file_dialog_options(self):
+        """Qt-only file dialogs are more stable than native dialogs inside QGIS."""
+        return QFileDialog.DontUseNativeDialog
+
+    def _prompt_save_xlsx(self, title, default_name):
+        """Prompts for an .xlsx output path, or returns None if cancelled."""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self._file_dialog_parent(),
+            title,
+            default_name,
+            "Excel Files (*.xlsx)",
+            options=self._file_dialog_options(),
+        )
+        if not file_path:
+            return None
+        if not file_path.lower().endswith('.xlsx'):
+            file_path += '.xlsx'
+        return file_path
+
+    def _prompt_open_xlsx(self, title):
+        """Prompts for an .xlsx input path, or returns None if cancelled."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self._file_dialog_parent(),
+            title,
+            "",
+            "Excel Files (*.xlsx *.xls)",
+            options=self._file_dialog_options(),
+        )
+        return file_path or None
+
+    def download_prioritization(self):
+        """Exports Kalman prioritization and variogram settings to Excel."""
+        attr_name = self._current_mn_parameter()
+        if not attr_name:
+            QMessageBox.warning(
+                self,
+                QCoreApplication.translate("Tab 4", "Download prioritization"),
+                QCoreApplication.translate(
+                    "Tab 4", "Select a parameter to optimize."
+                ),
+            )
+            return
+
+        if attr_name not in self.variance_results:
+            QMessageBox.warning(
+                self,
+                QCoreApplication.translate("Tab 4", "Download prioritization"),
+                QCoreApplication.translate(
+                    "Tab 4",
+                    "Run Optimize first to generate prioritization results.",
+                ),
+            )
+            return
+
+        default_name = (
+            "prioritization_combined.xlsx"
+            if self._is_combined_mn_parameter(attr_name)
+            else f"prioritization_{attr_name}.xlsx"
+        )
+        file_path = self._prompt_save_xlsx(
+            QCoreApplication.translate("Tab 4", "Save prioritization"),
+            default_name,
+        )
+        if not file_path:
+            return
+
+        results = self.variance_results[attr_name]
+        selection_order = np.asarray(results['selection_order'], dtype=int)
+        normalized_variances = np.asarray(
+            results['normalized_variances'], dtype=float
+        )
+        variance_reduction = np.asarray(
+            results['variance_reduction'], dtype=float
+        )
+
+        if self._is_combined_mn_parameter(attr_name):
+            specs, _ = self._get_multi_parameter_optimization_specs()
+            point_ids = specs[0].get('point_ids') if specs else None
+            parameter_label = self._mn_combined_parameters_label()
+        else:
+            param_data = self._get_mn_parameter_data(attr_name)
+            point_ids = param_data.get('point_ids') if param_data else None
+            parameter_label = attr_name
+
+        prioritization_rows = []
+        for rank, well_idx in enumerate(selection_order, start=1):
+            if rank >= normalized_variances.size:
+                break
+            well_id = (
+                str(point_ids[well_idx])
+                if point_ids is not None
+                else str(well_idx)
+            )
+            prioritization_rows.append({
+                'Rank': rank,
+                'Well_ID': well_id,
+                'Parameter': parameter_label,
+                'Normalized_Variance': float(normalized_variances[rank]),
+                'Variance_Reduction_%': float(variance_reduction[rank]),
+            })
+
+        prioritization_columns = [
+            'Rank',
+            'Well_ID',
+            'Parameter',
+            'Normalized_Variance',
+            'Variance_Reduction_%',
+        ]
+
+        variogram_rows = []
+        for param_name in sorted(self.variogram_models_by_attribute.keys()):
+            state = self._get_variogram_state(param_name)
+            if not state:
+                continue
+            variogram_rows.append({
+                'Parameter': param_name,
+                'Weight': float(state.get('weight', 1.0)),
+                'Transform': self._transform_display_text(
+                    state.get('log_transform', False)
+                ),
+                'Model': state.get('model_type', ''),
+                'Nugget': float(state.get('nugget', 0)),
+                'Sill': float(state.get('sill', 0)),
+                'Range': float(state.get('range', 0)),
+                'R2': float(state.get('r2', 0)),
+                'Adjust': state.get('adjust', ''),
+            })
+        variogram_columns = [
+            'Parameter',
+            'Weight',
+            'Transform',
+            'Model',
+            'Nugget',
+            'Sill',
+            'Range',
+            'R2',
+            'Adjust',
+        ]
+
+        try:
+            write_excel_sheets(
+                file_path,
+                [
+                    ('Prioritization', prioritization_columns, prioritization_rows),
+                    ('Variogram_Settings', variogram_columns, variogram_rows),
+                ],
+            )
+            QMessageBox.information(
+                self,
+                QCoreApplication.translate("Tab 4", "Download prioritization"),
+                QCoreApplication.translate(
+                    "Tab 4",
+                    "Prioritization saved to:\n{path}",
+                ).format(path=file_path),
+            )
+        except ImportError:
+            QMessageBox.warning(
+                self,
+                QCoreApplication.translate("Tab 4", "Download prioritization"),
+                QCoreApplication.translate(
+                    "Tab 4",
+                    "openpyxl is required to export Excel files.",
+                ),
+            )
+        except Exception as exc:
+            import traceback
+            QMessageBox.warning(
+                self,
+                QCoreApplication.translate("Tab 4", "Download prioritization"),
+                QCoreApplication.translate(
+                    "Tab 4",
+                    "Could not save the Excel file:\n{error}\n{details}",
+                ).format(error=str(exc), details=traceback.format_exc()),
+            )
+
     def _annotate_well_id_labels(self, ax, coordinates, point_ids, indices=None):
         """Draws well ID text next to each point on a spatial axes."""
         if point_ids is None or coordinates is None:
@@ -1358,10 +2314,28 @@ class MonitoringNetworksDialog(QDialog):
 
     def _get_mn_parameter_data(self, attr_name):
         """
-        Loads aligned coordinates, values and variogram state for tab 4.
+        Loads aligned coordinates, values and variogram state for tab 4/5.
 
-        Uses the same transform stored when geostatistics were calculated.
+        For combined mode, returns the first selected parameter as the spatial
+        reference (same well geometry); OK maps on tab 5 use its variogram.
         """
+        if self._is_combined_mn_parameter(attr_name):
+            specs, _ = self._get_multi_parameter_optimization_specs()
+            if not specs:
+                return None
+            first = specs[0]
+            state = self._get_variogram_state(first['name'])
+            if not state:
+                return None
+            return {
+                'coordinates': first['coordinates'],
+                'values': first['values'],
+                'point_ids': first.get('point_ids'),
+                'well_weights': first.get('well_weights'),
+                'state': state,
+                'reference_parameter': first['name'],
+            }
+
         layer = self.input_data_layer.currentLayer()
         if not layer or not attr_name:
             return None
@@ -1407,6 +2381,9 @@ class MonitoringNetworksDialog(QDialog):
 
         Phase 1 determines the selection order via rank-1 covariance updates;
         phase 2 evaluates normalized ordinary-kriging variance along that order.
+
+        When «Parameters combined» is selected, runs the weighted multi-parameter
+        extension (see compute_weighted_multi_parameter_variance_reduction_curve).
         """
         attr_name = self._current_mn_parameter()
         if not attr_name:
@@ -1434,38 +2411,11 @@ class MonitoringNetworksDialog(QDialog):
             )
             return
 
-        param_data = self._get_mn_parameter_data(attr_name)
-        if param_data is None:
-            QMessageBox.warning(
-                self,
-                QCoreApplication.translate("Tab 4", "Optimize"),
-                QCoreApplication.translate(
-                    "Tab 4",
-                    "Run geostatistics on tab 2 for «{param}» first."
-                ).format(param=attr_name),
-            )
-            return
-
-        state = param_data['state']
         use_well_weights = (
             hasattr(self, 'mn_use_well_weights')
             and self.mn_use_well_weights.isEnabled()
             and self.mn_use_well_weights.isChecked()
         )
-        well_weights = (
-            param_data.get('well_weights') if use_well_weights else None
-        )
-        if use_well_weights and well_weights is None:
-            QMessageBox.warning(
-                self,
-                QCoreApplication.translate("Tab 4", "Optimize"),
-                QCoreApplication.translate(
-                    "Tab 4",
-                    "No well weight field is available for this layer.",
-                ),
-            )
-            return
-
         use_grid_weights = (
             hasattr(self, 'mn_use_grid_weights')
             and self.mn_use_grid_weights.isEnabled()
@@ -1489,17 +2439,77 @@ class MonitoringNetworksDialog(QDialog):
         QApplication.processEvents()
 
         try:
-            results = compute_simple_kriging_variance_reduction_curve(
-                param_data['coordinates'],
-                param_data['values'],
-                self.current_grid_points,
-                state.get('model_type', 'spherical'),
-                state.get('nugget', 0),
-                state.get('sill', 0),
-                state.get('range', 0),
-                well_weights=well_weights,
-                grid_weights=grid_weights,
-            )
+            if self._is_combined_mn_parameter(attr_name):
+                specs, spec_error = self._get_multi_parameter_optimization_specs()
+                if specs is None:
+                    QMessageBox.warning(
+                        self,
+                        QCoreApplication.translate("Tab 4", "Optimize"),
+                        spec_error,
+                    )
+                    return
+
+                well_weights = None
+                if use_well_weights:
+                    well_weights = specs[0].get('well_weights')
+                    if well_weights is None:
+                        QMessageBox.warning(
+                            self,
+                            QCoreApplication.translate("Tab 4", "Optimize"),
+                            QCoreApplication.translate(
+                                "Tab 4",
+                                "No well weight field is available for this layer.",
+                            ),
+                        )
+                        return
+
+                results = compute_weighted_multi_parameter_variance_reduction_curve(
+                    specs,
+                    self.current_grid_points,
+                    well_weights=well_weights,
+                    grid_weights=grid_weights,
+                )
+                display_name = self._mn_combined_parameters_label()
+            else:
+                param_data = self._get_mn_parameter_data(attr_name)
+                if param_data is None:
+                    QMessageBox.warning(
+                        self,
+                        QCoreApplication.translate("Tab 4", "Optimize"),
+                        QCoreApplication.translate(
+                            "Tab 4",
+                            "Run geostatistics on tab 2 for «{param}» first."
+                        ).format(param=attr_name),
+                    )
+                    return
+
+                state = param_data['state']
+                well_weights = (
+                    param_data.get('well_weights') if use_well_weights else None
+                )
+                if use_well_weights and well_weights is None:
+                    QMessageBox.warning(
+                        self,
+                        QCoreApplication.translate("Tab 4", "Optimize"),
+                        QCoreApplication.translate(
+                            "Tab 4",
+                            "No well weight field is available for this layer.",
+                        ),
+                    )
+                    return
+
+                results = compute_simple_kriging_variance_reduction_curve(
+                    param_data['coordinates'],
+                    param_data['values'],
+                    self.current_grid_points,
+                    state.get('model_type', 'spherical'),
+                    state.get('nugget', 0),
+                    state.get('sill', 0),
+                    state.get('range', 0),
+                    well_weights=well_weights,
+                    grid_weights=grid_weights,
+                )
+                display_name = attr_name
         except Exception as exc:
             QMessageBox.warning(
                 self,
@@ -1526,7 +2536,7 @@ class MonitoringNetworksDialog(QDialog):
 
         self.variance_results[attr_name] = results
         self.prioritization_grid_points = self.current_grid_points.copy()
-        self._update_variance_reduction_plot(results, attr_name)
+        self._update_variance_reduction_plot(results, display_name)
 
         n_wells = int(results['n_points'][-1])
         grid_nodes = results['grid_nodes_used']
@@ -1540,13 +2550,24 @@ class MonitoringNetworksDialog(QDialog):
             weight_note += " " + QCoreApplication.translate(
                 "Tab 4", "(using weighted estimation grid)"
             )
+        if results.get('combined_mode'):
+            param_weights = results.get('parameter_weights', {})
+            weight_parts = [
+                f"{name}={weight:.2f}"
+                for name, weight in sorted(param_weights.items())
+            ]
+            weight_note += " " + QCoreApplication.translate(
+                "Tab 4",
+                "(parameter weights: {weights})",
+            ).format(weights=", ".join(weight_parts))
+
         self.variance_info_label.setText(
             QCoreApplication.translate(
                 "Tab 4",
                 "Kalman ordering for «{param}»: {n} wells, "
                 "{grid} grid nodes, {red:.1f}% variance reduction.{weights}",
             ).format(
-                param=attr_name,
+                param=display_name,
                 n=n_wells,
                 grid=grid_nodes,
                 red=final_reduction,
@@ -2455,7 +3476,7 @@ class MonitoringNetworksDialog(QDialog):
                                     "The estimation grid changed. Click Optimize again.",
                                 )
                             )
-                        self._clear_ok_interpolation_plot(
+                        self._clear_ok_interpolation_plots(
                             QCoreApplication.translate(
                                 "Tab 5",
                                 "The estimation grid changed. Re-run optimization on tab 4.",
@@ -2612,55 +3633,77 @@ class MonitoringNetworksDialog(QDialog):
         skips records that are incomplete or non-numeric in any of those fields.
         """
         try:
-            from PyQt5.QtWidgets import QFileDialog, QMessageBox
-            import numpy as np
-            import pandas as pd
-
-            # Open File Dialog for Excel file
-            file_dialog = QFileDialog(self)
-            file_dialog.setNameFilter("Excel Files (*.xlsx)")
-            file_dialog.setWindowTitle("Select Estimation Grid Excel File")
-            if file_dialog.exec_():
-                file_path = file_dialog.selectedFiles()[0]
-            else:
-                return  # User canceled
-
-            # Load Excel File
-            try:
-                df = pd.read_excel(file_path)
-            except Exception as e:
-                QMessageBox.warning(self, "Error", f"Could not read Excel file:\n{str(e)}")
+            file_path = self._prompt_open_xlsx(
+                "Select Estimation Grid Excel File"
+            )
+            if not file_path:
                 return
 
-            if df.shape[1] < 4:
+            try:
+                table_rows = read_excel_table_rows(file_path)
+            except ImportError as exc:
+                QMessageBox.warning(self, "Error", str(exc))
+                return
+            except Exception as e:
                 QMessageBox.warning(
-                    self,
-                    "Invalid File",
-                    f"The selected file must have at least 4 columns for ID, X, Y, and Weight (in that order).\nColumns found: {list(df.columns)}",
+                    self, "Error", f"Could not read Excel file:\n{str(e)}"
                 )
                 return
 
-            # Take only the first 4 columns in order
-            df_use = df.iloc[:, :4].copy()
-            df_use.columns = ['id', 'x', 'y', 'weight']
-
-            # Remove any row where x, y, or weight is missing or non-numeric
-            df_use = df_use[pd.notnull(df_use['id']) & pd.notnull(df_use['x']) & pd.notnull(df_use['y']) & pd.notnull(df_use['weight'])]
-            # Convert and filter to only keep rows where x, y, weight are numeric
-            for col in ['x', 'y', 'weight']:
-                df_use[col] = pd.to_numeric(df_use[col], errors='coerce')
-            valid = df_use[['x', 'y', 'weight']].notnull().all(axis=1)
-            df_use = df_use[valid]
-
-            if df_use.empty:
-                QMessageBox.warning(self, "Error", "No valid records with ID, X, Y, and Weight found in the file.")
+            if not table_rows:
+                QMessageBox.warning(
+                    self, "Error", "The selected Excel file is empty."
+                )
                 return
 
-            ids = df_use['id'].to_numpy()
-            xs = df_use['x'].to_numpy(dtype=float)
-            ys = df_use['y'].to_numpy(dtype=float)
-            weights = df_use['weight'].to_numpy(dtype=float)
+            if len(table_rows[0]) < 4:
+                QMessageBox.warning(
+                    self,
+                    "Invalid File",
+                    "The selected file must have at least 4 columns for "
+                    "ID, X, Y, and Weight (in that order).",
+                )
+                return
 
+            ids = []
+            xs = []
+            ys = []
+            weights = []
+            for row in table_rows[1:]:
+                if row is None or len(row) < 4:
+                    continue
+                id_val, x_val, y_val, w_val = row[0], row[1], row[2], row[3]
+                if (
+                    id_val is None
+                    or x_val is None
+                    or y_val is None
+                    or w_val is None
+                ):
+                    continue
+                try:
+                    x_f = float(x_val)
+                    y_f = float(y_val)
+                    w_f = float(w_val)
+                except (ValueError, TypeError):
+                    continue
+                if np.isnan(x_f) or np.isnan(y_f) or np.isnan(w_f):
+                    continue
+                ids.append(id_val)
+                xs.append(x_f)
+                ys.append(y_f)
+                weights.append(w_f)
+
+            if not ids:
+                QMessageBox.warning(
+                    self,
+                    "Error",
+                    "No valid records with ID, X, Y, and Weight found in the file.",
+                )
+                return
+
+            xs = np.asarray(xs, dtype=float)
+            ys = np.asarray(ys, dtype=float)
+            weights = np.asarray(weights, dtype=float)
             grid_points = np.column_stack([xs, ys])
             n_nodes = grid_points.shape[0]
 
@@ -2668,7 +3711,7 @@ class MonitoringNetworksDialog(QDialog):
             self.current_grid_info = {
                 'grid_points': grid_points,
                 'n_nodes': n_nodes,
-                'ids': ids,
+                'ids': np.asarray(ids),
                 'weights': weights,
                 'grid_type': "imported_from_xlsx",
                 'buffer': 0.0,
@@ -2689,7 +3732,7 @@ class MonitoringNetworksDialog(QDialog):
             ax.set_title("Imported Estimation Grid")
             ax.set_xlabel("X")
             ax.set_ylabel("Y")
-            cb = self.grid_figure.colorbar(
+            self.grid_figure.colorbar(
                 ax.collections[0], ax=ax, orientation='vertical', label="Weight"
             )
             ax.set_aspect('equal', 'box')
@@ -2698,11 +3741,16 @@ class MonitoringNetworksDialog(QDialog):
             QMessageBox.information(
                 self,
                 "Success",
-                f"Grid loaded successfully with {n_nodes} points.\n(used columns: first 4 columns of file)"
+                f"Grid loaded successfully with {n_nodes} points.\n"
+                "(used columns: first 4 columns of file)",
             )
         except Exception as e:
             import traceback
-            QMessageBox.warning(self, "Error", f"Failed to load grid: {str(e)}\n{traceback.format_exc()}")
+            QMessageBox.warning(
+                self,
+                "Error",
+                f"Failed to load grid: {str(e)}\n{traceback.format_exc()}",
+            )
 
 class VariogramWidget(QWidget):
     """Widget visualization and adjustment of variogram"""
