@@ -716,9 +716,9 @@ def compute_weighted_multi_parameter_variance_reduction_curve(
 
     Phase 2 (variance-reduction curve):
       - Uses the shared selection order from phase 1.
-      - For each step, computes ordinary-kriging variance per parameter,
-        divides by that parameter's initial variance (0 wells), then combines:
-            V_combined(t) = sum_p( w_p * V_p_norm(t) )
+      - Baseline at 0 wells is n_grid (same convention as single-parameter mode).
+      - At each step, computes OK variance per parameter and combines:
+            V_combined(t) = sum_p( w_p * V_p_OK(t) )
 
     Optional per-well weights (layer column) multiply the combined score(k),
     matching the single-parameter routine.
@@ -815,28 +815,18 @@ def compute_weighted_multi_parameter_variance_reduction_curve(
             break
 
     # Phase 2: weighted combination of per-parameter OK variances along the order.
-    initial_norm_vars = []
-    for spec, model in zip(parameter_specs, param_models):
-        var0 = _mean_simple_kriging_variance(
-            None,
-            np.array([], dtype=float),
-            grid_coordinates,
-            model,
-            grid_weights=grid_weights,
-        )
-        initial_norm_vars.append(var0)
-
+    # Baseline at t=0 uses n_grid, matching single-parameter mode and
+    # geostat_app_kalman_v10 (not _mean_simple_kriging_variance with zero wells,
+    # which returns inf and makes the first step appear as 100% reduction).
     num_puntos = [0]
-    varianzas = [float(np.dot(param_weights, initial_norm_vars))]
+    varianzas = [float(n_grid)]
 
     indices_acumulados = []
     for idx in selected:
         indices_acumulados.append(idx)
         sel_coords = well_coordinates[indices_acumulados]
         step_vars = []
-        for spec, model, var0 in zip(
-            parameter_specs, param_models, initial_norm_vars
-        ):
+        for spec, model in zip(parameter_specs, param_models):
             sel_vals = np.asarray(spec['values'], dtype=float)[indices_acumulados]
             var_ok = _mean_simple_kriging_variance(
                 sel_coords,
@@ -845,10 +835,7 @@ def compute_weighted_multi_parameter_variance_reduction_curve(
                 model,
                 grid_weights=grid_weights,
             )
-            if var0 > 0:
-                step_vars.append(var_ok / var0)
-            else:
-                step_vars.append(var_ok)
+            step_vars.append(var_ok)
         varianzas.append(float(np.dot(param_weights, step_vars)))
         num_puntos.append(len(indices_acumulados))
 
