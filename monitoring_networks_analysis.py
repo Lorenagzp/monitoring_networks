@@ -23,6 +23,8 @@
 """
 
 import os
+from dataclasses import dataclass
+from typing import List, Optional
 
 import gstools as gs
 import numpy as np
@@ -46,6 +48,61 @@ _WELL_WEIGHT_FIELD_HINTS = (
     'peso_pozo', 'well_weight', 'w_pozo', 'peso_w', 'well_w',
     'weight_well', 'pozo_peso','w'
 )
+
+
+@dataclass
+class ParameterInput:
+    """
+    One geostatistical parameter measured at the monitoring wells.
+
+    Each parameter has its own sample values, variogram model and optional
+    user weight (tab 2). Spatial locations are shared at OptimizationInput level.
+    """
+
+    name: str
+    values: np.ndarray
+    model_type: str = 'spherical'
+    nugget: float = 0.0
+    sill: float = 0.0
+    range_val: float = 0.0
+    weight: float = 1.0
+
+
+@dataclass
+class OptimizationInput:
+    """
+    Full input for well-network variance-reduction optimization.
+
+    Network-wide fields (coordinates, IDs, well/grid weights, estimation grid)
+    are stored once. Each entry in ``parameters`` supplies values and a
+    variogram for one contaminant or property.
+
+    ``grid_coordinates`` must contain every estimation node from tab 3 (generated
+    or imported). Kalman optimization uses the full grid, matching
+    geostat_app_kalman_v10.
+    """
+
+    coordinates: np.ndarray
+    grid_coordinates: np.ndarray
+    parameters: List[ParameterInput]
+    point_ids: Optional[np.ndarray] = None
+    well_weights: Optional[np.ndarray] = None
+    grid_weights: Optional[np.ndarray] = None
+
+    def __post_init__(self):
+        self.coordinates = np.asarray(self.coordinates, dtype=float)
+        self.grid_coordinates = np.asarray(self.grid_coordinates, dtype=float)
+        if not self.parameters:
+            raise ValueError("At least one ParameterInput is required.")
+        n_wells = self.coordinates.shape[0]
+        for param in self.parameters:
+            values = np.asarray(param.values, dtype=float).ravel()
+            if values.size != n_wells:
+                raise ValueError(
+                    f"Parameter «{param.name}» has {values.size} values "
+                    f"but {n_wells} well coordinates were provided."
+                )
+
 
 class MonitoringNetworksAnalysis:
     """Class for the analysis of the monitoring networks"""
@@ -117,6 +174,35 @@ def extract_coordinates_and_values_from_layer(layer, attribute):
     
     except Exception:
         return None, None, 0
+
+
+def extract_layer_coordinates(layer):
+    """
+    Extracts XY coordinates from every point feature in a vector layer.
+
+    Returns:
+        ndarray of shape (n_points, 2), or None when the layer is invalid
+        or contains no point geometries.
+    """
+    try:
+        from qgis.core import QgsVectorLayer
+
+        if not isinstance(layer, QgsVectorLayer):
+            return None
+
+        coordinates = []
+        for feature in layer.getFeatures():
+            geom = feature.geometry()
+            if not geom or geom.isEmpty():
+                continue
+            point = geom.asPoint()
+            coordinates.append([point.x(), point.y()])
+
+        if not coordinates:
+            return None
+        return np.asarray(coordinates, dtype=float)
+    except Exception:
+        return None
 
 
 def apply_value_transform(values, transform='none'):
@@ -398,76 +484,41 @@ def build_covariance_model(model_type, nugget, sill, range_val):
     return gs.Matern(dim=2, var=var, len_scale=len_scale, nugget=nugget)
 
 
-def run_leave_one_out_cross_validation(
-    coordinates, values, model_type, nugget, sill, range_val
-):
+def compute_cross_validation_summary(errors):
     """
-    Leave-one-out ordinary kriging cross-validation.
+    Builds cross-validation summary metrics from prediction errors.
+
+    The first three statistics are min, max and mean of the signed error
+    (measured - predicted). MAE, MSE and RMSE use only finite error values.
 
     Returns:
-        dict with keys summary (min/max/mean of measured values, MAE, MSE, RMSE)
-        and rows (per-point measured, predicted, error, SE, standardized error).
-        Returns None when there are fewer than three valid points.
+        dict with keys min, max, mean, mae, mse, rmse.
     """
-    coordinates = np.asarray(coordinates, dtype=float)
-    values = np.asarray(values, dtype=float)
-    n = values.size
-    if n < 3:
-        return None
+    errors = np.asarray(errors, dtype=float).ravel()
+    valid_errors = errors[np.isfinite(errors)]
+    if valid_errors.size == 0:
+        return {
+            'min': np.nan,
+            'max': np.nan,
+            'mean': np.nan,
+            'mae': np.nan,
+            'mse': np.nan,
+            'rmse': np.nan,
+        }
 
-    x = coordinates[:, 0]
-    y = coordinates[:, 1]
-    model = build_covariance_model(model_type, nugget, sill, range_val)
-
-    predicted = np.full(n, np.nan)
-    kriging_var = np.full(n, np.nan)
-
-    for i in range(n):
-        train_mask = np.ones(n, dtype=bool)
-        train_mask[i] = False
-        krige = gs.krige.Ordinary(
-            model,
-            cond_pos=(x[train_mask], y[train_mask]),
-            cond_val=values[train_mask],
-        )
-        estimate, variance = krige(
-            (np.array([x[i]]), np.array([y[i]])),
-            return_var=True,
-        )
-        predicted[i] = float(np.asarray(estimate).ravel()[0])
-        kriging_var[i] = max(float(np.asarray(variance).ravel()[0]), 0.0)
-
-    errors = values - predicted
-    se = np.sqrt(kriging_var)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        standardized = np.where(se > 0, errors / se, np.nan)
-
-    abs_errors = np.abs(errors)
-    mse = float(np.mean(errors ** 2))
-
-    summary = {
-        'min': float(np.min(values)),
-        'max': float(np.max(values)),
-        'mean': float(np.mean(values)),
+    abs_errors = np.abs(valid_errors)
+    mse = float(np.mean(valid_errors ** 2))
+    return {
+        'min': float(np.min(valid_errors)),
+        'max': float(np.max(valid_errors)),
+        'mean': float(np.mean(valid_errors)),
         'mae': float(np.mean(abs_errors)),
         'mse': mse,
         'rmse': float(np.sqrt(mse)),
     }
 
-    rows = []
-    for i in range(n):
-        rows.append({
-            'measured': float(values[i]),
-            'predicted': float(predicted[i]),
-            'error': float(errors[i]),
-            'se': float(se[i]),
-            'standardized_error': float(standardized[i]),
-        })
 
-    return {'summary': summary, 'rows': rows}
-
-
-def run_network_cross_validation(
+def run_ordinary_kriging_cross_validation(
     coordinates,
     values,
     model_type,
@@ -477,14 +528,20 @@ def run_network_cross_validation(
     network_indices=None,
 ):
     """
-    Cross-validation for ordinary kriging with an optional monitoring network.
+    Ordinary-kriging cross-validation for a full dataset or a monitoring network.
 
-    When network_indices is None, all points are in the network (standard LOO CV).
-    Otherwise, network wells use leave-one-out among the network; other wells are
-    predicted using the full network as conditioning data.
+    When network_indices is None, every point is in the network and each point
+    is predicted with leave-one-out among all points (standard LOO CV).
+
+    When network_indices is provided, network wells are cross-validated with
+    leave-one-out among the network; other wells are predicted using the full
+    network as conditioning data only.
 
     Returns:
-        dict with summary, rows (each row includes 'included': bool), or None.
+        dict with summary (error min/max/mean, MAE, MSE, RMSE) and rows
+        (measured, predicted, error, SE, standardized error, included).
+        None when there are fewer than three points or fewer than three
+        successful predictions.
     """
     coordinates = np.asarray(coordinates, dtype=float)
     values = np.asarray(values, dtype=float)
@@ -493,21 +550,13 @@ def run_network_cross_validation(
         return None
 
     if network_indices is None:
-        cv = run_leave_one_out_cross_validation(
-            coordinates, values, model_type, nugget, sill, range_val
-        )
-        if cv is None:
+        network_mask = np.ones(n, dtype=bool)
+    else:
+        network_indices = np.asarray(network_indices, dtype=int)
+        if network_indices.size < 1:
             return None
-        for row in cv['rows']:
-            row['included'] = True
-        return cv
-
-    network_indices = np.asarray(network_indices, dtype=int)
-    if network_indices.size < 1:
-        return None
-
-    network_mask = np.zeros(n, dtype=bool)
-    network_mask[network_indices] = True
+        network_mask = np.zeros(n, dtype=bool)
+        network_mask[network_indices] = True
 
     x = coordinates[:, 0]
     y = coordinates[:, 1]
@@ -526,6 +575,8 @@ def run_network_cross_validation(
             included_flags[i] = True
         else:
             train_mask = network_mask
+            if np.sum(train_mask) < 1:
+                continue
 
         krige = gs.krige.Ordinary(
             model,
@@ -539,27 +590,15 @@ def run_network_cross_validation(
         predicted[i] = float(np.asarray(estimate).ravel()[0])
         kriging_var[i] = max(float(np.asarray(variance).ravel()[0]), 0.0)
 
-    valid = np.isfinite(predicted)
-    if np.sum(valid) < 3:
+    if np.sum(np.isfinite(predicted)) < 3:
         return None
 
-    errors = values - predicted
+    errors = predicted - values
     se = np.sqrt(kriging_var)
     with np.errstate(divide='ignore', invalid='ignore'):
         standardized = np.where(se > 0, errors / se, np.nan)
 
-    abs_errors = np.abs(errors[valid])
-    sq_errors = errors[valid] ** 2
-    mse = float(np.mean(sq_errors))
-
-    summary = {
-        'min': float(np.min(values)),
-        'max': float(np.max(values)),
-        'mean': float(np.mean(values)),
-        'mae': float(np.mean(abs_errors)),
-        'mse': mse,
-        'rmse': float(np.sqrt(mse)),
-    }
+    summary = compute_cross_validation_summary(errors)
 
     rows = []
     for i in range(n):
@@ -627,21 +666,6 @@ def _mean_simple_kriging_variance(cond_coords, cond_vals, grid_coords, model, gr
     return float(np.sum(krige_var) / norm_factor / 2.0)
 
 
-def _subsample_estimation_grid(grid_coordinates, grid_weights, max_grid_nodes, rng_seed=0):
-    """Optionally subsample grid nodes (shared by single- and multi-parameter runs)."""
-    grid_coordinates = np.asarray(grid_coordinates, dtype=float)
-    n_grid = grid_coordinates.shape[0]
-    if n_grid <= max_grid_nodes:
-        return grid_coordinates, grid_weights, n_grid
-
-    rng = np.random.default_rng(rng_seed)
-    pick = rng.choice(n_grid, size=max_grid_nodes, replace=False)
-    grid_coordinates = grid_coordinates[pick]
-    if grid_weights is not None:
-        grid_weights = np.asarray(grid_weights, dtype=float).ravel()[pick]
-    return grid_coordinates, grid_weights, int(max_grid_nodes)
-
-
 def _init_kalman_covariance_state(well_coordinates, grid_coordinates, model):
     """Builds Kalman covariance state for one variogram model."""
     n_grid = grid_coordinates.shape[0]
@@ -690,62 +714,52 @@ def _kalman_rank1_update(k, state):
     state['C_cc'] -= np.outer(c_ck, c_ck) * inv_S
 
 
-def compute_weighted_multi_parameter_variance_reduction_curve(
-    parameter_specs,
-    grid_coordinates,
-    max_grid_nodes=500,
-    well_weights=None,
-    grid_weights=None,
-):
+def compute_variance_reduction_curve(optimization_input):
     """
-    Multi-parameter Kalman prioritization with tab-2 parameter weights.
+    Greedy Kalman well prioritization with an ordinary-kriging variance curve.
 
-    DESIGN NOTE (explicit ambiguity resolution)
-    -------------------------------------------
-    Each parameter has its own variogram, so there is no single covariance
-    matrix for all variables. This implementation therefore:
+    Uses the full estimation grid supplied in ``OptimizationInput`` (every node
+    generated on tab 3 or imported from Excel). This matches geostat_app_kalman_v10,
+    which evaluates the full ``df_malla`` without random subsampling.
 
-    Phase 1 (well ordering):
-      - Keeps one Kalman state per parameter (same well locations, different
-        spatial correlation models).
-      - Scores each candidate well k with the weighted sum of per-parameter
-        grid variance reductions:
-            score(k) = sum_p( w_p * reduction_p(k) )
-        where w_p are the user weights from tab 2, normalized to sum to 1.
-      - When k is selected, applies a rank-1 Kalman update to every state.
+    Accepts one or several parameters via ``OptimizationInput``. When multiple
+    parameters are supplied, each keeps its own variogram (no cross-covariance);
+    phase 1 ranks wells by a weighted sum of per-parameter grid variance
+    reductions, and phase 2 combines per-parameter OK variances with the same
+    weights.
 
-    Phase 2 (variance-reduction curve):
-      - Uses the shared selection order from phase 1.
-      - Baseline at 0 wells is n_grid (same convention as single-parameter mode).
-      - At each step, computes OK variance per parameter and combines:
-            V_combined(t) = sum_p( w_p * V_p_OK(t) )
+    Phase 1 — well ordering (fast Kalman / SK-equivalent covariance updates):
+        score(k) = well_weight[k] * sum_p( w_p * reduction_p(k) )
+        where reduction_p(k) is the weighted grid variance drop if well k is
+        assimilated for parameter p, and w_p are tab-2 weights (normalized).
 
-    Optional per-well weights (layer column) multiply the combined score(k),
-    matching the single-parameter routine.
+    Phase 2 — variance-reduction curve along the selected order:
+        At step t, V(t) = sum_p( w_p * OK_variance_p(t) )
+        Baseline V(0) = n_grid nodes (geostat_app_kalman_v10 convention).
 
-    Args:
-        parameter_specs: list of dicts with keys
-            name, coordinates, values, model_type, nugget, sill, range, weight.
+    Returns:
+        dict with n_points, normalized_variances, variance_reduction (%),
+        selection_order, grid_node_count, combined_mode, parameters,
+        parameter_weights; or None if inputs are insufficient.
     """
-    if not parameter_specs:
+    if not isinstance(optimization_input, OptimizationInput):
         return None
 
-    well_coordinates = np.asarray(parameter_specs[0]['coordinates'], dtype=float)
+    try:
+        well_coordinates = np.asarray(optimization_input.coordinates, dtype=float)
+        parameters = optimization_input.parameters
+    except (ValueError, TypeError):
+        return None
+
     n_candidates = well_coordinates.shape[0]
     if n_candidates < 1:
         return None
 
-    for spec in parameter_specs[1:]:
-        coords = np.asarray(spec['coordinates'], dtype=float)
-        if coords.shape != well_coordinates.shape:
-            return None
-        if not np.allclose(coords, well_coordinates):
-            return None
+    grid_coordinates = np.asarray(optimization_input.grid_coordinates, dtype=float)
+    grid_weights = optimization_input.grid_weights
+    well_weights = optimization_input.well_weights
 
-    grid_coordinates = np.asarray(grid_coordinates, dtype=float)
-    grid_coordinates, grid_weights, n_grid = _subsample_estimation_grid(
-        grid_coordinates, grid_weights, max_grid_nodes
-    )
+    n_grid = grid_coordinates.shape[0]
     if n_grid < 1:
         return None
 
@@ -760,38 +774,42 @@ def compute_weighted_multi_parameter_variance_reduction_curve(
         if grid_weights.size != n_grid:
             grid_weights = None
         else:
+            # Normalize spatial priorities on the estimation grid (tab 3 / tab 4).
             pesos_norm = normalized_grid_weights(grid_weights)
 
     raw_weights = np.asarray(
-        [max(float(spec.get('weight', 1.0)), 0.0) for spec in parameter_specs],
+        [max(float(param.weight), 0.0) for param in parameters],
         dtype=float,
     )
     if np.sum(raw_weights) <= 0:
-        param_weights = np.full(len(parameter_specs), 1.0 / len(parameter_specs))
+        param_weights = np.full(len(parameters), 1.0 / len(parameters))
     else:
         param_weights = raw_weights / np.sum(raw_weights)
 
+    # One Kalman covariance state per parameter (same wells, different variograms).
     param_states = []
     param_models = []
-    for spec in parameter_specs:
+    for param in parameters:
         model = build_covariance_model(
-            spec.get('model_type', 'spherical'),
-            spec.get('nugget', 0),
-            spec.get('sill', 0),
-            spec.get('range', 0),
+            param.model_type,
+            param.nugget,
+            param.sill,
+            param.range_val,
         )
         param_models.append(model)
         param_states.append(
-            _init_kalman_covariance_state(well_coordinates, grid_coordinates, model)
+            _init_kalman_covariance_state(
+                well_coordinates, grid_coordinates, model
+            )
         )
 
     selected = []
     disponibles = list(range(n_candidates))
 
-    # Phase 1: greedy selection using weighted multi-parameter Kalman scores.
+    # Phase 1: greedily pick the well with highest combined variance reduction.
     for _step in range(len(disponibles)):
-        mejor_idx = None
-        mejor_score = -np.inf
+        best_idx = None
+        best_score = -np.inf
 
         for k in disponibles:
             combined_reduction = 0.0
@@ -799,25 +817,22 @@ def compute_weighted_multi_parameter_variance_reduction_curve(
                 combined_reduction += weight * _kalman_candidate_reduction(
                     k, state, pesos_norm
                 )
-            peso_k = well_weights[k] if well_weights is not None else 1.0
-            score = peso_k * combined_reduction
-            if score > mejor_score:
-                mejor_score = score
-                mejor_idx = k
+            well_factor = well_weights[k] if well_weights is not None else 1.0
+            score = well_factor * combined_reduction
+            if score > best_score:
+                best_score = score
+                best_idx = k
 
-        if mejor_idx is not None and mejor_score > 1e-15:
+        if best_idx is not None and best_score > 1e-15:
             for state in param_states:
-                _kalman_rank1_update(mejor_idx, state)
-            selected.append(mejor_idx)
-            disponibles.remove(mejor_idx)
+                _kalman_rank1_update(best_idx, state)
+            selected.append(best_idx)
+            disponibles.remove(best_idx)
         else:
             selected.extend(disponibles)
             break
 
-    # Phase 2: weighted combination of per-parameter OK variances along the order.
-    # Baseline at t=0 uses n_grid, matching single-parameter mode and
-    # geostat_app_kalman_v10 (not _mean_simple_kriging_variance with zero wells,
-    # which returns inf and makes the first step appear as 100% reduction).
+    # Phase 2: evaluate weighted OK variance along the fixed selection order.
     num_puntos = [0]
     varianzas = [float(n_grid)]
 
@@ -826,8 +841,8 @@ def compute_weighted_multi_parameter_variance_reduction_curve(
         indices_acumulados.append(idx)
         sel_coords = well_coordinates[indices_acumulados]
         step_vars = []
-        for spec, model in zip(parameter_specs, param_models):
-            sel_vals = np.asarray(spec['values'], dtype=float)[indices_acumulados]
+        for param, model in zip(parameters, param_models):
+            sel_vals = np.asarray(param.values, dtype=float)[indices_acumulados]
             var_ok = _mean_simple_kriging_variance(
                 sel_coords,
                 sel_vals,
@@ -847,135 +862,19 @@ def compute_weighted_multi_parameter_variance_reduction_curve(
     else:
         variance_reduction = np.zeros_like(varianzas)
 
+    combined_mode = len(parameters) > 1
     return {
         'n_points': num_puntos,
         'normalized_variances': varianzas,
         'variance_reduction': variance_reduction,
         'selection_order': np.asarray(selected, dtype=int),
-        'grid_nodes_used': int(n_grid),
-        'combined_mode': True,
-        'parameters': [spec['name'] for spec in parameter_specs],
+        'grid_node_count': int(n_grid),
+        'combined_mode': combined_mode,
+        'parameters': [param.name for param in parameters],
         'parameter_weights': {
-            spec['name']: float(weight)
-            for spec, weight in zip(parameter_specs, param_weights)
+            param.name: float(weight)
+            for param, weight in zip(parameters, param_weights)
         },
-    }
-
-
-def compute_simple_kriging_variance_reduction_curve(
-    well_coordinates,
-    well_values,
-    grid_coordinates,
-    model_type,
-    nugget,
-    sill,
-    range_val,
-    max_grid_nodes=500,
-    well_weights=None,
-    grid_weights=None,
-):
-    """
-    Kalman-filter well prioritization (geostat_app_kalman_v10 ejecutar_kalman).
-
-    Phase 1: greedy rank-1 Kalman updates on the covariance matrices determine
-    the optimal selection order (equivalent to simple kriging, fast).
-
-    Phase 2: normalized ordinary-kriging variance is evaluated along that
-    order for a comparable variance-reduction curve.
-
-    When well_weights is provided, phase 1 scores each candidate as
-    well_weights[k] * weighted grid variance reduction.
-
-    When grid_weights is provided, phase 1 uses dot(reduction, pesos_norm) and
-    phase 2 uses weighted OK variance aggregation (geostat_app_kalman_v10).
-
-    Returns:
-        dict with n_points, normalized_variances, variance_reduction (%),
-        selection_order, grid_nodes_used; None if inputs are insufficient.
-    """
-    well_coordinates = np.asarray(well_coordinates, dtype=float)
-    well_values = np.asarray(well_values, dtype=float).ravel()
-    grid_coordinates = np.asarray(grid_coordinates, dtype=float)
-    n_candidates = well_coordinates.shape[0]
-    n_grid = grid_coordinates.shape[0]
-
-    if well_weights is not None:
-        well_weights = np.asarray(well_weights, dtype=float).ravel()
-        if well_weights.size != n_candidates:
-            well_weights = None
-
-    pesos_norm = None
-    if grid_weights is not None:
-        grid_weights = np.asarray(grid_weights, dtype=float).ravel()
-        if grid_weights.size != n_grid:
-            grid_weights = None
-
-    if n_candidates < 1 or n_grid < 1:
-        return None
-
-    grid_coordinates, grid_weights, n_grid = _subsample_estimation_grid(
-        grid_coordinates, grid_weights, max_grid_nodes
-    )
-
-    if grid_weights is not None:
-        pesos_norm = normalized_grid_weights(grid_weights)
-
-    model = build_covariance_model(model_type, nugget, sill, range_val)
-    state = _init_kalman_covariance_state(
-        well_coordinates, grid_coordinates, model
-    )
-
-    selected = []
-    disponibles = list(range(n_candidates))
-
-    for _step in range(len(disponibles)):
-        mejor_idx = None
-        mejor_score = -np.inf
-
-        for k in disponibles:
-            reduccion_total = _kalman_candidate_reduction(k, state, pesos_norm)
-            peso_k = well_weights[k] if well_weights is not None else 1.0
-            score = peso_k * reduccion_total
-            if score > mejor_score:
-                mejor_score = score
-                mejor_idx = k
-
-        if mejor_idx is not None and mejor_score > 1e-15:
-            _kalman_rank1_update(mejor_idx, state)
-            selected.append(mejor_idx)
-            disponibles.remove(mejor_idx)
-        else:
-            selected.extend(disponibles)
-            break
-
-    num_puntos = [0]
-    varianzas = [float(n_grid)]
-
-    indices_acumulados = []
-    for idx in selected:
-        indices_acumulados.append(idx)
-        sel_coords = well_coordinates[indices_acumulados]
-        sel_vals = well_values[indices_acumulados]
-        var_ok = _mean_simple_kriging_variance(
-            sel_coords, sel_vals, grid_coordinates, model, grid_weights=grid_weights
-        )
-        varianzas.append(var_ok)
-        num_puntos.append(len(indices_acumulados))
-
-    varianzas = np.asarray(varianzas, dtype=float)
-    num_puntos = np.asarray(num_puntos, dtype=int)
-    var_inicial = varianzas[0]
-    if var_inicial > 0:
-        variance_reduction = (1.0 - varianzas / var_inicial) * 100.0
-    else:
-        variance_reduction = np.zeros_like(varianzas)
-
-    return {
-        'n_points': num_puntos,
-        'normalized_variances': varianzas,
-        'variance_reduction': variance_reduction,
-        'selection_order': np.asarray(selected, dtype=int),
-        'grid_nodes_used': int(n_grid),
     }
 
 
@@ -1034,8 +933,13 @@ def ordinary_kriging_interpolation(
     return estimates
 
 
-def _excel_scalar(value):
-    """Coerces a value to something openpyxl can write in write_only mode."""
+def _excel_cell_value(value):
+    """
+    Coerces a Python/numpy value to a type XlsxWriter can write to a cell.
+
+    Empty cells are written as None. Non-finite floats become blank cells so
+    Excel does not show NaN/Inf literals.
+    """
     if value is None:
         return None
     if isinstance(value, (np.floating, float)):
@@ -1048,37 +952,89 @@ def _excel_scalar(value):
     return value
 
 
+def _sanitize_excel_sheet_name(sheet_name):
+    """
+    Returns an Excel-safe worksheet title (max 31 chars, no forbidden chars).
+
+    XlsxWriter rejects names containing : \\ / ? * [ ] or exceeding 31 chars.
+    """
+    invalid_chars = str.maketrans({
+        ':': '_',
+        '\\': '_',
+        '/': '_',
+        '?': '_',
+        '*': '_',
+        '[': '_',
+        ']': '_',
+    })
+    safe = str(sheet_name).translate(invalid_chars).strip()
+    if not safe:
+        safe = "Sheet"
+    return safe[:31]
+
+
 def write_excel_sheets(file_path, sheet_specs):
     """
-    Write an .xlsx file without pandas or openpyxl style initialization.
+    Write a multi-sheet .xlsx file using XlsxWriter (export path only).
 
-    Uses write_only mode, which avoids the NamedStyle copy crash seen in some
-    QGIS / Python environments.
+    Exports use XlsxWriter instead of openpyxl because several QGIS builds on
+    Windows crash with an access violation inside openpyxl when initializing
+    workbook styles (NamedStyle copy / libxml2). XlsxWriter writes data-only
+    workbooks without that style bootstrap.
+
+    Grid import continues to use openpyxl read-only mode in
+    ``read_excel_table_rows`` because XlsxWriter is write-only.
 
     Args:
-        file_path: destination .xlsx path
-        sheet_specs: iterable of (sheet_name, column_names, row_dicts)
+        file_path: Destination .xlsx path.
+        sheet_specs: Iterable of (sheet_name, column_names, row_dicts).
+            Each row_dict maps column name -> cell value.
     """
     try:
-        from openpyxl import Workbook
+        import xlsxwriter
     except ImportError as exc:
-        raise ImportError("openpyxl is required to export Excel files.") from exc
+        raise ImportError(
+            "xlsxwriter is required to export Excel files."
+        ) from exc
 
-    wb = Workbook(write_only=True)
-    for sheet_name, columns, rows in sheet_specs:
-        ws = wb.create_sheet(title=str(sheet_name)[:31])
-        ws.append([str(col) for col in columns])
-        for row in rows:
-            ws.append([
-                _excel_scalar(row.get(col))
-                for col in columns
-            ])
-    wb.save(file_path)
+    if not sheet_specs:
+        raise ValueError("At least one worksheet specification is required.")
+
+    output_path = str(file_path)
+    workbook = xlsxwriter.Workbook(
+        output_path,
+        {
+            # Keep well IDs and similar fields as text unless explicitly numeric.
+            'strings_to_numbers': False,
+        },
+    )
+    try:
+        for sheet_name, columns, rows in sheet_specs:
+            if not columns:
+                continue
+            worksheet = workbook.add_worksheet(
+                _sanitize_excel_sheet_name(sheet_name)
+            )
+            for col_idx, column in enumerate(columns):
+                worksheet.write(0, col_idx, str(column))
+            for row_idx, row in enumerate(rows, start=1):
+                for col_idx, column in enumerate(columns):
+                    worksheet.write(
+                        row_idx,
+                        col_idx,
+                        _excel_cell_value(row.get(column)),
+                    )
+    finally:
+        # Always close so partial files are flushed or the handle is released.
+        workbook.close()
 
 
 def read_excel_table_rows(file_path):
     """
-    Read the first worksheet as a list of row tuples (read_only mode).
+    Read the first worksheet as a list of row tuples (openpyxl read-only).
+
+    Import uses openpyxl because XlsxWriter is write-only. Read-only mode avoids
+    the style initialization path that crashes during export on some systems.
 
     Returns:
         list[tuple]: all rows including the header row, if present.

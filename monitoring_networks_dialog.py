@@ -22,7 +22,7 @@
  ***************************************************************************/
 """
 
-### Functions for the user interface of the plugin.
+# Functions for the user interface of the plugin.
 
 from qgis.PyQt import uic
 from qgis.PyQt.QtCore import Qt, pyqtSignal, QTimer, QObject, QEvent, QVariant, QTranslator, QCoreApplication
@@ -47,16 +47,17 @@ from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 
 from .monitoring_networks_analysis import (
+    extract_layer_coordinates,
     extract_point_records_from_layer,
     align_coordinates_with_transform,
     align_point_ids_with_transform,
     align_well_weights_with_transform,
     resolve_well_weight_field,
     compute_descriptive_stats,
-    run_leave_one_out_cross_validation,
-    run_network_cross_validation,
-    compute_simple_kriging_variance_reduction_curve,
-    compute_weighted_multi_parameter_variance_reduction_curve,
+    run_ordinary_kriging_cross_validation,
+    compute_variance_reduction_curve,
+    OptimizationInput,
+    ParameterInput,
     ordinary_kriging_interpolation,
     write_excel_sheets,
     read_excel_table_rows,
@@ -66,10 +67,18 @@ from .monitoring_networks_analysis import (
 STATS_TRANSFORM_COL = 0
 STATS_VALUE_COL_OFFSET = 1
 
-STATS_VALUE_HEADERS = [
+STATS_VALUE_HEADERS = (
     'Count', 'Min', 'Max', 'Mean', 'Median',
     'Std Dev', 'Variance', 'Asymmetry', 'Kurtosis',
-]
+)
+
+
+def stats_value_header_labels():
+    """Column headers for the tab 2 basic statistics table."""
+    return [
+        QCoreApplication.translate("Tab 2", header)
+        for header in STATS_VALUE_HEADERS
+    ]
 
 VAR_COL_PARAM = 0
 VAR_COL_WEIGHT = 1
@@ -86,6 +95,40 @@ VARIOGRAM_MODEL_TYPES = [
 ]
 
 CV_SUMMARY_KEYS = ('min', 'max', 'mean', 'mae', 'mse', 'rmse')
+
+CV_SUMMARY_FORMATS = {
+    'min': '{:.3f}',
+    'max': '{:.3f}',
+    'mean': '{:.3f}',
+    'mae': '{:.3f}',
+    'mse': '{:.3f}',
+    'rmse': '{:.3f}',
+}
+
+
+def cv_summary_header_labels(context_name):
+    """Column headers for CV summary tables (tabs 2 and 5)."""
+    return [
+        QCoreApplication.translate(context_name, "Min error"),
+        QCoreApplication.translate(context_name, "Max error"),
+        QCoreApplication.translate(context_name, "Mean error"),
+        QCoreApplication.translate(context_name, "MAE"),
+        QCoreApplication.translate(context_name, "MSE"),
+        QCoreApplication.translate(context_name, "RMSE"),
+    ]
+
+
+def cv_results_header_labels(context_name):
+    """Column headers for per-point CV tables (tabs 2 and 5)."""
+    return [
+        QCoreApplication.translate(context_name, "ID"),
+        QCoreApplication.translate(context_name, "Included?"),
+        QCoreApplication.translate(context_name, "Measured"),
+        QCoreApplication.translate(context_name, "Predicted"),
+        QCoreApplication.translate(context_name, "Error"),
+        QCoreApplication.translate(context_name, "SE"),
+        QCoreApplication.translate(context_name, "Standardized Error"),
+    ]
 
 CV_COL_ID = 0
 CV_COL_INCLUDED = 1
@@ -123,9 +166,13 @@ class MonitoringNetworksDialog(QDialog):
         self.current_grid_points = None  # Store grid generated in tab 3 (array of points)
         self.variogram_models_by_attribute = {}  # Dictionary to store models by attribute
         self.variance_results = {}  # Variance reduction curves keyed by parameter
+
+        initial_layer = self.input_data_layer.currentLayer()
+        if initial_layer is not None:
+            self.on_layer_changed(initial_layer)
         
     def init_ui(self):
-        """Inicializa la interfaz de usuario"""
+        """Initialize the user interface"""
         layout = QVBoxLayout()
         
         self.tabs = QTabWidget()
@@ -167,7 +214,7 @@ class MonitoringNetworksDialog(QDialog):
         self.setup_results_tab()
         self.tabs.addTab(
             self.tab_results, 
-            "5. " + QCoreApplication.translate("Main Window", "Results")
+            "5. " + QCoreApplication.translate("Main Window", "Map")
         )
         
         layout.addWidget(self.tabs)
@@ -201,13 +248,17 @@ class MonitoringNetworksDialog(QDialog):
         data_tab_layout = QVBoxLayout()
 
         # Section to select the point layer to use
-        layer_group = QGroupBox() #"Selección de Capa de Puntos"
+        layer_group = QGroupBox()
         layer_layout = QVBoxLayout()
-        layer_layout.addWidget(QLabel("Capa de puntos:"))
+        layer_layout.addWidget(QLabel(
+            QCoreApplication.translate("Tab 1", "Point layer:")
+        ))
+   
         self.input_data_layer = QgsMapLayerComboBox() # Combo box to select layer of points from the TOC
         self.input_data_layer.setFilters(QgsMapLayerProxyModel.PointLayer) # Filter to show only point layers
         self.input_data_layer.layerChanged.connect(self.on_layer_changed)
         layer_layout.addWidget(self.input_data_layer)
+
 
         # Layer info text
         self.layer_info = QTextEdit()
@@ -215,13 +266,24 @@ class MonitoringNetworksDialog(QDialog):
         self.layer_info.setReadOnly(True)
         layer_layout.addWidget(self.layer_info)
         
+        layer_layout.addWidget(QLabel(
+            QCoreApplication.translate("Tab 1", "Layer attribute values:")
+        ))
+        self.layer_fields_table = QTableWidget()
+        self.layer_fields_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.layer_fields_table.setAlternatingRowColors(True)
+        self.layer_fields_table.horizontalHeader().setStretchLastSection(True)
+        self.layer_fields_table.setMinimumHeight(140)
+        self.layer_fields_table.setMaximumHeight(280)
+        layer_layout.addWidget(self.layer_fields_table)
+
         layer_group.setLayout(layer_layout)
         data_tab_layout.addWidget(layer_group)
         
         # Attribute selector section
-        attr_group = QGroupBox("Selección de Atributos para Análisis")
+        attr_group = QGroupBox(QCoreApplication.translate("Tab 1", "Selection of Attributes for Analysis"))
         attr_layout = QVBoxLayout()
-        attr_layout.addWidget(QLabel("Atributos disponibles para usar como parámetros de la red de monitoreo:"))
+        attr_layout.addWidget(QLabel(QCoreApplication.translate("Tab 1", "Attributes available to use as parameters of the monitoring network:")))
         
         # List of selectable attributes
         self.selected_data_parameters = QListWidget()
@@ -232,7 +294,7 @@ class MonitoringNetworksDialog(QDialog):
         attr_group.setLayout(attr_layout)
         data_tab_layout.addWidget(attr_group)
 
-        # Asignar el layout a la pestaña de datos
+        # Assign the layout to the data tab
         self.tab_data.setLayout(data_tab_layout)
         
     
@@ -259,7 +321,9 @@ class MonitoringNetworksDialog(QDialog):
         variogram_tab_layout.addLayout(attr_select_layout)
 
         # Calculate geostatistics button
-        self.calc_geostats_btn = QPushButton("Calculate geostatistics")
+        self.calc_geostats_btn = QPushButton(
+            QCoreApplication.translate("Tab 2", "Calculate geostatistics")
+        )
         self.calc_geostats_btn.clicked.connect(self.calculate_geostatistics)
         variogram_tab_layout.addWidget(self.calc_geostats_btn) #, 1, 1
 
@@ -276,12 +340,13 @@ class MonitoringNetworksDialog(QDialog):
         layout.setContentsMargins(10, 10, 10, 10)
 
         # 1. Basic statistics of the selected attribute
-        stats_group = QGroupBox("Basic statistics")
+        stats_group = QGroupBox(QCoreApplication.translate("Tab 2", "Basic statistics"))
         stats_layout = QVBoxLayout()
 
         self.stats_table = QTableWidget()
         table_headers = [QCoreApplication.translate(
-            "Tab 2",'Transformation')] + STATS_VALUE_HEADERS
+            "Tab 2", 'Transformation'
+        )] + stats_value_header_labels()
         self.stats_table.setColumnCount(len(table_headers))
         self.stats_table.setRowCount(1)
         self.stats_table.setHorizontalHeaderLabels(table_headers)
@@ -302,7 +367,6 @@ class MonitoringNetworksDialog(QDialog):
         self.stats_table.setCellWidget(
             0, STATS_TRANSFORM_COL, self.stats_transform_combo
         )
-        #self.stats_table.setColumnWidth(STATS_TRANSFORM_COL, 200) #borrar?
 
         for col in range(STATS_VALUE_COL_OFFSET, self.stats_table.columnCount()):
             self.stats_table.setItem(0, col, QTableWidgetItem(""))
@@ -310,7 +374,7 @@ class MonitoringNetworksDialog(QDialog):
 
         # Informative label to select attributes
         self.stats_info_label = QLabel(QCoreApplication.translate(
-            "Tab 2", "Select attribute so see its statistics")
+            "Tab 2", "Select an attribute to view its statistics.")
         )
         self.stats_info_label.setStyleSheet("color: gray; font-style: italic;")
         stats_layout.addWidget(self.stats_info_label) 
@@ -349,8 +413,8 @@ class MonitoringNetworksDialog(QDialog):
             QCoreApplication.translate("Tab 2", "Nugget"),
             QCoreApplication.translate("Tab 2", "Sill"), 
             QCoreApplication.translate("Tab 2", "Range"),
-            QCoreApplication.translate("Tab 2", "R²"),
-            QCoreApplication.translate("Tab 2", "Adjust")
+            QCoreApplication.translate("Tab 2", "R²")#,
+            #QCoreApplication.translate("Tab 2", "Adjust") #not used
         ])
         #self.var_params_table.setFixedHeight(126)
         # Connect table changes to update the variogram
@@ -401,14 +465,9 @@ class MonitoringNetworksDialog(QDialog):
         self.cv_summary_table = QTableWidget()
         self.cv_summary_table.setColumnCount(len(CV_SUMMARY_KEYS))
         self.cv_summary_table.setRowCount(1)
-        self.cv_summary_table.setHorizontalHeaderLabels([
-            QCoreApplication.translate("Tab 2", "Min"),
-            QCoreApplication.translate("Tab 2", "Max"),
-            QCoreApplication.translate("Tab 2", "Mean"),
-            QCoreApplication.translate("Tab 2", "MAE"),
-            QCoreApplication.translate("Tab 2", "MSE"),
-            QCoreApplication.translate("Tab 2", "RMSE"),
-        ])
+        self.cv_summary_table.setHorizontalHeaderLabels(
+            cv_summary_header_labels("Tab 2")
+        )
         self.cv_summary_table.verticalHeader().setVisible(False)
         self.cv_summary_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.cv_summary_table.setFixedHeight(70)
@@ -422,15 +481,9 @@ class MonitoringNetworksDialog(QDialog):
 
         self.cv_results_table = QTableWidget()
         self.cv_results_table.setColumnCount(7)
-        self.cv_results_table.setHorizontalHeaderLabels([
-            QCoreApplication.translate("Tab 2", "ID"),
-            QCoreApplication.translate("Tab 2", "Included?"),
-            QCoreApplication.translate("Tab 2", "Measured"),
-            QCoreApplication.translate("Tab 2", "Predicted"),
-            QCoreApplication.translate("Tab 2", "Error"),
-            QCoreApplication.translate("Tab 2", "SE"),
-            QCoreApplication.translate("Tab 2", "Standardized Error"),
-        ])
+        self.cv_results_table.setHorizontalHeaderLabels(
+            cv_results_header_labels("Tab 2")
+        )
         self.cv_results_table.verticalHeader().setVisible(True)
         self.cv_results_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.cv_results_table.setMinimumHeight(160)
@@ -469,7 +522,7 @@ class MonitoringNetworksDialog(QDialog):
         # Add the scroll area to the main layout
         variogram_tab_layout.addWidget(scroll_area)
 
-        # Asignar el layout a la pestaña de datos
+        # Assign the layout to the variogram tab
         self.tab_variogram.setLayout(variogram_tab_layout)
             
     def setup_grid_tab(self):
@@ -478,15 +531,19 @@ class MonitoringNetworksDialog(QDialog):
         layout = QVBoxLayout()
         
         # Generate grid
-        gen_grid_group = QGroupBox("Calculate the estimation grid ")
+        gen_grid_group = QGroupBox(
+            QCoreApplication.translate("Tab 3", "Calculate the estimation grid")
+        )
         gen_grid_layout = QGridLayout()
-        
-        # Espaciado entre nodos
-        gen_grid_layout.addWidget(QLabel("Spacing between nodes (map units):"), 0, 0)
+
+        # Node spacing
+        gen_grid_layout.addWidget(QLabel(
+            QCoreApplication.translate("Tab 3", "Spacing between nodes (map units):")
+        ), 0, 0)
         self.spacing_spin = QDoubleSpinBox()
         self.spacing_spin.setRange(10, 10000)
         
-        # Calcular valor por defecto: (max_dist / 2) / 10
+        # Default spacing: (max_dist / 2) / 10
         layer = getattr(self, 'input_data_layer', None)
         max_dist = None
         if layer and hasattr(layer, 'currentLayer') and layer.currentLayer() is not None:
@@ -512,14 +569,14 @@ class MonitoringNetworksDialog(QDialog):
         self.spacing_spin.valueChanged.connect(self.on_spacing_changed)
         gen_grid_layout.addWidget(self.spacing_spin, 0, 1)
         
-        # Etiqueta para mostrar estimado de puntos totales
-        gen_grid_layout.addWidget(QLabel("Puntos estimados:"), 1, 0)
-        self.estimated_points_label = QLabel("Calculando...")
+        # Label to display estimated total points
+        gen_grid_layout.addWidget(QLabel(QCoreApplication.translate("Tab 3", "Estimated total points:")), 1, 0)
+        self.estimated_points_label = QLabel(QCoreApplication.translate("Tab 3", "Calculating..."))
         self.estimated_points_label.setStyleSheet("color: gray; font-style: italic;")
         gen_grid_layout.addWidget(self.estimated_points_label, 1, 1)
         
         # Buffer
-        gen_grid_layout.addWidget(QLabel("Buffer (unidades del mapa):"), 2, 0)
+        gen_grid_layout.addWidget(QLabel(QCoreApplication.translate("Tab 3", "Buffer (map units):")), 2, 0)
         self.buffer_spin = QDoubleSpinBox()
         self.buffer_spin.setRange(0, 10000)
         self.buffer_spin.setValue(100)
@@ -528,7 +585,7 @@ class MonitoringNetworksDialog(QDialog):
         gen_grid_layout.addWidget(self.buffer_spin, 2, 1)
         
         # Calculate grid button
-        self.preview_grid_btn = QPushButton("Calculate grid")
+        self.preview_grid_btn = QPushButton(QCoreApplication.translate("Tab 3", "Calculate grid"))
         self.preview_grid_btn.clicked.connect(self.preview_grid)
         gen_grid_layout.addWidget(self.preview_grid_btn, 3, 1) #, 1, 1
 
@@ -536,12 +593,12 @@ class MonitoringNetworksDialog(QDialog):
         layout.addWidget(gen_grid_group)
 
         # Option to upload the grid from a file
-        load_grid_group = QGroupBox("Or Upload the estimation grid from *.XLSX file [Optional]")
+        load_grid_group = QGroupBox(QCoreApplication.translate("Tab 3", "Or Upload the estimation grid from *.XLSX file [Optional]"))
         load_grid_layout = QGridLayout()
 
         # Button to upload grid from file
-        load_grid_layout.addWidget(QLabel("The file needs to contain the next data columns: ID, X, Y, weight"))
-        self.load_grid_btn = QPushButton("Select *.XLSX file")
+        load_grid_layout.addWidget(QLabel(QCoreApplication.translate("Tab 3", "The file needs to contain the next data columns: ID, X, Y, weight")))
+        self.load_grid_btn = QPushButton(QCoreApplication.translate("Tab 3", "Select *.XLSX file"))
         self.load_grid_btn.clicked.connect(self.load_grid_as_layer)
         load_grid_layout.addWidget(self.load_grid_btn, 2, 1)
 
@@ -555,7 +612,7 @@ class MonitoringNetworksDialog(QDialog):
         
         # Button to save grid as temporary layer
         #btn_grid_layout = QHBoxLayout()
-        self.save_grid_btn = QPushButton("Guardar Malla como Capa Temporal")
+        self.save_grid_btn = QPushButton(QCoreApplication.translate("Tab 3", "Save Grid as Temporary Layer"))
         self.save_grid_btn.clicked.connect(self.save_grid_as_layer,1,0)
         #btn_grid_layout.addWidget(self.save_grid_btn)
         #btn_grid_layout.addStretch()
@@ -682,6 +739,31 @@ class MonitoringNetworksDialog(QDialog):
         self.variance_ax = self.variance_figure.add_subplot(111)
         variance_layout.addWidget(self.variance_canvas)
 
+        order_label = QLabel(
+            QCoreApplication.translate("Tab 4", "Optimization order")
+        )
+        variance_layout.addWidget(order_label)
+
+        self.mn_prioritization_order_table = QTableWidget()
+        self.mn_prioritization_order_table.setColumnCount(5)
+        self.mn_prioritization_order_table.setHorizontalHeaderLabels([
+            QCoreApplication.translate("Tab 4", "Rank"),
+            QCoreApplication.translate("Tab 4", "Well ID"),
+            QCoreApplication.translate("Tab 4", "Well weight"),
+            QCoreApplication.translate("Tab 4", "Normalized variance"),
+            QCoreApplication.translate("Tab 4", "Variance reduction (%)"),
+        ])
+        self.mn_prioritization_order_table.verticalHeader().setVisible(True)
+        self.mn_prioritization_order_table.setEditTriggers(
+            QAbstractItemView.NoEditTriggers
+        )
+        self.mn_prioritization_order_table.setMinimumHeight(160)
+        self.mn_prioritization_order_table.setMaximumHeight(280)
+        self.mn_prioritization_order_table.horizontalHeader().setStretchLastSection(
+            True
+        )
+        variance_layout.addWidget(self.mn_prioritization_order_table)
+
         variance_group.setLayout(variance_layout)
         mn_layout.addWidget(variance_group)
         self._clear_variance_reduction_plot()
@@ -695,75 +777,11 @@ class MonitoringNetworksDialog(QDialog):
         # Add the scroll area to the main layout
         priorization_tab_layout.addWidget(mn_scroll_area)
 
-        # Asignar el layout a la pestaña de datos
+        # Assign the layout to the prioritization tab
         self.tab_prioritization.setLayout(priorization_tab_layout)
         self._update_mn_well_weight_info()
         self._update_mn_grid_weight_info()
 
-
-    def _build_cv_tables_widget(self, context_name):
-        """Creates summary/results CV tables and info label for tab 5 columns."""
-        container = QWidget()
-        layout = QVBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        summary_label = QLabel(
-            QCoreApplication.translate(context_name, "Cross-Validation Summary")
-        )
-        layout.addWidget(summary_label)
-
-        summary_table = QTableWidget()
-        summary_table.setColumnCount(len(CV_SUMMARY_KEYS))
-        summary_table.setRowCount(1)
-        summary_table.setHorizontalHeaderLabels([
-            QCoreApplication.translate(context_name, "Min"),
-            QCoreApplication.translate(context_name, "Max"),
-            QCoreApplication.translate(context_name, "Mean"),
-            QCoreApplication.translate(context_name, "MAE"),
-            QCoreApplication.translate(context_name, "MSE"),
-            QCoreApplication.translate(context_name, "RMSE"),
-        ])
-        summary_table.verticalHeader().setVisible(False)
-        summary_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        summary_table.setFixedHeight(70)
-        summary_table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(summary_table)
-
-        results_label = QLabel(
-            QCoreApplication.translate(context_name, "Cross-Validation Results")
-        )
-        layout.addWidget(results_label)
-
-        results_table = QTableWidget()
-        results_table.setColumnCount(7)
-        results_table.setHorizontalHeaderLabels([
-            QCoreApplication.translate(context_name, "ID"),
-            QCoreApplication.translate(context_name, "Included?"),
-            QCoreApplication.translate(context_name, "Measured"),
-            QCoreApplication.translate(context_name, "Predicted"),
-            QCoreApplication.translate(context_name, "Error"),
-            QCoreApplication.translate(context_name, "SE"),
-            QCoreApplication.translate(context_name, "Standardized Error"),
-        ])
-        results_table.verticalHeader().setVisible(True)
-        results_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        results_table.setMinimumHeight(140)
-        results_table.setMaximumHeight(200)
-        results_table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(results_table)
-
-        info_label = QLabel(
-            QCoreApplication.translate(
-                context_name,
-                "Run Kalman optimization on tab 4 to compute cross-validation.",
-            )
-        )
-        info_label.setStyleSheet("color: gray; font-style: italic;")
-        info_label.setWordWrap(True)
-        layout.addWidget(info_label)
-
-        container.setLayout(layout)
-        return container, summary_table, results_table, info_label
 
     def setup_results_tab(self):
         """Configures the results tab (OK maps and CV for all vs selected wells)."""
@@ -843,6 +861,61 @@ class MonitoringNetworksDialog(QDialog):
         self.tab_results.setLayout(results_layout)
         self._clear_ok_interpolation_plots()
 
+
+    def _build_cv_tables_widget(self, context_name):
+        """Creates summary/results CV tables and info label for tab 5 columns."""
+        container = QWidget()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        summary_label = QLabel(
+            QCoreApplication.translate(context_name, "Cross-Validation Summary")
+        )
+        layout.addWidget(summary_label)
+
+        summary_table = QTableWidget()
+        summary_table.setColumnCount(len(CV_SUMMARY_KEYS))
+        summary_table.setRowCount(1)
+        summary_table.setHorizontalHeaderLabels(
+            cv_summary_header_labels(context_name)
+        )
+        summary_table.verticalHeader().setVisible(False)
+        summary_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        summary_table.setFixedHeight(70)
+        summary_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(summary_table)
+
+        results_label = QLabel(
+            QCoreApplication.translate(context_name, "Cross-Validation Results")
+        )
+        layout.addWidget(results_label)
+
+        results_table = QTableWidget()
+        results_table.setColumnCount(7)
+        results_table.setHorizontalHeaderLabels(
+            cv_results_header_labels(context_name)
+        )
+        results_table.verticalHeader().setVisible(True)
+        results_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        results_table.setMinimumHeight(140)
+        results_table.setMaximumHeight(200)
+        results_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(results_table)
+
+        info_label = QLabel(
+            QCoreApplication.translate(
+                context_name,
+                "Run Kalman optimization on tab 4 to compute cross-validation.",
+            )
+        )
+        info_label.setStyleSheet("color: gray; font-style: italic;")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        container.setLayout(layout)
+        return container, summary_table, results_table, info_label
+
+
     def _count_layer_wells(self, attr_name):
         """Returns the number of valid measurement points in the input layer."""
         layer = self.input_data_layer.currentLayer()
@@ -904,20 +977,12 @@ class MonitoringNetworksDialog(QDialog):
             info_label.setText(message)
             info_label.setStyleSheet("color: gray; font-style: italic;")
 
-    def _populate_results_cv_summary(self, summary_table, summary):
-        """Fills a one-row CV summary table."""
+    def _populate_cv_summary_table(self, summary_table, summary):
+        """Fills a one-row CV summary table (tabs 2 and 5)."""
         read_only = Qt.ItemIsSelectable | Qt.ItemIsEnabled
-        formats = {
-            'min': '{:.2f}',
-            'max': '{:.2f}',
-            'mean': '{:.2f}',
-            'mae': '{:.3f}',
-            'mse': '{:.3f}',
-            'rmse': '{:.3f}',
-        }
         for col, key in enumerate(CV_SUMMARY_KEYS):
             value = summary.get(key, np.nan)
-            text = "—" if np.isnan(value) else formats[key].format(value)
+            text = "—" if np.isnan(value) else CV_SUMMARY_FORMATS[key].format(value)
             item = summary_table.item(0, col)
             if item is None:
                 item = QTableWidgetItem(text)
@@ -927,11 +992,19 @@ class MonitoringNetworksDialog(QDialog):
             item.setFlags(read_only)
         summary_table.resizeColumnsToContents()
 
-    def _populate_results_cv_results(self, results_table, point_ids, cv_rows):
-        """Fills a per-point CV table with optional Included? column."""
-        yes_text = QCoreApplication.translate("Tab 5", "Yes")
-        no_text = QCoreApplication.translate("Tab 5", "No")
+    def _populate_cv_results_table(
+        self,
+        results_table,
+        point_ids,
+        cv_rows,
+        context_name="Tab 2",
+        highlight_selected=False,
+    ):
+        """Fills a per-point CV table (tabs 2 and 5)."""
+        yes_text = QCoreApplication.translate(context_name, "Yes")
+        no_text = QCoreApplication.translate(context_name, "No")
         read_only = Qt.ItemIsSelectable | Qt.ItemIsEnabled
+        selected_row_color = QColor('#d5f5e3')
         results_table.setRowCount(len(cv_rows))
 
         for row, (point_id, row_data) in enumerate(zip(point_ids, cv_rows)):
@@ -948,6 +1021,8 @@ class MonitoringNetworksDialog(QDialog):
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 item.setFlags(read_only)
+                if highlight_selected and included:
+                    item.setBackground(selected_row_color)
                 results_table.setItem(row, col, item)
 
         results_table.resizeColumnsToContents()
@@ -1257,7 +1332,7 @@ class MonitoringNetworksDialog(QDialog):
         """Computes and displays CV tables for a well network."""
         state = context['state']
         try:
-            cv_result = run_network_cross_validation(
+            cv_result = run_ordinary_kriging_cross_validation(
                 context['coordinates'],
                 context['values'],
                 state.get('model_type', 'spherical'),
@@ -1284,9 +1359,13 @@ class MonitoringNetworksDialog(QDialog):
         if point_ids is None:
             point_ids = [str(i) for i in range(context['values'].size)]
 
-        self._populate_results_cv_summary(summary_table, cv_result['summary'])
-        self._populate_results_cv_results(
-            results_table, point_ids, cv_result['rows']
+        self._populate_cv_summary_table(summary_table, cv_result['summary'])
+        self._populate_cv_results_table(
+            results_table,
+            point_ids,
+            cv_result['rows'],
+            context_name="Tab 5",
+            highlight_selected=(network_indices is not None),
         )
 
         n_total = context['values'].size
@@ -1637,10 +1716,80 @@ class MonitoringNetworksDialog(QDialog):
             self.tabs.setCurrentIndex(current - 1)
     
     def next_tab(self):
-        """Va a la siguiente pestaña"""
+        """Go to the next tab."""
         current = self.tabs.currentIndex()
         if current < self.tabs.count() - 1:
             self.tabs.setCurrentIndex(current + 1)
+
+    @staticmethod
+    def _format_layer_field_value(value):
+        """Formats a QGIS attribute value for display in tab 1."""
+        if value is None or (isinstance(value, QVariant) and value.isNull()):
+            return ""
+        if isinstance(value, QVariant):
+            value = value.value()
+        if value is None:
+            return ""
+        if isinstance(value, float):
+            if np.isnan(value) or np.isinf(value):
+                return ""
+            text = f"{value:.6g}"
+            return text
+        return str(value)
+
+    def _refresh_layer_fields_table(self, layer, max_rows=500):
+        """Fills the tab 1 table with attribute values from the selected layer."""
+        if not hasattr(self, 'layer_fields_table'):
+            return
+
+        self.layer_fields_table.clear()
+        self.layer_fields_table.setRowCount(0)
+        self.layer_fields_table.setColumnCount(0)
+
+        if not layer:
+            return
+
+        fields = layer.fields()
+        field_names = [field.name() for field in fields]
+        if not field_names:
+            return
+
+        features = []
+        for feature in layer.getFeatures():
+            features.append(feature)
+            if len(features) >= max_rows:
+                break
+
+        self.layer_fields_table.setColumnCount(len(field_names))
+        self.layer_fields_table.setRowCount(len(features))
+        self.layer_fields_table.setHorizontalHeaderLabels(field_names)
+
+        for row, feature in enumerate(features):
+            for col, field_name in enumerate(field_names):
+                text = self._format_layer_field_value(feature[field_name])
+                self.layer_fields_table.setItem(
+                    row, col, QTableWidgetItem(text)
+                )
+
+        self.layer_fields_table.resizeColumnsToContents()
+
+    def _clear_variogram_widget(self):
+        """Resets the tab 2 variogram plot and parameters."""
+        if not hasattr(self, 'variogram_widget'):
+            return
+
+        self._syncing_variogram = True
+        try:
+            self.variogram_widget.clear()
+        finally:
+            self._syncing_variogram = False
+
+        if hasattr(self, 'var_progress_bar'):
+            self.var_progress_bar.setValue(0)
+        if hasattr(self, 'var_progress_status_label'):
+            self.var_progress_status_label.setText(
+                QCoreApplication.translate("Tab 2", "State: Ready")
+            )
 
     def on_layer_changed(self, layer):
         """Update the layer information and the numeric attributes."""
@@ -1654,6 +1803,7 @@ class MonitoringNetworksDialog(QDialog):
         self.variance_results = {}
         self._sync_var_params_table_from_store()
         self.clear_stats_table()
+        self._clear_variogram_widget()
         self._sync_attr_name_combo()
         self._clear_variance_reduction_plot()
         self._update_results_well_spinbox()
@@ -1664,16 +1814,29 @@ class MonitoringNetworksDialog(QDialog):
 
         if not layer:
             self.layer_info.clear()
+            self._refresh_layer_fields_table(None)
             return
-        else:
-            #Update the layer information and the numeric attributes
-            info = f"Name: {layer.name()}\n"
-            info += f"Number of features: {layer.featureCount()}\n"
-            info += f"Coordinate system: {layer.crs().authid()}"
-            self.layer_info.setText(info)
-            for field in layer.fields():
-                if field.type() in (QVariant.Int, QVariant.Double, QVariant.LongLong):
-                    self.selected_data_parameters.addItem(field.name())
+
+        self._refresh_layer_fields_table(layer)
+        info = QCoreApplication.translate(
+            "Tab 1",
+            "Name: {name}\n"
+            "Number of features: {count}\n"
+            "Coordinate system: {crs}",
+        ).format(
+            name=layer.name(),
+            count=layer.featureCount(),
+            crs=layer.crs().authid(),
+        )
+        feature_count = layer.featureCount()
+        if feature_count > 500:
+            info += "\n" + QCoreApplication.translate(
+                "Tab 1", "Table shows the first 500 features."
+            )
+        self.layer_info.setText(info)
+        for field in layer.fields():
+            if field.type() in (QVariant.Int, QVariant.Double, QVariant.LongLong):
+                self.selected_data_parameters.addItem(field.name())
 
     def _current_analysis_attribute(self):
         """Returns the attribute selected on tab 2, or None."""
@@ -1867,10 +2030,23 @@ class MonitoringNetworksDialog(QDialog):
             )
 
     def _on_mn_parameter_changed(self, _index):
-        """Refresh tab 5 spin box and interpolation when the optimized parameter changes."""
+        """Refresh tab 4/5 views when the optimized parameter changes."""
         self._update_results_well_spinbox()
         self._update_mn_well_weight_info()
         self._update_mn_grid_weight_info()
+
+        param_key = self._current_mn_parameter()
+        if param_key and param_key in self.variance_results:
+            results = self.variance_results[param_key]
+            self._update_variance_reduction_plot(
+                results,
+                self._mn_parameter_display_name(param_key),
+                param_key=param_key,
+            )
+            self._update_prioritization_order_table(
+                results, param_key=param_key
+            )
+
         self._refresh_ok_interpolation_plot()
 
     def _mn_combined_parameters_label(self):
@@ -1913,41 +2089,47 @@ class MonitoringNetworksDialog(QDialog):
             return None
         return text
 
-    def _get_multi_parameter_optimization_specs(self):
+    def _load_optimization_parameters(self, param_names):
         """
-        Builds aligned per-parameter inputs for combined Kalman optimization.
+        Loads aligned well geometry and per-parameter variogram inputs.
 
-        Returns (specs, error_message). specs is None when validation fails.
+        Returns:
+            (coordinates, point_ids, well_weights, parameters, error_message)
+            Any leading field is None when loading fails.
         """
         layer = self.input_data_layer.currentLayer()
         if not layer:
-            return None, QCoreApplication.translate(
+            return None, None, None, None, QCoreApplication.translate(
                 "Tab 4", "Select an input point layer first."
             )
 
-        param_names = self._selected_analysis_parameters()
-        if len(param_names) < 2:
-            return None, QCoreApplication.translate(
-                "Tab 4",
-                "Select at least two parameters on tab 1 for combined optimization.",
+        if not param_names:
+            return None, None, None, None, QCoreApplication.translate(
+                "Tab 4", "Select a parameter to optimize."
             )
 
-        specs = []
+        parameters = []
         reference_coords = None
+        point_ids = None
+        well_weights = None
 
         for name in param_names:
             state = self._get_variogram_state(name)
             if not state:
-                return None, QCoreApplication.translate(
+                return None, None, None, None, QCoreApplication.translate(
                     "Tab 4",
                     "Run geostatistics on tab 2 for «{param}» first.",
                 ).format(param=name)
 
-            point_ids, coordinates, raw_values, _, raw_well_weights = (
-                extract_point_records_from_layer(layer, name)
-            )
+            (
+                raw_point_ids,
+                coordinates,
+                raw_values,
+                _,
+                raw_well_weights,
+            ) = extract_point_records_from_layer(layer, name)
             if coordinates is None or raw_values is None:
-                return None, QCoreApplication.translate(
+                return None, None, None, None, QCoreApplication.translate(
                     "Tab 4",
                     "No valid data found for «{param}».",
                 ).format(param=name)
@@ -1957,47 +2139,104 @@ class MonitoringNetworksDialog(QDialog):
                 coordinates, raw_values, transform
             )
             if error or coordinates is None or values is None:
-                return None, error or QCoreApplication.translate(
+                return None, None, None, None, error or QCoreApplication.translate(
                     "Tab 4",
                     "Could not align data for «{param}».",
                 ).format(param=name)
 
-            point_ids = align_point_ids_with_transform(
-                point_ids, raw_values, transform
+            aligned_point_ids = align_point_ids_with_transform(
+                raw_point_ids, raw_values, transform
             )
 
             if reference_coords is None:
                 reference_coords = coordinates
+                point_ids = aligned_point_ids
             elif (
                 coordinates.shape != reference_coords.shape
                 or not np.allclose(coordinates, reference_coords)
             ):
-                return None, QCoreApplication.translate(
+                return None, None, None, None, QCoreApplication.translate(
                     "Tab 4",
                     "Combined optimization requires the same valid wells for "
                     "every parameter (check null values and log transforms).",
                 )
 
-            well_weights = None
             if raw_well_weights is not None:
-                well_weights = align_well_weights_with_transform(
+                aligned_well_weights = align_well_weights_with_transform(
                     raw_well_weights, raw_values, transform
                 )
+                if well_weights is None:
+                    well_weights = aligned_well_weights
+                elif not np.allclose(aligned_well_weights, well_weights):
+                    return None, None, None, None, QCoreApplication.translate(
+                        "Tab 4",
+                        "Well weight values must align for every parameter.",
+                    )
 
-            specs.append({
-                'name': name,
-                'coordinates': coordinates,
-                'values': values,
-                'point_ids': point_ids,
-                'well_weights': well_weights,
-                'model_type': state.get('model_type', 'spherical'),
-                'nugget': state.get('nugget', 0),
-                'sill': state.get('sill', 0),
-                'range': state.get('range', 0),
-                'weight': float(state.get('weight', 1.0)),
-            })
+            parameters.append(
+                ParameterInput(
+                    name=name,
+                    values=values,
+                    model_type=state.get('model_type', 'spherical'),
+                    nugget=float(state.get('nugget', 0)),
+                    sill=float(state.get('sill', 0)),
+                    range_val=float(state.get('range', 0)),
+                    weight=float(state.get('weight', 1.0)),
+                )
+            )
 
-        return specs, None
+        return reference_coords, point_ids, well_weights, parameters, None
+
+    def _build_optimization_input(
+        self,
+        param_names,
+        grid_coordinates,
+        grid_weights=None,
+        apply_well_weights=False,
+    ):
+        """
+        Builds an OptimizationInput for one or more parameters.
+
+        ``grid_coordinates`` is passed through unchanged (full tab-3 grid).
+
+        Returns:
+            (OptimizationInput, error_message). Input is None when validation fails.
+        """
+        (
+            coordinates,
+            point_ids,
+            well_weights,
+            parameters,
+            error,
+        ) = self._load_optimization_parameters(param_names)
+        if error:
+            return None, error
+
+        if apply_well_weights:
+            if well_weights is None:
+                return None, QCoreApplication.translate(
+                    "Tab 4",
+                    "No well weight field is available for this layer.",
+                )
+        else:
+            well_weights = None
+
+        try:
+            optimization_input = OptimizationInput(
+                coordinates=coordinates,
+                point_ids=point_ids,
+                well_weights=well_weights,
+                grid_coordinates=grid_coordinates,
+                grid_weights=grid_weights,
+                parameters=parameters,
+            )
+        except ValueError:
+            return None, QCoreApplication.translate(
+                "Tab 4",
+                "Optimization input data are inconsistent.",
+            )
+
+        return optimization_input, None
 
     def _clear_variance_reduction_plot(self):
         """Resets the variance reduction plot and info label."""
@@ -2030,7 +2269,84 @@ class MonitoringNetworksDialog(QDialog):
                 "color: gray; font-style: italic;"
             )
 
-    def _update_variance_reduction_plot(self, results, attr_name):
+        self._clear_prioritization_order_table()
+
+    def _clear_prioritization_order_table(self):
+        """Clears the tab 4 optimization-order table."""
+        if not hasattr(self, 'mn_prioritization_order_table'):
+            return
+        self.mn_prioritization_order_table.setRowCount(0)
+
+    def _update_prioritization_order_table(self, results, param_key=None):
+        """Fills the tab 4 table with Kalman prioritization rank, ID and weight."""
+        if not hasattr(self, 'mn_prioritization_order_table'):
+            return
+
+        self._clear_prioritization_order_table()
+
+        selection_order = results.get('selection_order')
+        if selection_order is None:
+            return
+
+        if param_key is None:
+            param_key = self._current_mn_parameter()
+
+        point_ids = None
+        well_weights = None
+        if param_key is not None:
+            param_data = self._get_mn_parameter_data(param_key)
+            if param_data is not None:
+                point_ids = param_data.get('point_ids')
+                well_weights = param_data.get('well_weights')
+
+        selection_order = np.asarray(selection_order, dtype=int)
+        normalized_variances = np.asarray(
+            results.get('normalized_variances', []), dtype=float
+        )
+        variance_reduction = np.asarray(
+            results.get('variance_reduction', []), dtype=float
+        )
+        read_only = Qt.ItemIsSelectable | Qt.ItemIsEnabled
+        self.mn_prioritization_order_table.setRowCount(selection_order.size)
+
+        for row, well_idx in enumerate(selection_order):
+            rank = row + 1
+            well_idx = int(well_idx)
+            well_id = (
+                str(point_ids[well_idx])
+                if point_ids is not None
+                else str(well_idx)
+            )
+            if well_weights is not None and well_idx < well_weights.size:
+                weight_text = f"{float(well_weights[well_idx]):.3f}"
+            else:
+                weight_text = "1.000"
+
+            if rank < normalized_variances.size:
+                norm_var_text = f"{float(normalized_variances[rank]):.3f}"
+            else:
+                norm_var_text = "—"
+
+            if rank < variance_reduction.size:
+                var_red_text = f"{float(variance_reduction[rank]):.2f}"
+            else:
+                var_red_text = "—"
+
+            cells = [
+                str(rank),
+                well_id,
+                weight_text,
+                norm_var_text,
+                var_red_text,
+            ]
+            for col, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                item.setFlags(read_only)
+                self.mn_prioritization_order_table.setItem(row, col, item)
+
+        self.mn_prioritization_order_table.resizeColumnsToContents()
+
+    def _update_variance_reduction_plot(self, results, display_name, param_key=None):
         """Plots normalized OK variance vs number of wells (Kalman filter curve)."""
         ax = self.variance_ax
         ax.clear()
@@ -2082,29 +2398,35 @@ class MonitoringNetworksDialog(QDialog):
         ax.set_title(
             QCoreApplication.translate(
                 "Tab 4", "Kalman Filter – {param}"
-            ).format(param=attr_name)
+            ).format(param=display_name)
         )
         ax.set_xlim(left=0)
         ax.grid(True, alpha=0.3)
         ax.legend(loc='best', fontsize=8)
 
+        if param_key is None:
+            param_key = self._current_mn_parameter()
+
         selection_order = results.get('selection_order')
-        param_data = self._get_mn_parameter_data(attr_name)
-        if selection_order is not None and param_data is not None:
-            point_ids = param_data.get('point_ids')
-            if point_ids is not None:
-                for step, well_idx in enumerate(selection_order, start=1):
-                    if step >= len(n_points):
-                        break
-                    ax.annotate(
-                        str(point_ids[well_idx]),
-                        (n_points[step], varianzas[step]),
-                        textcoords='offset points',
-                        xytext=(4, 4),
-                        fontsize=6,
-                        ha='left',
-                        va='bottom',
-                    )
+        point_ids = None
+        if param_key is not None:
+            param_data = self._get_mn_parameter_data(param_key)
+            if param_data is not None:
+                point_ids = param_data.get('point_ids')
+
+        if selection_order is not None and point_ids is not None:
+            for step, well_idx in enumerate(selection_order, start=1):
+                if step >= len(n_points):
+                    break
+                ax.annotate(
+                    str(point_ids[well_idx]),
+                    (n_points[step], varianzas[step]),
+                    textcoords='offset points',
+                    xytext=(4, 4),
+                    fontsize=7,
+                    ha='left',
+                    va='bottom',
+                )
 
         self.variance_figure.tight_layout()
         self.variance_canvas.draw()
@@ -2193,8 +2515,17 @@ class MonitoringNetworksDialog(QDialog):
         )
 
         if self._is_combined_mn_parameter(attr_name):
-            specs, _ = self._get_multi_parameter_optimization_specs()
-            point_ids = specs[0].get('point_ids') if specs else None
+            (
+                _coordinates,
+                point_ids,
+                _well_weights,
+                _parameters,
+                error,
+            ) = self._load_optimization_parameters(
+                self._selected_analysis_parameters()
+            )
+            if error:
+                point_ids = None
             parameter_label = self._mn_combined_parameters_label()
         else:
             param_data = self._get_mn_parameter_data(attr_name)
@@ -2257,6 +2588,7 @@ class MonitoringNetworksDialog(QDialog):
         ]
 
         try:
+            # XlsxWriter export avoids openpyxl style-init crashes on some QGIS builds.
             write_excel_sheets(
                 file_path,
                 [
@@ -2278,7 +2610,9 @@ class MonitoringNetworksDialog(QDialog):
                 QCoreApplication.translate("Tab 4", "Download prioritization"),
                 QCoreApplication.translate(
                     "Tab 4",
-                    "openpyxl is required to export Excel files.",
+                    "XlsxWriter is required to export Excel files. "
+                    "Install it in the QGIS Python environment "
+                    "(pip install XlsxWriter).",
                 ),
             )
         except Exception as exc:
@@ -2291,6 +2625,42 @@ class MonitoringNetworksDialog(QDialog):
                     "Could not save the Excel file:\n{error}\n{details}",
                 ).format(error=str(exc), details=traceback.format_exc()),
             )
+
+    def _plot_wells_on_map_axes(
+        self,
+        ax,
+        coordinates,
+        label=None,
+        point_ids=None,
+        annotate_ids=False,
+        zorder=6,
+    ):
+        """Draws monitoring-well markers on a matplotlib map axes."""
+        if coordinates is None:
+            return
+
+        coords = np.asarray(coordinates, dtype=float)
+        if coords.size == 0 or coords.shape[0] == 0:
+            return
+
+        if label is None:
+            label = QCoreApplication.translate("Tab 3", "Wells")
+
+        ax.scatter(
+            coords[:, 0],
+            coords[:, 1],
+            c='red',
+            marker='s',
+            label=label,
+            s=20,
+            alpha=0.95,
+            edgecolors='black',
+            linewidths=0.2,
+            zorder=zorder,
+        )
+
+        if annotate_ids and point_ids is not None:
+            self._annotate_well_id_labels(ax, coords, point_ids)
 
     def _annotate_well_id_labels(self, ax, coordinates, point_ids, indices=None):
         """Draws well ID text next to each point on a spatial axes."""
@@ -2320,59 +2690,34 @@ class MonitoringNetworksDialog(QDialog):
         reference (same well geometry); OK maps on tab 5 use its variogram.
         """
         if self._is_combined_mn_parameter(attr_name):
-            specs, _ = self._get_multi_parameter_optimization_specs()
-            if not specs:
+            param_names = self._selected_analysis_parameters()
+            if len(param_names) < 2:
                 return None
-            first = specs[0]
-            state = self._get_variogram_state(first['name'])
-            if not state:
-                return None
-            return {
-                'coordinates': first['coordinates'],
-                'values': first['values'],
-                'point_ids': first.get('point_ids'),
-                'well_weights': first.get('well_weights'),
-                'state': state,
-                'reference_parameter': first['name'],
-            }
+        else:
+            param_names = [attr_name]
 
-        layer = self.input_data_layer.currentLayer()
-        if not layer or not attr_name:
+        (
+            coordinates,
+            point_ids,
+            well_weights,
+            parameters,
+            error,
+        ) = self._load_optimization_parameters(param_names)
+        if error or not parameters:
             return None
 
-        state = self._get_variogram_state(attr_name)
+        first_param = parameters[0]
+        state = self._get_variogram_state(first_param.name)
         if not state:
             return None
 
-        point_ids, coordinates, raw_values, _, raw_well_weights = (
-            extract_point_records_from_layer(layer, attr_name)
-        )
-        if coordinates is None or raw_values is None:
-            return None
-
-        transform = 'log' if state.get('log_transform') else 'none'
-        coordinates, values, _, error = align_coordinates_with_transform(
-            coordinates, raw_values, transform
-        )
-        if error or coordinates is None or values is None or values.size < 2:
-            return None
-
-        well_weights = None
-        if raw_well_weights is not None:
-            well_weights = align_well_weights_with_transform(
-                raw_well_weights, raw_values, transform
-            )
-
-        aligned_point_ids = align_point_ids_with_transform(
-            point_ids, raw_values, transform
-        )
-
         return {
             'coordinates': coordinates,
-            'values': values,
-            'point_ids': aligned_point_ids,
+            'values': first_param.values,
+            'point_ids': point_ids,
             'well_weights': well_weights,
             'state': state,
+            'reference_parameter': first_param.name,
         }
 
     def optimize_monitoring_network(self):
@@ -2381,9 +2726,8 @@ class MonitoringNetworksDialog(QDialog):
 
         Phase 1 determines the selection order via rank-1 covariance updates;
         phase 2 evaluates normalized ordinary-kriging variance along that order.
-
-        When «Parameters combined» is selected, runs the weighted multi-parameter
-        extension (see compute_weighted_multi_parameter_variance_reduction_curve).
+        The full estimation grid from tab 3 is used (no node subsampling).
+        Single- and multi-parameter runs both use compute_variance_reduction_curve.
         """
         attr_name = self._current_mn_parameter()
         if not attr_name:
@@ -2440,76 +2784,39 @@ class MonitoringNetworksDialog(QDialog):
 
         try:
             if self._is_combined_mn_parameter(attr_name):
-                specs, spec_error = self._get_multi_parameter_optimization_specs()
-                if specs is None:
-                    QMessageBox.warning(
-                        self,
-                        QCoreApplication.translate("Tab 4", "Optimize"),
-                        spec_error,
-                    )
-                    return
-
-                well_weights = None
-                if use_well_weights:
-                    well_weights = specs[0].get('well_weights')
-                    if well_weights is None:
-                        QMessageBox.warning(
-                            self,
-                            QCoreApplication.translate("Tab 4", "Optimize"),
-                            QCoreApplication.translate(
-                                "Tab 4",
-                                "No well weight field is available for this layer.",
-                            ),
-                        )
-                        return
-
-                results = compute_weighted_multi_parameter_variance_reduction_curve(
-                    specs,
-                    self.current_grid_points,
-                    well_weights=well_weights,
-                    grid_weights=grid_weights,
-                )
-                display_name = self._mn_combined_parameters_label()
-            else:
-                param_data = self._get_mn_parameter_data(attr_name)
-                if param_data is None:
+                param_names = self._selected_analysis_parameters()
+                if len(param_names) < 2:
                     QMessageBox.warning(
                         self,
                         QCoreApplication.translate("Tab 4", "Optimize"),
                         QCoreApplication.translate(
                             "Tab 4",
-                            "Run geostatistics on tab 2 for «{param}» first."
-                        ).format(param=attr_name),
-                    )
-                    return
-
-                state = param_data['state']
-                well_weights = (
-                    param_data.get('well_weights') if use_well_weights else None
-                )
-                if use_well_weights and well_weights is None:
-                    QMessageBox.warning(
-                        self,
-                        QCoreApplication.translate("Tab 4", "Optimize"),
-                        QCoreApplication.translate(
-                            "Tab 4",
-                            "No well weight field is available for this layer.",
+                            "Select at least two parameters on tab 1 "
+                            "for combined optimization.",
                         ),
                     )
                     return
-
-                results = compute_simple_kriging_variance_reduction_curve(
-                    param_data['coordinates'],
-                    param_data['values'],
-                    self.current_grid_points,
-                    state.get('model_type', 'spherical'),
-                    state.get('nugget', 0),
-                    state.get('sill', 0),
-                    state.get('range', 0),
-                    well_weights=well_weights,
-                    grid_weights=grid_weights,
-                )
+                display_name = self._mn_combined_parameters_label()
+            else:
+                param_names = [attr_name]
                 display_name = attr_name
+
+            # Full estimation grid from tab 3 — same scope as geostat_app_kalman_v10 df_malla.
+            optimization_input, input_error = self._build_optimization_input(
+                param_names,
+                self.current_grid_points,
+                grid_weights=grid_weights,
+                apply_well_weights=use_well_weights,
+            )
+            if optimization_input is None:
+                QMessageBox.warning(
+                    self,
+                    QCoreApplication.translate("Tab 4", "Optimize"),
+                    input_error,
+                )
+                return
+
+            results = compute_variance_reduction_curve(optimization_input)
         except Exception as exc:
             QMessageBox.warning(
                 self,
@@ -2536,10 +2843,13 @@ class MonitoringNetworksDialog(QDialog):
 
         self.variance_results[attr_name] = results
         self.prioritization_grid_points = self.current_grid_points.copy()
-        self._update_variance_reduction_plot(results, display_name)
+        self._update_variance_reduction_plot(
+            results, display_name, param_key=attr_name
+        )
+        self._update_prioritization_order_table(results, param_key=attr_name)
 
         n_wells = int(results['n_points'][-1])
-        grid_nodes = results['grid_nodes_used']
+        grid_nodes = results['grid_node_count']
         final_reduction = float(results['variance_reduction'][-1])
         weight_note = ""
         if use_well_weights:
@@ -2839,6 +3149,7 @@ class MonitoringNetworksDialog(QDialog):
     def on_attribute_changed(self):
         """Handles the selection of attributes in the data selection tab (supports multi-selection)."""
         self._sync_attr_name_combo()
+        self._clear_variogram_widget()
         if not self.selected_data_parameters.selectedItems():
             self.clear_stats_table()
 
@@ -2852,7 +3163,9 @@ class MonitoringNetworksDialog(QDialog):
             else:
                 item.setText("")
         self.stats_info_label.setText(
-            "Seleccione un atributo para ver sus estadísticas"
+            QCoreApplication.translate(
+                "Tab 2", "Select an attribute to view its statistics."
+            )
         )
         self.stats_info_label.setStyleSheet("color: gray; font-style: italic;")
         self._clear_stats_plots()
@@ -2895,52 +3208,6 @@ class MonitoringNetworksDialog(QDialog):
         self.cv_ax.set_xticks([])
         self.cv_ax.set_yticks([])
         self.cv_canvas.draw()
-
-    def _populate_cross_validation_summary(self, summary):
-        """Fills the one-row summary table (measured-value range + error metrics)."""
-        read_only = Qt.ItemIsSelectable | Qt.ItemIsEnabled
-        formats = {
-            'min': '{:.2f}',
-            'max': '{:.2f}',
-            'mean': '{:.2f}',
-            'mae': '{:.3f}',
-            'mse': '{:.3f}',
-            'rmse': '{:.3f}',
-        }
-        for col, key in enumerate(CV_SUMMARY_KEYS):
-            value = summary.get(key, np.nan)
-            text = "—" if np.isnan(value) else formats[key].format(value)
-            item = self.cv_summary_table.item(0, col)
-            if item is None:
-                item = QTableWidgetItem(text)
-                self.cv_summary_table.setItem(0, col, item)
-            else:
-                item.setText(text)
-            item.setFlags(read_only)
-        self.cv_summary_table.resizeColumnsToContents()
-
-    def _populate_cross_validation_results(self, point_ids, cv_rows):
-        """Fills the per-point cross-validation table."""
-        yes_text = QCoreApplication.translate("Tab 2", "Yes")
-        read_only = Qt.ItemIsSelectable | Qt.ItemIsEnabled
-        self.cv_results_table.setRowCount(len(cv_rows))
-
-        for row, (point_id, row_data) in enumerate(zip(point_ids, cv_rows)):
-            cells = [
-                str(point_id),
-                yes_text,
-                f"{row_data['measured']:.3f}",
-                f"{row_data['predicted']:.3f}",
-                f"{row_data['error']:.3f}",
-                f"{row_data['se']:.3f}",
-                f"{row_data['standardized_error']:.3f}",
-            ]
-            for col, text in enumerate(cells):
-                item = QTableWidgetItem(text)
-                item.setFlags(read_only)
-                self.cv_results_table.setItem(row, col, item)
-
-        self.cv_results_table.resizeColumnsToContents()
 
     def _update_cross_validation_plot(self, measured, predicted, attr_name):
         """Measured vs predicted scatter with a 1:1 reference line."""
@@ -3005,13 +3272,14 @@ class MonitoringNetworksDialog(QDialog):
             return
 
         try:
-            cv_result = run_leave_one_out_cross_validation(
+            cv_result = run_ordinary_kriging_cross_validation(
                 coordinates,
                 values,
                 state.get('model_type', 'spherical'),
                 state.get('nugget', 0),
                 state.get('sill', 0),
                 state.get('range', 0),
+                network_indices=None,
             )
         except Exception:
             self._clear_cross_validation()
@@ -3037,8 +3305,13 @@ class MonitoringNetworksDialog(QDialog):
 
         summary = cv_result['summary']
         rows = cv_result['rows']
-        self._populate_cross_validation_summary(summary)
-        self._populate_cross_validation_results(point_ids, rows)
+        self._populate_cv_summary_table(self.cv_summary_table, summary)
+        self._populate_cv_results_table(
+            self.cv_results_table,
+            point_ids,
+            rows,
+            context_name="Tab 2",
+        )
 
         measured = [row['measured'] for row in rows]
         predicted = [row['predicted'] for row in rows]
@@ -3061,8 +3334,9 @@ class MonitoringNetworksDialog(QDialog):
     def _clear_stats_plots(self):
         """Clears histogram and spatial map placeholders."""
         self.stats_hist_ax.clear()
+        no_data = QCoreApplication.translate("Tab 2", "No data")
         self.stats_hist_ax.text(
-            0.5, 0.5, 'Sin datos',
+            0.5, 0.5, no_data,
             ha='center', va='center',
             transform=self.stats_hist_ax.transAxes, color='gray',
         )
@@ -3072,7 +3346,7 @@ class MonitoringNetworksDialog(QDialog):
 
         self._reset_stats_map_axes()
         self.stats_map_ax.text(
-            0.5, 0.5, 'Sin datos',
+            0.5, 0.5, no_data,
             ha='center', va='center',
             transform=self.stats_map_ax.transAxes, color='gray',
         )
@@ -3094,11 +3368,15 @@ class MonitoringNetworksDialog(QDialog):
         median_val = float(np.median(values))
         ax.axvline(
             mean_val, color='#c0392b', linestyle='--', linewidth=1.5,
-            label=f'Media: {mean_val:.4f}',
+            label=QCoreApplication.translate(
+                "Tab 2", "Mean: {value:.4f}"
+            ).format(value=mean_val),
         )
         ax.axvline(
             median_val, color='#d35400', linestyle='-', linewidth=1.5,
-            label=f'Mediana: {median_val:.4f}',
+            label=QCoreApplication.translate(
+                "Tab 2", "Median: {value:.4f}"
+            ).format(value=median_val),
         )
 
         ymin, ymax = ax.get_ylim()
@@ -3114,13 +3392,17 @@ class MonitoringNetworksDialog(QDialog):
             alpha=0.55,
             edgecolors='none',
             zorder=5,
-            label='Datos',
+            label=QCoreApplication.translate("Tab 2", "Data"),
         )
         ax.set_ylim(ymin, ymax + rug_span * 1.5)
         ax.legend(loc='upper right', fontsize=8)
-        ax.set_title(f'Histograma: {attr_name}')
-        ax.set_xlabel('Valor')
-        ax.set_ylabel('Frecuencia')
+        ax.set_title(
+            QCoreApplication.translate(
+                "Tab 2", "Histogram: {param}"
+            ).format(param=attr_name)
+        )
+        ax.set_xlabel(QCoreApplication.translate("Tab 2", "Value"))
+        ax.set_ylabel(QCoreApplication.translate("Tab 2", "Frequency"))
         self.stats_hist_figure.tight_layout()
         self.stats_hist_canvas.draw()
 
@@ -3137,9 +3419,11 @@ class MonitoringNetworksDialog(QDialog):
         self.stats_map_colorbar = self.stats_map_figure.colorbar(
             scatter, ax=self.stats_map_ax, label=attr_name, fraction=0.046,
         )
-        self.stats_map_ax.set_title('Distribución espacial')
-        self.stats_map_ax.set_xlabel('X')
-        self.stats_map_ax.set_ylabel('Y')
+        self.stats_map_ax.set_title(
+            QCoreApplication.translate("Tab 2", "Spatial distribution")
+        )
+        self.stats_map_ax.set_xlabel(QCoreApplication.translate("Tab 2", "X"))
+        self.stats_map_ax.set_ylabel(QCoreApplication.translate("Tab 2", "Y"))
         self.stats_map_figure.tight_layout()
         self.stats_map_canvas.draw()
 
@@ -3202,7 +3486,10 @@ class MonitoringNetworksDialog(QDialog):
         ):
             self.clear_stats_table()
             self.stats_info_label.setText(
-                "No hay datos válidos para el atributo seleccionado."
+                QCoreApplication.translate(
+                    "Tab 2",
+                    "No valid data for the selected attribute.",
+                )
             )
             self.stats_info_label.setStyleSheet("color: red; font-style: italic;")
             return
@@ -3214,7 +3501,9 @@ class MonitoringNetworksDialog(QDialog):
 
         if error:
             self.clear_stats_table()
-            self.stats_info_label.setText(error)
+            self.stats_info_label.setText(
+                QCoreApplication.translate("Tab 2", error)
+            )
             self.stats_info_label.setStyleSheet("color: red; font-style: italic;")
             return
 
@@ -3222,7 +3511,10 @@ class MonitoringNetworksDialog(QDialog):
         if stats_dict is None:
             self.clear_stats_table()
             self.stats_info_label.setText(
-                "No hay datos válidos tras aplicar la transformación."
+                QCoreApplication.translate(
+                    "Tab 2",
+                    "No valid data after applying the transformation.",
+                )
             )
             self.stats_info_label.setStyleSheet("color: red; font-style: italic;")
             return
@@ -3230,15 +3522,27 @@ class MonitoringNetworksDialog(QDialog):
         self._populate_stats_table(stats_dict)
         self._update_stats_plots(coordinates, transformed, attr_name)
 
-        info_parts = [f"Estadísticas de «{attr_name}»"]
+        info_parts = [
+            QCoreApplication.translate(
+                "Tab 2", "Statistics for «{param}»"
+            ).format(param=attr_name)
+        ]
         if null_count > 0:
-            info_parts.append(f"{null_count} valor(es) nulo(s) omitido(s)")
+            info_parts.append(
+                QCoreApplication.translate(
+                    "Tab 2", "{count} null value(s) omitted"
+                ).format(count=null_count)
+            )
         if transform == 'log' and excluded_non_positive > 0:
             info_parts.append(
-                f"{excluded_non_positive} valor(es) ≤ 0 omitido(s) para log"
+                QCoreApplication.translate(
+                    "Tab 2", "{count} value(s) ≤ 0 omitted for log"
+                ).format(count=excluded_non_positive)
             )
         if transform == 'log':
-            info_parts.append("(Log transformation)")
+            info_parts.append(
+                QCoreApplication.translate("Tab 2", "(Log transformation)")
+            )
 
         self.stats_info_label.setText(" · ".join(info_parts))
         self.stats_info_label.setStyleSheet("color: gray; font-style: italic;")
@@ -3302,7 +3606,7 @@ class MonitoringNetworksDialog(QDialog):
         self.update_estimated_points()
 
     def update_estimated_points(self):
-        """Calcula y actualiza el estimado de puntos totales basado en el espaciado actual"""
+        """Updates the estimated total node count from the current spacing."""
         layer = self.input_data_layer.currentLayer()
         if not layer or not hasattr(self, 'spacing_spin') or not hasattr(self, 'estimated_points_label'):
             return
@@ -3314,7 +3618,7 @@ class MonitoringNetworksDialog(QDialog):
             buffer = self.buffer_spin.value() if hasattr(self, 'buffer_spin') else 0
             
             if spacing > 0 and width > 0 and height > 0:
-                # Ajustar dimensiones con buffer
+                # Adjust dimensions with buffer
                 width_with_buffer = width + (2 * buffer)
                 height_with_buffer = height + (2 * buffer)
                 
@@ -3323,21 +3627,32 @@ class MonitoringNetworksDialog(QDialog):
                 n_y = max(1, int(height_with_buffer / spacing) + 1)
                 n_nodes = n_x * n_y
                 
-                self.estimated_points_label.setText(f"{n_nodes} puntos ({n_x} × {n_y})")
+                self.estimated_points_label.setText(
+                    QCoreApplication.translate(
+                        "Tab 3",
+                        "{count} points ({n_x} × {n_y})",
+                    ).format(count=n_nodes, n_x=n_x, n_y=n_y)
+                )
             else:
                 self.estimated_points_label.setText("N/A")
         except Exception:
-            self.estimated_points_label.setText("Error al calcular")
+            self.estimated_points_label.setText(
+                QCoreApplication.translate("Tab 3", "Could not calculate estimate")
+            )
     
     def preview_grid(self):
         """
-        Previsualiza la malla de estimación generando nodos sobre un hull cóncavo
-        que cubre la extensión de los puntos de entrada, con el espaciado y buffer definidos.
-        Usa el algoritmo Concave hull de QGIS con ALPHA = 0.7 y sin agujeros.
+        Previews the estimation grid by generating nodes over a concave hull
+        that covers the input points, using the defined spacing and buffer.
+        Uses the QGIS concave hull algorithm with ALPHA = 0.7 and no holes.
         """
         layer = self.input_data_layer.currentLayer()
         if not layer:
-            QMessageBox.warning(self, "Error", "Seleccione una capa primero")
+            QMessageBox.warning(
+                self,
+                QCoreApplication.translate("Tab 3", "Error"),
+                QCoreApplication.translate("Tab 3", "Select a layer first."),
+            )
             return
 
         try:
@@ -3348,22 +3663,21 @@ class MonitoringNetworksDialog(QDialog):
             buffer = self.buffer_spin.value()
             spacing = self.spacing_spin.value()
 
-            # Obtener datos de entrada (pozos/puntos originales)
-            data_points = []
-            for feature in layer.getFeatures():
-                geom = feature.geometry()
-                if geom:
-                    point = geom.asPoint()
-                    data_points.append([point.x(), point.y()])
-
-            data_points = np.array(data_points) if data_points else np.array([]).reshape(0, 2)
-            if len(data_points) == 0:
-                QMessageBox.warning(self, "Error", "No hay puntos en la capa seleccionada.")
+            # Input well/point coordinates
+            data_points = extract_layer_coordinates(layer)
+            if data_points is None or len(data_points) == 0:
+                QMessageBox.warning(
+                    self,
+                    QCoreApplication.translate("Tab 3", "Error"),
+                    QCoreApplication.translate(
+                        "Tab 3", "The selected layer has no points."
+                    ),
+                )
                 return
 
-            # Crear hull usando algoritmo Concave Hull de QGIS
+            # Build hull using the QGIS concave hull algorithm
             if len(data_points) <= 2:
-                # No se puede crear hull, usar bounding box bufferizado
+                # Cannot build a hull; use a buffered bounding box
                 extent = layer.extent()
                 minx, miny, maxx, maxy = extent.xMinimum(), extent.yMinimum(), extent.xMaximum(), extent.yMaximum()
                 minx -= buffer
@@ -3372,7 +3686,7 @@ class MonitoringNetworksDialog(QDialog):
                 maxy += buffer
                 hull_polygon = Polygon([(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)])
             else:
-                # Crear capa temporal de puntos para usar QGIS Concave Hull
+                # Temporary point layer for the QGIS concave hull tool
                 from qgis.core import (
                     QgsVectorLayer,
                     QgsField,
@@ -3386,7 +3700,7 @@ class MonitoringNetworksDialog(QDialog):
                 )
                 import processing
 
-                # Crear capa temporal de puntos en memoria
+                # In-memory temporary point layer
                 point_layer = QgsVectorLayer("Point?crs={}".format(layer.crs().authid()), "temp_points", "memory")
                 prov = point_layer.dataProvider()
                 features = []
@@ -3397,7 +3711,7 @@ class MonitoringNetworksDialog(QDialog):
                 prov.addFeatures(features)
                 point_layer.updateExtents()
 
-                # Ejecutar Concave Hull con alpha = 0.7, without holes
+                # Run concave hull with alpha = 0.7, without holes
                 alg_params = {
                     'INPUT': point_layer,
                     'ALPHA': 0.7,
@@ -3408,11 +3722,11 @@ class MonitoringNetworksDialog(QDialog):
                 hull_result = processing.run("qgis:concavehull", alg_params, feedback=feedback)
                 hull_layer = hull_result['OUTPUT']
 
-                # Obtener el polígono del hull generado
+                # Hull polygon from the processing output
                 hull_features = list(hull_layer.getFeatures())
                 if hull_features:
                     hull_geom = hull_features[0].geometry()
-                    # Convertir a shapely polygon para procesamiento
+                    # Convert to a Shapely polygon for further processing
                     if hull_geom.isMultipart():
                         qgs_polys = hull_geom.asMultiPolygon()
                         polys = [Polygon([(pt.x(), pt.y()) for pt in ring]) for ring in qgs_polys[0:]]
@@ -3422,28 +3736,38 @@ class MonitoringNetworksDialog(QDialog):
                         if qgs_poly:
                             hull_polygon = Polygon([(pt.x(), pt.y()) for pt in qgs_poly[0]])
                         else:
-                            # fallback, por alguna razón conversion falló
-                            raise Exception("No se pudo convertir el hull QGIS a Shapely Polygon.")
+                            # Fallback when QGIS-to-Shapely conversion fails
+                            raise Exception(
+                                QCoreApplication.translate(
+                                    "Tab 3",
+                                    "Could not convert the QGIS hull to a Shapely polygon.",
+                                )
+                            )
                 else:
-                    raise Exception("No se pudo crear el hull cóncavo con QGIS.")
+                    raise Exception(
+                        QCoreApplication.translate(
+                            "Tab 3",
+                            "Could not create the concave hull with QGIS.",
+                        )
+                    )
 
-                # Buffer al hull calculado
+                # Buffer the computed hull
                 hull_polygon = hull_polygon.buffer(buffer)
 
-            # Generar grid rectangular de puntos sobre el bounding box del hull+buffer
+            # Rectangular grid over the hull bounding box
             minx, miny, maxx, maxy = hull_polygon.bounds
             x_coords = np.arange(minx, maxx + spacing, spacing)
             y_coords = np.arange(miny, maxy + spacing, spacing)
             grid_x, grid_y = np.meshgrid(x_coords, y_coords)
             grid_points = np.column_stack([grid_x.ravel(), grid_y.ravel()])
 
-            # Filtrar solo los puntos dentro del hull poligon (concave hull + buffer)
+            # Keep only nodes inside the hull polygon (concave hull + buffer)
             shapely_points = [Point(xy) for xy in grid_points]
             mask_in_hull = np.array([hull_polygon.contains(pt) or hull_polygon.touches(pt) for pt in shapely_points])
             estimation_points = grid_points[mask_in_hull]
             n_nodes = len(estimation_points)
 
-            # Guardar la información de la malla para otros métodos
+            # Store grid metadata for later workflow steps
             grid_info = {
                 'grid_points': estimation_points,
                 'n_nodes': n_nodes,
@@ -3458,16 +3782,15 @@ class MonitoringNetworksDialog(QDialog):
             self.current_grid_info = grid_info
             self.current_grid_points = estimation_points
             
-            # Invalidar datos de priorización y resultados cuando cambia la malla
-            # Esto asegura que se recalculen con la nueva malla
+            # Invalidate prioritization/results when the grid changes
             if hasattr(self, 'prioritization_grid_points'):
-                # Verificar si la malla ha cambiado comparando el número de puntos
+                # Detect grid changes by comparing node counts
                 if (self.prioritization_grid_points is None or 
                     len(self.prioritization_grid_points) != len(estimation_points)):
                     self.prioritization_grid_points = None
                     if hasattr(self, 'variance_results'):
                         self.variance_results = {}
-                        # Limpiar visualizaciones
+                        # Clear dependent visualizations
                         if hasattr(self, 'variance_ax'):
                             self._clear_variance_reduction_plot()
                             self.variance_info_label.setText(
@@ -3486,40 +3809,52 @@ class MonitoringNetworksDialog(QDialog):
             ceg_values = np.ones(len(estimation_points), dtype=int)
             self.current_ceg_values = ceg_values
 
-            # Visualización
+            # Preview plot
             self.grid_figure.clear()
             ax = self.grid_figure.add_subplot(111)
 
-            # Dibujar puntos originales
-            if len(data_points) > 0:
-                ax.scatter(
-                    data_points[:, 0], data_points[:, 1],
-                    c='red', marker='s', label='Pozos',
-                    s=20, zorder=5, edgecolors='black', linewidths=0.2
-                )
+            self._plot_wells_on_map_axes(
+                ax,
+                data_points,
+                label=QCoreApplication.translate("Tab 3", "Wells"),
+            )
 
-            # Dibujar hull (concave hull QGIS para referencia)
+            # Hull outline (QGIS concave hull with buffer)
             hull_x, hull_y = hull_polygon.exterior.xy
-            ax.plot(hull_x, hull_y, color='blue', linestyle='--', linewidth=1, label='Hull (QGIS, bufferizado)')
+            ax.plot(
+                hull_x,
+                hull_y,
+                color='blue',
+                linestyle='--',
+                linewidth=1,
+                label=QCoreApplication.translate(
+                    "Tab 3", "Hull (QGIS, buffered)"
+                ),
+            )
 
-            # Dibujar grid de estimación
+            # Estimation grid nodes
             if n_nodes > 0:
                 ax.scatter(
                     estimation_points[:, 0], estimation_points[:, 1],
-                    c='black', marker='o', label='Malla de estimación',
+                    c='black', marker='o',
+                    label=QCoreApplication.translate("Tab 3", "Estimation grid"),
                     s=5, alpha=0.7, edgecolors='black', linewidths=0.5
                 )
 
-            ax.set_xlabel('X')
-            ax.set_ylabel('Y')
-            ax.set_title('Malla de Estimación sobre Hull Cóncavo (QGIS)')
+            ax.set_xlabel(QCoreApplication.translate("Tab 3", "X"))
+            ax.set_ylabel(QCoreApplication.translate("Tab 3", "Y"))
+            ax.set_title(
+                QCoreApplication.translate(
+                    "Tab 3", "Estimation Grid on QGIS Concave Hull"
+                )
+            )
             ax.legend(loc='best')
             ax.grid(True, alpha=0.3)
             ax.set_aspect('equal')
 
             self.grid_canvas.draw()
 
-            # Guardar también los parámetros de la malla para poder usarlos al guardar
+            # Keep grid parameters for export
             self.grid_type_saved = 'Concave Hull (QGIS)'
             self.n_nodes_saved = n_nodes
             self.buffer_saved = buffer
@@ -3528,17 +3863,35 @@ class MonitoringNetworksDialog(QDialog):
 
         except Exception as e:
             import traceback
-            QMessageBox.warning(self, "Error", f"Error al crear malla: {str(e)}\n{traceback.format_exc()}")
+            QMessageBox.warning(
+                self,
+                QCoreApplication.translate("Tab 3", "Error"),
+                QCoreApplication.translate(
+                    "Tab 3",
+                    "Could not create the estimation grid:\n{error}\n{details}",
+                ).format(error=str(e), details=traceback.format_exc()),
+            )
 
     def save_grid_as_layer(self):
-        """Guarda la malla generada como capa temporal en QGIS con valores CEG"""
+        """Saves the generated grid as a temporary QGIS point layer."""
         if not hasattr(self, 'current_grid_points') or self.current_grid_points is None:
-            QMessageBox.warning(self, "Error", "No hay malla generada para guardar. Por favor, previsualice la malla primero.")
+            QMessageBox.warning(
+                self,
+                QCoreApplication.translate("Tab 3", "Error"),
+                QCoreApplication.translate(
+                    "Tab 3",
+                    "No generated grid is available. Preview the grid first.",
+                ),
+            )
             return
         
         layer = self.input_data_layer.currentLayer()
         if not layer:
-            QMessageBox.warning(self, "Error", "No hay capa seleccionada")
+            QMessageBox.warning(
+                self,
+                QCoreApplication.translate("Tab 3", "Error"),
+                QCoreApplication.translate("Tab 3", "No layer is selected."),
+            )
             return
         
         try:
@@ -3551,22 +3904,27 @@ class MonitoringNetworksDialog(QDialog):
             ceg_values = getattr(self, 'current_ceg_values', None)
             crs = layer.crs()
             
-            # Crear capa temporal de puntos
-            temp_layer = QgsVectorLayer(f"Point?crs={crs.authid()}", "Malla de Estimación", "memory")
+            # Temporary point layer
+            layer_name = QCoreApplication.translate(
+                "Tab 3", "Estimation Grid"
+            )
+            temp_layer = QgsVectorLayer(
+                f"Point?crs={crs.authid()}", layer_name, "memory"
+            )
             
-            # Definir campos
+            # Field definitions
             fields = QgsFields()
             fields.append(QgsField('ID', QVariant.Int))
             fields.append(QgsField('Coord_X', QVariant.Double))
             fields.append(QgsField('Coord_Y', QVariant.Double))
-            fields.append(QgsField('Fila', QVariant.Int))
-            fields.append(QgsField('Columna', QVariant.Int))
+            fields.append(QgsField('Row', QVariant.Int))
+            fields.append(QgsField('Column', QVariant.Int))
             fields.append(QgsField('CEG_Value', QVariant.Int))
-            fields.append(QgsField('Tipo_Malla', QVariant.String))
-            fields.append(QgsField('Num_Nodos', QVariant.Int))
+            fields.append(QgsField('Grid_Type', QVariant.String))
+            fields.append(QgsField('Node_Count', QVariant.Int))
             fields.append(QgsField('Buffer', QVariant.Double))
             
-            # Obtener parámetros guardados o actuales
+            # Saved or current grid parameters
             grid_type = getattr(self, 'grid_type_saved', 'Rectangular')
             n_nodes = getattr(self, 'n_nodes_saved', 0)
             buffer = getattr(self, 'buffer_saved', self.buffer_spin.value() if hasattr(self, 'buffer_spin') else 100)
@@ -3574,41 +3932,38 @@ class MonitoringNetworksDialog(QDialog):
             temp_layer.dataProvider().addAttributes(fields)
             temp_layer.updateFields()
             
-            # Obtener información de filas y columnas si está disponible
+            # Row/column indices when available
             row_col_indices = None
             if grid_info is not None and 'row_col_indices' in grid_info:
                 row_col_indices = grid_info['row_col_indices']
             
-            # Añadir features
+            # Build features
             features = []
             for i, point in enumerate(grid_points):
                 feature = QgsFeature()
                 qgs_point = QgsPointXY(point[0], point[1])
                 feature.setGeometry(QgsGeometry.fromPointXY(qgs_point))
                 
-                # Obtener fila y columna
                 row = -1
                 col = -1
                 if row_col_indices is not None and i < len(row_col_indices):
                     row = int(row_col_indices[i][0])
                     col = int(row_col_indices[i][1])
                 
-                # Obtener valor CEG
                 ceg_value = -1
                 if ceg_values is not None and i < len(ceg_values):
                     ceg_value = int(ceg_values[i])
                 
-                # Atributos
                 attrs = [
-                    i + 1,  # ID
-                    float(point[0]),  # Coord_X
-                    float(point[1]),  # Coord_Y
-                    row,  # Fila
-                    col,  # Columna
-                    ceg_value,  # CEG_Value
-                    grid_type,  # Tipo_Malla
-                    n_nodes,  # Num_Nodos
-                    float(buffer)  # Buffer
+                    i + 1,
+                    float(point[0]),
+                    float(point[1]),
+                    row,
+                    col,
+                    ceg_value,
+                    grid_type,
+                    n_nodes,
+                    float(buffer),
                 ]
                 
                 feature.setAttributes(attrs)
@@ -3617,15 +3972,87 @@ class MonitoringNetworksDialog(QDialog):
             temp_layer.dataProvider().addFeatures(features)
             temp_layer.updateExtents()
             
-            # Añadir capa al proyecto
+            # Add layer to the project
             QgsProject.instance().addMapLayer(temp_layer)
             
-            QMessageBox.information(self, "Éxito", f"Malla guardada como capa temporal con {len(features)} puntos.")
+            QMessageBox.information(
+                self,
+                QCoreApplication.translate("Tab 3", "Success"),
+                QCoreApplication.translate(
+                    "Tab 3",
+                    "Saved the estimation grid as a temporary layer with "
+                    "{count} points.",
+                ).format(count=len(features)),
+            )
             
         except Exception as e:
             import traceback
-            QMessageBox.warning(self, "Error", f"Error al guardar malla: {str(e)}\n{traceback.format_exc()}")
+            QMessageBox.warning(
+                self,
+                QCoreApplication.translate("Tab 3", "Error"),
+                QCoreApplication.translate(
+                    "Tab 3",
+                    "Could not save the estimation grid:\n{error}\n{details}",
+                ).format(error=str(e), details=traceback.format_exc()),
+            )
     
+    def _draw_imported_estimation_grid(self, xs, ys, weights):
+        """
+        Draws an imported estimation grid with a discrete weight legend.
+
+        Each unique grid weight is shown as a separate legend entry instead of
+        a continuous color ramp.
+        """
+        self.grid_figure.clear()
+        ax = self.grid_figure.add_subplot(111)
+
+        xs = np.asarray(xs, dtype=float)
+        ys = np.asarray(ys, dtype=float)
+        weights = np.asarray(weights, dtype=float)
+        unique_weights = np.unique(weights)
+        cmap = plt.get_cmap('viridis')
+        n_unique = unique_weights.size
+
+        for index, weight_val in enumerate(unique_weights):
+            mask = weights == weight_val
+            if not np.any(mask):
+                continue
+            color = cmap(index / max(n_unique - 1, 1))
+            ax.scatter(
+                xs[mask],
+                ys[mask],
+                c=[color],
+                s=30,
+                alpha=0.9,
+                edgecolors='k',
+                linewidths=0.3,
+                label=f"{weight_val:g}",
+                zorder=3,
+            )
+
+        layer = (
+            self.input_data_layer.currentLayer()
+            if hasattr(self, 'input_data_layer')
+            else None
+        )
+        if layer is not None:
+            well_coords = extract_layer_coordinates(layer)
+            self._plot_wells_on_map_axes(ax, well_coords)
+
+        ax.set_title(
+            QCoreApplication.translate("Tab 3", "Imported Estimation Grid")
+        )
+        ax.set_xlabel(QCoreApplication.translate("Tab 3", "X"))
+        ax.set_ylabel(QCoreApplication.translate("Tab 3", "Y"))
+        ax.legend(
+            title=QCoreApplication.translate("Tab 3", "Weight"),
+            loc='best',
+            fontsize=8,
+        )
+        ax.grid(True, alpha=0.3)
+        ax.set_aspect('equal', 'box')
+        self.grid_canvas.draw()
+
     def load_grid_as_layer(self):
         """
         Load estimation grid from an .xlsx file and plot on Tab 3.
@@ -3634,7 +4061,9 @@ class MonitoringNetworksDialog(QDialog):
         """
         try:
             file_path = self._prompt_open_xlsx(
-                "Select Estimation Grid Excel File"
+                QCoreApplication.translate(
+                    "Tab 3", "Select Estimation Grid Excel File"
+                )
             )
             if not file_path:
                 return
@@ -3642,26 +4071,41 @@ class MonitoringNetworksDialog(QDialog):
             try:
                 table_rows = read_excel_table_rows(file_path)
             except ImportError as exc:
-                QMessageBox.warning(self, "Error", str(exc))
+                QMessageBox.warning(
+                    self,
+                    QCoreApplication.translate("Tab 3", "Error"),
+                    str(exc),
+                )
                 return
             except Exception as e:
                 QMessageBox.warning(
-                    self, "Error", f"Could not read Excel file:\n{str(e)}"
+                    self,
+                    QCoreApplication.translate("Tab 3", "Error"),
+                    QCoreApplication.translate(
+                        "Tab 3", "Could not read Excel file:\n{error}"
+                    ).format(error=str(e)),
                 )
                 return
 
             if not table_rows:
                 QMessageBox.warning(
-                    self, "Error", "The selected Excel file is empty."
+                    self,
+                    QCoreApplication.translate("Tab 3", "Error"),
+                    QCoreApplication.translate(
+                        "Tab 3", "The selected Excel file is empty."
+                    ),
                 )
                 return
 
             if len(table_rows[0]) < 4:
                 QMessageBox.warning(
                     self,
-                    "Invalid File",
-                    "The selected file must have at least 4 columns for "
-                    "ID, X, Y, and Weight (in that order).",
+                    QCoreApplication.translate("Tab 3", "Invalid File"),
+                    QCoreApplication.translate(
+                        "Tab 3",
+                        "The selected file must have at least 4 columns for "
+                        "ID, X, Y, and Weight (in that order).",
+                    ),
                 )
                 return
 
@@ -3696,8 +4140,12 @@ class MonitoringNetworksDialog(QDialog):
             if not ids:
                 QMessageBox.warning(
                     self,
-                    "Error",
-                    "No valid records with ID, X, Y, and Weight found in the file.",
+                    QCoreApplication.translate("Tab 3", "Error"),
+                    QCoreApplication.translate(
+                        "Tab 3",
+                        "No valid records with ID, X, Y, and Weight found in "
+                        "the file.",
+                    ),
                 )
                 return
 
@@ -3726,34 +4174,30 @@ class MonitoringNetworksDialog(QDialog):
             self.current_ceg_values = weights
 
             # Plot on Tab 3 (Estimation Grid Visualization)
-            self.grid_figure.clear()
-            ax = self.grid_figure.add_subplot(111)
-            ax.scatter(xs, ys, c=weights, cmap='viridis', s=30, alpha=0.9, edgecolors='k')
-            ax.set_title("Imported Estimation Grid")
-            ax.set_xlabel("X")
-            ax.set_ylabel("Y")
-            self.grid_figure.colorbar(
-                ax.collections[0], ax=ax, orientation='vertical', label="Weight"
-            )
-            ax.set_aspect('equal', 'box')
-            self.grid_canvas.draw()
+            self._draw_imported_estimation_grid(xs, ys, weights)
 
             QMessageBox.information(
                 self,
-                "Success",
-                f"Grid loaded successfully with {n_nodes} points.\n"
-                "(used columns: first 4 columns of file)",
+                QCoreApplication.translate("Tab 3", "Success"),
+                QCoreApplication.translate(
+                    "Tab 3",
+                    "Grid loaded successfully with {count} points.\n"
+                    "(used columns: first 4 columns of file)",
+                ).format(count=n_nodes),
             )
         except Exception as e:
             import traceback
             QMessageBox.warning(
                 self,
-                "Error",
-                f"Failed to load grid: {str(e)}\n{traceback.format_exc()}",
+                QCoreApplication.translate("Tab 3", "Error"),
+                QCoreApplication.translate(
+                    "Tab 3",
+                    "Failed to load grid:\n{error}\n{details}",
+                ).format(error=str(e), details=traceback.format_exc()),
             )
 
 class VariogramWidget(QWidget):
-    """Widget visualization and adjustment of variogram"""
+    """Widget for variogram visualization and parameter adjustment."""
 
     params_changed = pyqtSignal(dict)
 
@@ -3806,7 +4250,7 @@ class VariogramWidget(QWidget):
         self.setLayout(layout)
     
     def on_params_changed(self):
-        """Emite señal cuando cambian los parámetros"""
+        """Emit signal when variogram parameters change."""
         if self.current_data is not None:
             params = {
                 'model': self.model_combo.currentText(),
@@ -3819,7 +4263,7 @@ class VariogramWidget(QWidget):
             self.update_plot(emit_signal=False)
     
     def auto_fit(self):
-        """Ajusta automáticamente el variograma"""
+        """Automatically fits the variogram model."""
         if self.current_data is None:
             return
 
@@ -3831,39 +4275,53 @@ class VariogramWidget(QWidget):
         # Show progress bar and set initial status
         if progress_bar and status_label:
             progress_bar.setValue(0)
-            status_label.setText("Iniciando cálculo de variograma...")
-            # Force UI update
+            status_label.setText(
+                QCoreApplication.translate(
+                    "Tab 2", "State: Starting variogram calculation..."
+                )
+            )
             QApplication.processEvents()
 
         try:
-            # Implement automatic fitting using gstools
             coordinates = self.current_data['coordinates']
             values = self.current_data['values']
             model_type = self.model_combo.currentText()
 
-            # Calculate experimental variogram
             if progress_bar and status_label:
                 progress_bar.setValue(10)
-                status_label.setText("Estado: Calculando variograma experimental...")
-                # Force UI update
+                status_label.setText(
+                    QCoreApplication.translate(
+                        "Tab 2", "State: Computing experimental variogram..."
+                    )
+                )
                 QApplication.processEvents()
 
             bin_edges = np.linspace(0, self.current_data['max_dist']/2,15)
             bin_center, gamma = gs.vario_estimate(coordinates.T, values, bin_edges=bin_edges)
             
-            # Filter valid values (remove NaN and infinities)
             valid_mask = np.isfinite(bin_center) & np.isfinite(gamma) & (gamma >= 0)
             if np.sum(valid_mask) < 3:
-                QMessageBox.warning(self, "Error", "No hay suficientes puntos válidos en el variograma experimental para el ajuste")
+                QMessageBox.warning(
+                    self,
+                    QCoreApplication.translate("Tab 2", "Error"),
+                    QCoreApplication.translate(
+                        "Tab 2",
+                        "Not enough valid points in the experimental variogram "
+                        "to fit the model.",
+                    ),
+                )
                 return
             
             bin_center = bin_center[valid_mask]
             gamma = gamma[valid_mask]
 
-            # Calculate approximate initial values to help the algorithm
             if progress_bar and status_label:
                 progress_bar.setValue(30)
-                status_label.setText("Estado: Calculando valores iniciales...")
+                status_label.setText(
+                    QCoreApplication.translate(
+                        "Tab 2", "State: Computing initial values..."
+                    )
+                )
                 QApplication.processEvents()
 
             var_values = np.var(values)
@@ -3876,10 +4334,13 @@ class VariogramWidget(QWidget):
             estimated_sill = max_gamma
             estimated_range = max_dist_used / 3.0  # Common approximation
             
-            # Create and fit model
             if progress_bar and status_label:
                 progress_bar.setValue(50)
-                status_label.setText("Estado: Creando modelo de variograma...")
+                status_label.setText(
+                    QCoreApplication.translate(
+                        "Tab 2", "State: Creating variogram model..."
+                    )
+                )
                 QApplication.processEvents()
 
             if model_type == 'spherical':
@@ -3893,11 +4354,13 @@ class VariogramWidget(QWidget):
             else:
                 model = gs.Matern(dim=2)
             
-            # Fit with increased parameters to avoid maximum evaluations error
-            # First, set estimated initial values to help the algorithm
             if progress_bar and status_label:
                 progress_bar.setValue(70)
-                status_label.setText("Estado: Configurando parámetros iniciales...")
+                status_label.setText(
+                    QCoreApplication.translate(
+                        "Tab 2", "State: Setting initial parameters..."
+                    )
+                )
                 QApplication.processEvents()
 
             try:
@@ -3919,18 +4382,22 @@ class VariogramWidget(QWidget):
 
             if progress_bar and status_label:
                 progress_bar.setValue(80)
-                status_label.setText("Ajustando modelo de variograma...")
+                status_label.setText(
+                    QCoreApplication.translate(
+                        "Tab 2", "State: Fitting variogram model..."
+                    )
+                )
                 QApplication.processEvents()
 
             try:
-                # Try fitting with increased parameters
-                # Use parameters compatible with different gstools versions
                 try:
-                    # Optimization: reduce max_eval for faster fitting
-                    # With good initial values, we don't need so many evaluations
                     if progress_bar and status_label:
                         progress_bar.setValue(80)
-                        status_label.setText("Estado: Ajustando modelo de variograma...")
+                        status_label.setText(
+                            QCoreApplication.translate(
+                                "Tab 2", "State: Fitting variogram model..."
+                            )
+                        )
                         QApplication.processEvents()
 
                     para, pcov, r2 = model.fit_variogram(
@@ -3976,15 +4443,22 @@ class VariogramWidget(QWidget):
                     r2 = 0.0  # R² unknown when no fitting
                     QMessageBox.information(
                         self,
-                        "Aviso",
-                        "No se pudo realizar el ajuste automático completo. Se usaron valores estimados.\n"
-                        f"Error: {str(fit_error2)}\n"
-                        "Puede ajustar los parámetros manualmente."
+                        QCoreApplication.translate("Tab 2", "Notice"),
+                        QCoreApplication.translate(
+                            "Tab 2",
+                            "Automatic fitting could not be completed. Estimated "
+                            "values were used instead.\n"
+                            "Error: {error}\n"
+                            "You can adjust the parameters manually.",
+                        ).format(error=str(fit_error2)),
                     )
-                    # Update progress for partial success
                     if progress_bar and status_label:
                         progress_bar.setValue(100)
-                        status_label.setText("Estado: Completado con valores estimados")
+                        status_label.setText(
+                            QCoreApplication.translate(
+                                "Tab 2", "State: Completed with estimated values"
+                            )
+                        )
                         QApplication.processEvents()
 
                         # Reset progress elements after a short delay
@@ -3994,7 +4468,11 @@ class VariogramWidget(QWidget):
             # Update spinboxes
             if progress_bar and status_label:
                 progress_bar.setValue(95)
-                status_label.setText("Estado: Actualizando controles...")
+                status_label.setText(
+                    QCoreApplication.translate(
+                        "Tab 2", "State: Updating controls..."
+                    )
+                )
                 QApplication.processEvents()
 
             self.nugget_spin.setValue(max(0.0, model.nugget))
@@ -4018,21 +4496,32 @@ class VariogramWidget(QWidget):
             # Complete progress
             if progress_bar and status_label:
                 progress_bar.setValue(100)
-                status_label.setText("Estado: Completado exitosamente")
+                status_label.setText(
+                    QCoreApplication.translate(
+                        "Tab 2", "State: Completed successfully"
+                    )
+                )
                 QApplication.processEvents()
 
                 # Reset progress elements after a short delay
                 from qgis.PyQt.QtCore import QTimer
                 QTimer.singleShot(2000, lambda: self._hide_progress_elements())
         except Exception as e:
-            # Reset progress bar on error
             if progress_bar and status_label:
                 progress_bar.setValue(0)
-                status_label.setText("Estado: Error")
-            QMessageBox.warning(self, "Error", f"Error en ajuste automático: {str(e)}")
+                status_label.setText(
+                    QCoreApplication.translate("Tab 2", "State: Error")
+                )
+            QMessageBox.warning(
+                self,
+                QCoreApplication.translate("Tab 2", "Error"),
+                QCoreApplication.translate(
+                    "Tab 2", "Automatic fitting failed: {error}"
+                ).format(error=str(e)),
+            )
 
     def _hide_progress_elements(self):
-        """Reset progress elements after completion"""
+        """Reset progress elements after completion."""
         main_dialog = self.dialog
         progress_bar = getattr(main_dialog, 'var_progress_bar', None)
         status_label = getattr(main_dialog, 'var_progress_status_label', None)
@@ -4040,10 +4529,47 @@ class VariogramWidget(QWidget):
         if progress_bar:
             progress_bar.setValue(0)
         if status_label:
-            status_label.setText("Estado: Listo")
+            status_label.setText(
+                QCoreApplication.translate("Tab 2", "State: Ready")
+            )
+
+    def clear(self):
+        """Clears data, model controls and plot when input layer/attributes change."""
+        self.model_combo.blockSignals(True)
+        self.nugget_spin.blockSignals(True)
+        self.sill_spin.blockSignals(True)
+        self.range_spin.blockSignals(True)
+        try:
+            self.current_data = None
+            self.current_model = None
+            self.model_combo.setCurrentText('spherical')
+            self.nugget_spin.setValue(0.0)
+            self.sill_spin.setValue(0.0)
+            self.range_spin.setValue(0.0)
+            self.r2_label.setText("0.000")
+        finally:
+            self.model_combo.blockSignals(False)
+            self.nugget_spin.blockSignals(False)
+            self.sill_spin.blockSignals(False)
+            self.range_spin.blockSignals(False)
+
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        ax.text(
+            0.5,
+            0.5,
+            QCoreApplication.translate("Tab 2", "No variogram data"),
+            ha='center',
+            va='center',
+            transform=ax.transAxes,
+            color='gray',
+        )
+        ax.set_xticks([])
+        ax.set_yticks([])
+        self.canvas.draw()
 
     def set_data(self, coordinates, values, attribute_name, log_transform=False, auto_fit=False):
-        """Establece los datos para el variograma"""
+        """Sets variogram input data."""
         from scipy.spatial import distance
         
         # Optimization: calculate max_dist more efficiently
@@ -4071,7 +4597,7 @@ class VariogramWidget(QWidget):
         # from the mathematical models table (if they exist)
     
     def set_parameters(self, model_type=None, nugget=None, sill=None, range_val=None, r2=None):
-        """Actualiza los controles del variograma con parámetros dados"""
+        """Updates variogram controls from the given parameters."""
         # Block signals to avoid unnecessary emissions
         self.model_combo.blockSignals(True)
         self.nugget_spin.blockSignals(True)
@@ -4102,13 +4628,12 @@ class VariogramWidget(QWidget):
             self.range_spin.blockSignals(False)
     
     def update_plot(self, emit_signal=True):
-        """Actualiza el gráfico del variograma"""
+        """Updates the variogram plot."""
         self.figure.clear()
         ax = self.figure.add_subplot(111)
         
         if self.current_data is not None:
             try:
-                # Calculate experimental variogram
                 coordinates = self.current_data['coordinates']
                 values = self.current_data['values']
                 max_dist = self.current_data['max_dist']
@@ -4116,8 +4641,12 @@ class VariogramWidget(QWidget):
                 bin_edges = np.linspace(0, max_dist/2, 20)
                 bin_center, gamma = gs.vario_estimate(coordinates.T, values, bin_edges=bin_edges)
                 
-                # Plot experimental
-                ax.scatter(bin_center, gamma, label='Experimental', alpha=0.7)
+                ax.scatter(
+                    bin_center,
+                    gamma,
+                    label=QCoreApplication.translate("Tab 2", "Experimental"),
+                    alpha=0.7,
+                )
                 
                 # Plot theoretical model
                 if self.current_model is not None or True:
@@ -4152,16 +4681,26 @@ class VariogramWidget(QWidget):
                         }
                         self.params_changed.emit(params)
                     
-                    # Plot model
                     x_model = np.linspace(0, max_dist/2, 100)
                     y_model = model.variogram(x_model)
-                    ax.plot(x_model, y_model, 'r-', label=f'Modelo {model_type}')
+                    ax.plot(
+                        x_model,
+                        y_model,
+                        'r-',
+                        label=QCoreApplication.translate(
+                            "Tab 2", "Model: {model}"
+                        ).format(model=model_type),
+                    )
                 
-                ax.set_xlabel('Distancia')
-                ax.set_ylabel('Semivarianza')
-                title = f'Variograma - {self.current_data["attribute"]}'
+                ax.set_xlabel(QCoreApplication.translate("Tab 2", "Distance"))
+                ax.set_ylabel(QCoreApplication.translate("Tab 2", "Semivariance"))
+                title = QCoreApplication.translate(
+                    "Tab 2", "Variogram – {param}"
+                ).format(param=self.current_data["attribute"])
                 if self.current_data.get('log_transform', False):
-                    title += ' (Transformación Logarítmica)'
+                    title += QCoreApplication.translate(
+                        "Tab 2", " (Log transform)"
+                    )
                 ax.set_title(title)
                 ax.legend()
                 ax.grid(True, alpha=0.3)
