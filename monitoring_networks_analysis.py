@@ -593,12 +593,17 @@ def run_ordinary_kriging_cross_validation(
     if np.sum(np.isfinite(predicted)) < 3:
         return None
 
-    errors = predicted - values
+    errors = values - predicted
     se = np.sqrt(kriging_var)
     with np.errstate(divide='ignore', invalid='ignore'):
         standardized = np.where(se > 0, errors / se, np.nan)
 
-    summary = compute_cross_validation_summary(errors)
+    if network_indices is not None:
+        summary_errors = errors[included_flags]
+    else:
+        summary_errors = errors
+
+    summary = compute_cross_validation_summary(summary_errors)
 
     rows = []
     for i in range(n):
@@ -714,6 +719,29 @@ def _kalman_rank1_update(k, state):
     state['C_cc'] -= np.outer(c_ck, c_ck) * inv_S
 
 
+def compute_total_variance_percent(normalized_variances):
+    """
+    Remaining total variance on a 0–100% scale relative to the no-wells baseline.
+
+    100% means no variance reduction (zero wells in the network).
+    0% means full reduction (theoretical limit; not reached in practice).
+
+    Args:
+        normalized_variances: Sequence indexed by optimization step; index 0 is
+            the baseline with no wells (same units as phase-2 OK aggregate).
+
+    Returns:
+        1-D float array, same length as ``normalized_variances``.
+    """
+    varianzas = np.asarray(normalized_variances, dtype=float).ravel()
+    if varianzas.size == 0:
+        return varianzas
+    var_initial = float(varianzas[0])
+    if var_initial > 0.0:
+        return 100.0 * varianzas / var_initial
+    return np.full(varianzas.shape, 100.0, dtype=float)
+
+
 def compute_variance_reduction_curve(optimization_input):
     """
     Greedy Kalman well prioritization with an ordinary-kriging variance curve.
@@ -739,6 +767,7 @@ def compute_variance_reduction_curve(optimization_input):
 
     Returns:
         dict with n_points, normalized_variances, variance_reduction (%),
+        total_variance_percent (remaining variance on a 0–100 scale),
         selection_order, grid_node_count, combined_mode, parameters,
         parameter_weights; or None if inputs are insufficient.
     """
@@ -867,6 +896,7 @@ def compute_variance_reduction_curve(optimization_input):
         'n_points': num_puntos,
         'normalized_variances': varianzas,
         'variance_reduction': variance_reduction,
+        'total_variance_percent': compute_total_variance_percent(varianzas),
         'selection_order': np.asarray(selected, dtype=int),
         'grid_node_count': int(n_grid),
         'combined_mode': combined_mode,
