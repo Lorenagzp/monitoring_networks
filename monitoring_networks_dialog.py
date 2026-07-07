@@ -60,7 +60,7 @@ from qgis.core import (QgsProject, QgsVectorLayer, QgsMapLayerProxyModel,
                       QgsFieldProxyModel, QgsFeature, QgsGeometry, QgsPointXY,
                       QgsField, QgsFields, QgsWkbTypes, QgsVectorDataProvider)
 from qgis.gui import QgsMapLayerComboBox, QgsFieldComboBox
-from PyQt5.QtGui import QColor
+from PyQt5.QtGui import QColor, QBrush
 import numpy as np
 import gstools as gs
 from scipy import stats
@@ -87,22 +87,35 @@ from .monitoring_networks_analysis import (
     STAT_KEYS,
 )
 
-STATS_TRANSFORM_COL = 0
-STATS_VALUE_COL_OFFSET = 1
+# Tab 2 stats_table: per-parameter weight for tab 4 combined optimization
+# (not the per-well weight checkbox on tab 4).
+STATS_COL_WEIGHT = 0
+STATS_TRANSFORM_COL = 1
+STATS_VALUE_COL_OFFSET = 2
 
 STATS_VALUE_HEADERS = (
     'Count', 'Min', 'Max', 'Mean', 'Median',
     'Std Dev', 'Variance', 'Asymmetry', 'Kurtosis',
 )
 
+STATS_COL_ASYMMETRY = STATS_VALUE_COL_OFFSET + STAT_KEYS.index('asymmetry')
+STATS_COL_KURTOSIS = STATS_VALUE_COL_OFFSET + STAT_KEYS.index('kurtosis')
+STATS_TABLE_MAX_VISIBLE_ROWS = 5
+
+# Tab 2 distribution-shape highlight colors (skewness / excess kurtosis cells).
+STATS_SKEWNESS_BG_SYMMETRIC = QColor('#d5f5e3')      # light green
+STATS_SKEWNESS_BG_NEAR_SYMMETRIC = QColor('#fcf3cf')  # light yellow
+STATS_SKEWNESS_BG_HIGH = QColor('#fadbd8')            # light red
+STATS_KURTOSIS_BG_NORMAL = QColor('#d5f5e3')           # light green
+STATS_KURTOSIS_BG_NON_NORMAL = QColor('#fdebd0')        # light orange
+
 VAR_COL_PARAM = 0
-VAR_COL_WEIGHT = 1
-VAR_COL_TRANSFORM = 2
-VAR_COL_MODEL = 3
-VAR_COL_NUGGET = 4
-VAR_COL_SILL = 5
-VAR_COL_RANGE = 6
-VAR_COL_R2 = 7
+VAR_COL_TRANSFORM = 1
+VAR_COL_MODEL = 2
+VAR_COL_NUGGET = 3
+VAR_COL_SILL = 4
+VAR_COL_RANGE = 5
+VAR_COL_R2 = 6
 
 VARIOGRAM_MODEL_TYPES = [
     'spherical', 'exponential', 'gaussian', 'stable', 'matern',
@@ -136,6 +149,72 @@ def stats_value_header_labels():
         QCoreApplication.translate("Tab 2", header)
         for header in STATS_VALUE_HEADERS
     ]
+
+
+def skewness_distribution_tooltip():
+    """Tooltip text for the tab 2 skewness (asymmetry) statistic."""
+    return QCoreApplication.translate(
+        "Tab 2",
+        "Skewness measures the lack of symmetry in the data distribution.\n\n"
+        "Between -0.5 and 0.5: Symmetric distribution\n"
+        "From -1 to -0.5 or from 0.5 to 1: Distribution close to symmetric\n"
+        "Less than -1 or greater than 1: High skewness, significant deviation",
+    )
+
+
+def kurtosis_distribution_tooltip():
+    """Tooltip text for the tab 2 excess kurtosis statistic."""
+    return QCoreApplication.translate(
+        "Tab 2",
+        "Excess kurtosis measures how peaked or flattened a distribution is.\n\n"
+        "Between -2 and 2: Normal distribution\n"
+        "Greater than 2: Sharper peak and heavy tails (more outliers)\n"
+        "Less than -2: Flatter peak and light tails (fewer outliers)",
+    )
+
+
+def skewness_cell_background(value):
+    """Background color for a skewness cell, or None when not applicable."""
+    if value is None or not np.isfinite(value):
+        return None
+    skew = float(value)
+    if -0.5 <= skew <= 0.5:
+        return STATS_SKEWNESS_BG_SYMMETRIC
+    if (-1.0 <= skew < -0.5) or (0.5 < skew <= 1.0):
+        return STATS_SKEWNESS_BG_NEAR_SYMMETRIC
+    if skew < -1.0 or skew > 1.0:
+        return STATS_SKEWNESS_BG_HIGH
+    return None
+
+
+def kurtosis_cell_background(value):
+    """Background color for an excess kurtosis cell, or None when not applicable."""
+    if value is None or not np.isfinite(value):
+        return None
+    kurt = float(value)
+    if -2.0 <= kurt <= 2.0:
+        return STATS_KURTOSIS_BG_NORMAL
+    if kurt > 2.0 or kurt < -2.0:
+        return STATS_KURTOSIS_BG_NON_NORMAL
+    return None
+
+
+def apply_distribution_shape_cell_style(item, stat_key, value):
+    """Apply tooltip and background color to skewness / kurtosis table cells."""
+    if stat_key == 'asymmetry':
+        item.setToolTip(skewness_distribution_tooltip())
+        background = skewness_cell_background(value)
+    elif stat_key == 'kurtosis':
+        item.setToolTip(kurtosis_distribution_tooltip())
+        background = kurtosis_cell_background(value)
+    else:
+        item.setToolTip("")
+        background = None
+
+    if background is not None:
+        item.setBackground(QBrush(background))
+    else:
+        item.setBackground(QBrush())
 
 def cv_summary_header_labels(context_name):
     """Column headers for CV summary tables (tabs 2 and 5)."""
@@ -212,9 +291,12 @@ class MonitoringNetworksDialog(QDialog):
         self.results_sel_interp_colorbar = None
         self.results_interp_color_limits = None
         self._syncing_variogram = False
+        self._syncing_stats_table = False
         self.init_ui()
         self.current_grid_points = None  # Store grid generated in tab 3 (array of points)
         self.variogram_models_by_attribute = {}  # Dictionary to store models by attribute
+        self.stats_by_attribute = {}  # Per-parameter descriptive stats and plot inputs
+        self._layer_data_by_attribute = {}  # Per-parameter raw layer extraction cache
         self.variance_results = {}  # Variance reduction curves keyed by parameter
 
         initial_layer = self.input_data_layer.currentLayer()
@@ -354,36 +436,19 @@ class MonitoringNetworksDialog(QDialog):
         # Layout for the variogram tab
         variogram_tab_layout = QVBoxLayout()
 
-        # Attribute selector for tab 2 (options from tab 1 multi-selection)
-        attr_select_layout = QHBoxLayout()
-        attr_select_layout.addWidget(QLabel(
-            QCoreApplication.translate("Tab 2", "Parameter:")
-        ))
-        self.selected_attr_combo = QComboBox()
-        self.selected_attr_combo.addItem(
-            QCoreApplication.translate("Tab 2", "No parameter selected")
-        )
-        self.selected_attr_combo.setEnabled(False)
-        self.selected_attr_combo.currentIndexChanged.connect(
-            self._on_tab2_attribute_changed
-        )
-        attr_select_layout.addWidget(self.selected_attr_combo)
-        variogram_tab_layout.addLayout(attr_select_layout)
-
-        # Calculate geostatistics button
+        # Calculate geostatistics for all Tab-1 selected parameters
         self.calc_geostats_btn = QPushButton(
-            QCoreApplication.translate("Tab 2", "Calculate geostatistics")
+            QCoreApplication.translate("Tab 2", "Calculate geostatistics for all parameters")
         )
         self.calc_geostats_btn.clicked.connect(self.calculate_geostatistics)
-        variogram_tab_layout.addWidget(self.calc_geostats_btn) #, 1, 1
-
+        variogram_tab_layout.addWidget(self.calc_geostats_btn)
 
         # Create QScrollArea to allow scrolling
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         #scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        
+
         # Container widget for scrollable content
         scroll_widget = QWidget()
         layout = QVBoxLayout()
@@ -394,37 +459,81 @@ class MonitoringNetworksDialog(QDialog):
         stats_layout = QVBoxLayout()
 
         self.stats_table = QTableWidget()
-        table_headers = [QCoreApplication.translate(
-            "Tab 2", 'Transformation'
-        )] + stats_value_header_labels()
+        table_headers = [
+            QCoreApplication.translate("Tab 2", "Weight"),
+            QCoreApplication.translate("Tab 2", "Transformation"),
+        ] + stats_value_header_labels()
         self.stats_table.setColumnCount(len(table_headers))
-        self.stats_table.setRowCount(1)
+        self.stats_table.setRowCount(0)
         self.stats_table.setHorizontalHeaderLabels(table_headers)
-        self.stats_table.verticalHeader().setVisible(False)
+        weight_header = self.stats_table.horizontalHeaderItem(STATS_COL_WEIGHT)
+        if weight_header is not None:
+            weight_header.setToolTip(
+                QCoreApplication.translate(
+                    "Tab 2",
+                    "Relative importance when combining parameters on tab 4. "
+                    "Default: equal share (1/N) so weights sum to 1.",
+                )
+            )
+        transform_header = self.stats_table.horizontalHeaderItem(
+            STATS_TRANSFORM_COL
+        )
+        if transform_header is not None:
+            transform_header.setToolTip(
+                QCoreApplication.translate(
+                    "Tab 2",
+                    "Data transform for this parameter. Changing it recalculates "
+                    "statistics and variogram for this parameter only.",
+                )
+            )
+        asymmetry_header = self.stats_table.horizontalHeaderItem(
+            STATS_COL_ASYMMETRY
+        )
+        if asymmetry_header is not None:
+            asymmetry_header.setToolTip(skewness_distribution_tooltip())
+        kurtosis_header = self.stats_table.horizontalHeaderItem(
+            STATS_COL_KURTOSIS
+        )
+        if kurtosis_header is not None:
+            kurtosis_header.setToolTip(kurtosis_distribution_tooltip())
+        self.stats_table.verticalHeader().setVisible(True)
         self.stats_table.horizontalHeader().setStretchLastSection(True)
+        # Column widths come from content; horizontal scroll is allowed when needed.
         self.stats_table.resizeColumnsToContents()
-        self.stats_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.stats_table.setFixedHeight(80)
-
-        self.stats_transform_combo = QComboBox()
-        self.stats_transform_combo.addItems([
-            QCoreApplication.translate("Tab 2","None"), 
-            QCoreApplication.translate("Tab 2","Logarithmic")
-        ])
-        self.stats_transform_combo.currentIndexChanged.connect(
-            lambda _index: self.refresh_attribute_statistics(force_reextract=False)
+        self.stats_table.setEditTriggers(
+            QAbstractItemView.DoubleClicked
+            | QAbstractItemView.SelectedClicked
         )
-        self.stats_table.setCellWidget(
-            0, STATS_TRANSFORM_COL, self.stats_transform_combo
+        self.stats_table.itemChanged.connect(self._on_stats_table_weight_changed)
+        self._stats_table_height_filter = StatsTableHeightFilter(self)
+        self.stats_table.installEventFilter(self._stats_table_height_filter)
+        self._adjust_stats_table_height()
+
+        self.selected_attr_combo = QComboBox()
+        self.selected_attr_combo.addItem(
+            QCoreApplication.translate("Tab 2", "No parameter selected")
+        )
+        self.selected_attr_combo.setEnabled(False)
+        self.selected_attr_combo.currentIndexChanged.connect(
+            self._on_tab2_attribute_changed
         )
 
-        for col in range(STATS_VALUE_COL_OFFSET, self.stats_table.columnCount()):
-            self.stats_table.setItem(0, col, QTableWidgetItem(""))
         stats_layout.addWidget(self.stats_table)
 
-        # Informative label to select attributes
-        self.stats_info_label = QLabel(QCoreApplication.translate(
-            "Tab 2", "Select an attribute to view its statistics.")
+        attr_select_layout = QHBoxLayout()
+        attr_select_layout.addWidget(QLabel(
+            QCoreApplication.translate("Tab 2", "Show parameter geostatistics for:")
+        ))
+        attr_select_layout.addWidget(self.selected_attr_combo)
+        attr_select_layout.addStretch()
+        stats_layout.addLayout(attr_select_layout)
+
+        # Informative label for statistics / active parameter views
+        self.stats_info_label = QLabel(
+            QCoreApplication.translate(
+                "Tab 2",
+                "Select attributes on tab 1, then click Calculate geostatistics.",
+            )
         )
         self.stats_info_label.setStyleSheet("color: gray; font-style: italic;")
         stats_layout.addWidget(self.stats_info_label) 
@@ -454,16 +563,15 @@ class MonitoringNetworksDialog(QDialog):
         params_layout = QVBoxLayout()
         
         self.var_params_table = QTableWidget()
-        self.var_params_table.setColumnCount(8)
+        self.var_params_table.setColumnCount(7)
         self.var_params_table.setHorizontalHeaderLabels([
-            QCoreApplication.translate("Tab 2", "Parameter"), 
-            QCoreApplication.translate("Tab 2", "Weight"),  
-            QCoreApplication.translate("Tab 2", "Transform"), 
+            QCoreApplication.translate("Tab 2", "Parameter"),
+            QCoreApplication.translate("Tab 2", "Transform"),
             QCoreApplication.translate("Tab 2", "Model"),
             QCoreApplication.translate("Tab 2", "Nugget"),
-            QCoreApplication.translate("Tab 2", "Sill"), 
+            QCoreApplication.translate("Tab 2", "Sill"),
             QCoreApplication.translate("Tab 2", "Range"),
-            QCoreApplication.translate("Tab 2", "R²")
+            QCoreApplication.translate("Tab 2", "R²"),
         ])
         #self.var_params_table.setFixedHeight(126)
         # Connect table changes to update the variogram
@@ -472,19 +580,8 @@ class MonitoringNetworksDialog(QDialog):
         self.var_params_table.horizontalHeader().setStretchLastSection(True)
         params_layout.addWidget(self.var_params_table)
 
-        # Progress bar
-        progress_layout = QVBoxLayout()
-        self.var_progress_status_label = QLabel(QCoreApplication.translate("Tab 2", "State: Ready"))
-        self.var_progress_status_label.setStyleSheet("color: gray; font-style: italic;")
-        self.var_progress_status_label.setVisible(True)
-        progress_layout.addWidget(self.var_progress_status_label)
-
-        self.var_progress_bar = QProgressBar()
-        self.var_progress_bar.setVisible(True)
-        self.var_progress_bar.setValue(0)
-        progress_layout.addWidget(self.var_progress_bar)
-
-        params_layout.addLayout(progress_layout)
+        # Progress status (but not progress bar anymore!)
+        params_layout.addStretch()  # To keep layout spacing #Do we need this?
 
         params_group.setLayout(params_layout)
         layout.addWidget(params_group)
@@ -572,6 +669,17 @@ class MonitoringNetworksDialog(QDialog):
         # Add the scroll area to the main layout
         variogram_tab_layout.addWidget(scroll_area)
 
+        # Variogram auto-fit progress (status text rendered inside the bar via setFormat).
+        self.var_progress_bar = QProgressBar()
+        self.var_progress_bar.setRange(0, 100)
+        self.var_progress_bar.setValue(0)
+        self.var_progress_bar.setTextVisible(True)
+        self.var_progress_bar.setAlignment(Qt.AlignCenter)
+        self.var_progress_bar.setFormat(
+            QCoreApplication.translate("Tab 2", "State: Ready")
+        )
+        variogram_tab_layout.addWidget(self.var_progress_bar)
+
         # Assign the layout to the variogram tab
         self.tab_variogram.setLayout(variogram_tab_layout)
             
@@ -625,19 +733,46 @@ class MonitoringNetworksDialog(QDialog):
         self.estimated_points_label.setStyleSheet("color: gray; font-style: italic;")
         gen_grid_layout.addWidget(self.estimated_points_label, 1, 1)
         
-        # Buffer
-        gen_grid_layout.addWidget(QLabel(QCoreApplication.translate("Tab 3", "Buffer (map units):")), 2, 0)
+        # Buffer outside the concave hull, expressed as a multiple of node spacing.
+        gen_grid_layout.addWidget(QLabel(
+            QCoreApplication.translate("Tab 3", "Boundary buffer (x times node spacing):")
+        ), 2, 0)
         self.buffer_spin = QDoubleSpinBox()
-        self.buffer_spin.setRange(0, 10000)
-        self.buffer_spin.setValue(100)
-        self.buffer_spin.setDecimals(0)
+        self.buffer_spin.setRange(0.0, 5.0)
+        self.buffer_spin.setValue(1.0)
+        self.buffer_spin.setDecimals(1)
+        self.buffer_spin.setSingleStep(0.5)
+        self.buffer_spin.setToolTip(
+            QCoreApplication.translate(
+                "Tab 3",
+                "Expands the concave hull outward by this many times the node "
+                "spacing. Default 1.0 adds one spacing interval beyond the hull.",
+            )
+        )
         self.buffer_spin.valueChanged.connect(self.update_estimated_points)
         gen_grid_layout.addWidget(self.buffer_spin, 2, 1)
+
+        # Concave hull ALPHA (QGIS qgis:concavehull); 0 = concave , 1 = convex.
+        gen_grid_layout.addWidget(QLabel(
+            QCoreApplication.translate("Tab 3", "Boundary tightness (tight ↔ smooth)")
+        ), 3, 0)
+        self.alpha_spin = QDoubleSpinBox()
+        self.alpha_spin.setRange(0.1, 1.0)
+        self.alpha_spin.setValue(0.7)
+        self.alpha_spin.setDecimals(1)
+        self.alpha_spin.setSingleStep(0.1)
+        self.alpha_spin.setToolTip(
+            QCoreApplication.translate(
+                "Tab 3",
+                "Alpha parameter for the QGIS hull around the wells. 0 = concave , 1 = convex .",
+            )
+        )
+        gen_grid_layout.addWidget(self.alpha_spin, 3, 1)
         
         # Calculate grid button
         self.preview_grid_btn = QPushButton(QCoreApplication.translate("Tab 3", "Calculate grid"))
         self.preview_grid_btn.clicked.connect(self.preview_grid)
-        gen_grid_layout.addWidget(self.preview_grid_btn, 3, 1) #, 1, 1
+        gen_grid_layout.addWidget(self.preview_grid_btn, 4, 1) #, 1, 1
 
         gen_grid_group.setLayout(gen_grid_layout)
         layout.addWidget(gen_grid_group)
@@ -647,7 +782,12 @@ class MonitoringNetworksDialog(QDialog):
         load_grid_layout = QGridLayout()
 
         # Button to upload grid from file
-        load_grid_layout.addWidget(QLabel(QCoreApplication.translate("Tab 3", "The file needs to contain the next data columns: ID, X, Y, weight")))
+        load_grid_layout.addWidget(QLabel(
+            QCoreApplication.translate(
+                "Tab 3",
+                "Required columns: ID, X, Y. Optional column: weight.",
+            )
+        ))
         self.load_grid_btn = QPushButton(QCoreApplication.translate("Tab 3", "Select *.XLSX file"))
         self.load_grid_btn.clicked.connect(self.load_grid_as_layer)
         load_grid_layout.addWidget(self.load_grid_btn, 2, 1)
@@ -736,6 +876,23 @@ class MonitoringNetworksDialog(QDialog):
         self.mn_grid_weight_info_label.setWordWrap(True)
         mn_param_select_layout.addWidget(self.mn_grid_weight_info_label)
 
+        # Add Buttons to optimize and download prioritization
+        optimize_btn_row = QHBoxLayout()
+        self.mn_optimize_btn = QPushButton(
+            QCoreApplication.translate("Tab 4", "Optimize")
+        )
+        self.mn_optimize_btn.clicked.connect(self.optimize_monitoring_network)
+        optimize_btn_row.addWidget(self.mn_optimize_btn)
+        self.mn_download_prioritization_btn = QPushButton(
+            QCoreApplication.translate("Tab 4", "Download prioritization")
+        )
+        self.mn_download_prioritization_btn.clicked.connect(
+            self.download_prioritization
+        )
+        optimize_btn_row.addWidget(self.mn_download_prioritization_btn)
+        optimize_btn_row.addStretch()
+        mn_param_select_layout.addLayout(optimize_btn_row)
+
         mn_param_select_group.setLayout(mn_param_select_layout)
         priorization_tab_layout.addWidget(mn_param_select_group)
 
@@ -754,23 +911,7 @@ class MonitoringNetworksDialog(QDialog):
             QCoreApplication.translate("Tab 4", "Variance Reduction")
         )
         variance_layout = QVBoxLayout()
-
-        optimize_btn_row = QHBoxLayout()
-        self.mn_optimize_btn = QPushButton(
-            QCoreApplication.translate("Tab 4", "Optimize")
-        )
-        self.mn_optimize_btn.clicked.connect(self.optimize_monitoring_network)
-        optimize_btn_row.addWidget(self.mn_optimize_btn)
-        self.mn_download_prioritization_btn = QPushButton(
-            QCoreApplication.translate("Tab 4", "Download prioritization")
-        )
-        self.mn_download_prioritization_btn.clicked.connect(
-            self.download_prioritization
-        )
-        optimize_btn_row.addWidget(self.mn_download_prioritization_btn)
-        optimize_btn_row.addStretch()
-        variance_layout.addLayout(optimize_btn_row)
-
+        
         self.variance_info_label = QLabel(
             QCoreApplication.translate(
                 "Tab 4",
@@ -798,7 +939,7 @@ class MonitoringNetworksDialog(QDialog):
         self.mn_prioritization_order_table.setColumnCount(4)
         self.mn_prioritization_order_table.setHorizontalHeaderLabels([
             QCoreApplication.translate("Tab 4", "Rank"),
-            QCoreApplication.translate("Tab 4", "Well ID"),
+            QCoreApplication.translate("Tab 4", "ID"),
             QCoreApplication.translate("Tab 4", "Well weight"),
             QCoreApplication.translate("Tab 4", "Total variance (%)"),
         ])
@@ -825,6 +966,17 @@ class MonitoringNetworksDialog(QDialog):
         
         # Add the scroll area to the main layout
         priorization_tab_layout.addWidget(mn_scroll_area)
+
+        # Optimization progress stays outside the scroll area so it remains visible.
+        self.mn_progress_bar = QProgressBar()
+        self.mn_progress_bar.setRange(0, 100)
+        self.mn_progress_bar.setValue(0)
+        self.mn_progress_bar.setTextVisible(True)
+        self.mn_progress_bar.setAlignment(Qt.AlignCenter)
+        self.mn_progress_bar.setFormat(
+            QCoreApplication.translate("Tab 4", "State: Ready")
+        )
+        priorization_tab_layout.addWidget(self.mn_progress_bar)
 
         # Assign the layout to the prioritization tab
         self.tab_prioritization.setLayout(priorization_tab_layout)
@@ -1924,6 +2076,22 @@ class MonitoringNetworksDialog(QDialog):
 
         self.layer_fields_table.resizeColumnsToContents()
 
+    def _set_variogram_progress(self, percent=None, status_message=None):
+        """Update Tab 2 variogram progress value and in-bar status text."""
+        if not hasattr(self, 'var_progress_bar'):
+            return
+        if percent is not None:
+            self.var_progress_bar.setValue(max(0, min(100, int(percent))))
+        if status_message is not None:
+            self.var_progress_bar.setFormat(
+                QCoreApplication.translate("Tab 2", status_message)
+            )
+        QApplication.processEvents()
+
+    def _reset_variogram_progress(self):
+        """Reset Tab 2 variogram progress bar to idle state."""
+        self._set_variogram_progress(0, "State: Ready")
+
     def _clear_variogram_widget(self):
         """Resets the tab 2 variogram plot and parameters."""
         if not hasattr(self, 'variogram_widget'):
@@ -1935,12 +2103,7 @@ class MonitoringNetworksDialog(QDialog):
         finally:
             self._syncing_variogram = False
 
-        if hasattr(self, 'var_progress_bar'):
-            self.var_progress_bar.setValue(0)
-        if hasattr(self, 'var_progress_status_label'):
-            self.var_progress_status_label.setText(
-                QCoreApplication.translate("Tab 2", "State: Ready")
-            )
+        self._reset_variogram_progress()
 
     def on_layer_changed(self, layer):
         """Update the layer information and the numeric attributes."""
@@ -1950,9 +2113,12 @@ class MonitoringNetworksDialog(QDialog):
         self._cached_coordinates = None
         self._cached_point_ids = None
         self._cached_null_count = 0
+        self.stats_by_attribute.clear()
+        self._layer_data_by_attribute.clear()
         self.variogram_models_by_attribute.clear()
         self.variance_results = {}
         self._sync_var_params_table_from_store()
+        self.selected_data_parameters.clear()
         self.clear_stats_table()
         self._clear_variogram_widget()
         self._sync_attr_name_combo()
@@ -1961,7 +2127,6 @@ class MonitoringNetworksDialog(QDialog):
         self._clear_ok_interpolation_plots()
         self._update_mn_well_weight_info()
         self._update_mn_grid_weight_info()
-        self.selected_data_parameters.clear()
 
         if not layer:
             self.layer_info.clear()
@@ -2048,7 +2213,7 @@ class MonitoringNetworksDialog(QDialog):
                 self.mn_param_select_combo.addItem(param, param)
             if len(selected) >= 2:
                 combined_label = QCoreApplication.translate(
-                    "Tab 4", "Parameters combined"
+                    "Tab 4", "Parameters combined (Weighted)"
                 )
                 self.mn_param_select_combo.addItem(
                     combined_label, MN_COMBINED_PARAMETERS_KEY
@@ -2331,7 +2496,12 @@ class MonitoringNetworksDialog(QDialog):
                     nugget=float(state.get('nugget', 0)),
                     sill=float(state.get('sill', 0)),
                     range_val=float(state.get('range', 0)),
-                    weight=float(state.get('weight', 1.0)),
+                    weight=float(
+                        state.get(
+                            'weight',
+                            self._equal_parameter_weight(len(param_names)),
+                        )
+                    ),
                 )
             )
 
@@ -2388,6 +2558,51 @@ class MonitoringNetworksDialog(QDialog):
 
         return optimization_input, None
 
+    def _reset_mn_progress(self, status_text=None):
+        """Reset tab 4 optimization progress bar and in-bar status text."""
+        if hasattr(self, 'mn_progress_bar'):
+            self.mn_progress_bar.setValue(0)
+            if status_text is None:
+                status_text = QCoreApplication.translate("Tab 4", "State: Ready")
+            self.mn_progress_bar.setFormat(status_text)
+
+    def _update_mn_progress(self, percent, status_text=None):
+        """Update tab 4 optimization progress and in-bar status text."""
+        if hasattr(self, 'mn_progress_bar'):
+            self.mn_progress_bar.setValue(max(0, min(100, int(percent))))
+            if status_text is not None:
+                self.mn_progress_bar.setFormat(status_text)
+        QApplication.processEvents()
+
+    def _optimization_progress_callback(self, fraction, message="", **kwargs):
+        """Translate optimization phase messages and update the progress bar."""
+        if message == "preparing":
+            status = QCoreApplication.translate(
+                "Tab 4", "State: Preparing optimization..."
+            )
+        elif message == "selecting":
+            status = QCoreApplication.translate(
+                "Tab 4", "State: Selecting wells ({current}/{total})..."
+            ).format(
+                current=kwargs.get("current", 0),
+                total=kwargs.get("total", 0),
+            )
+        elif message == "evaluating":
+            status = QCoreApplication.translate(
+                "Tab 4", "State: Evaluating variance ({current}/{total})..."
+            ).format(
+                current=kwargs.get("current", 0),
+                total=kwargs.get("total", 0),
+            )
+        elif message == "complete":
+            status = QCoreApplication.translate("Tab 4", "State: Completed")
+        elif message == "error":
+            status = QCoreApplication.translate("Tab 4", "State: Error")
+        else:
+            status = message or None
+
+        self._update_mn_progress(int(round(fraction * 100)), status)
+
     def _clear_variance_reduction_plot(self):
         """Resets the variance reduction plot and info label."""
         if not hasattr(self, 'variance_ax'):
@@ -2419,6 +2634,7 @@ class MonitoringNetworksDialog(QDialog):
                 "color: gray; font-style: italic;"
             )
 
+        self._reset_mn_progress()
         self._clear_prioritization_order_table()
 
     def _clear_prioritization_order_table(self):
@@ -2562,7 +2778,10 @@ class MonitoringNetworksDialog(QDialog):
                 point_ids = param_data.get('point_ids')
 
         if selection_order is not None and point_ids is not None:
+            max_well_labels = min(10, len(selection_order))
             for step, well_idx in enumerate(selection_order, start=1):
+                if step > max_well_labels:
+                    break
                 if step >= len(n_points) or step >= total_variance.size:
                     break
                 ax.annotate(
@@ -2918,8 +3137,12 @@ class MonitoringNetworksDialog(QDialog):
             return
 
         self.mn_optimize_btn.setEnabled(False)
+        self._reset_mn_progress(
+            QCoreApplication.translate("Tab 4", "State: Starting optimization...")
+        )
         QApplication.processEvents()
 
+        results = None
         try:
             if self._is_combined_mn_parameter(attr_name):
                 param_names = self._selected_analysis_parameters()
@@ -2933,6 +3156,7 @@ class MonitoringNetworksDialog(QDialog):
                             "for combined optimization.",
                         ),
                     )
+                    self._reset_mn_progress()
                     return
                 display_name = self._mn_combined_parameters_label()
             else:
@@ -2952,10 +3176,15 @@ class MonitoringNetworksDialog(QDialog):
                     QCoreApplication.translate("Tab 4", "Optimize"),
                     input_error,
                 )
+                self._reset_mn_progress()
                 return
 
-            results = compute_variance_reduction_curve(optimization_input)
+            results = compute_variance_reduction_curve(
+                optimization_input,
+                progress_callback=self._optimization_progress_callback,
+            )
         except Exception as exc:
+            self._optimization_progress_callback(0.0, "error")
             QMessageBox.warning(
                 self,
                 QCoreApplication.translate("Tab 4", "Optimize"),
@@ -2969,6 +3198,7 @@ class MonitoringNetworksDialog(QDialog):
             self.mn_optimize_btn.setEnabled(True)
 
         if results is None:
+            self._optimization_progress_callback(0.0, "error")
             QMessageBox.warning(
                 self,
                 QCoreApplication.translate("Tab 4", "Optimize"),
@@ -3028,20 +3258,702 @@ class MonitoringNetworksDialog(QDialog):
         self._refresh_ok_interpolation_plot()
 
     def _on_tab2_attribute_changed(self, _index):
-        """Restore variogram view when switching the active parameter on tab 2."""
+        """Switch histogram, map, variogram and CV to the selected parameter."""
         if not self.selected_attr_combo.isEnabled():
             return
         attr = self._current_analysis_attribute()
-        if not attr or not self._get_variogram_state(attr):
+        if not attr:
+            self._clear_stats_plots()
+            self._clear_cross_validation()
             return
-        widget_data = getattr(self.variogram_widget, 'current_data', None)
-        if widget_data and widget_data.get('attribute') == attr:
-            self._apply_store_to_widget(attr)
-            self.variogram_widget.update_plot(emit_signal=False)
+        self._sync_var_params_table_from_store()
+        self._refresh_tab2_parameter_views(attr)
 
     def calculate_geostatistics(self):
-        """Calculate geostatistics"""
-        self.refresh_attribute_statistics(force_reextract=True)
+        """Calculate descriptive statistics for all Tab-1 selected parameters."""
+        self._calculate_all_attribute_statistics(force_reextract=True)
+
+    def _get_attribute_log_transform(self, attr_name):
+        """Per-parameter log transform stored in variogram state."""
+        state = self._get_variogram_state(attr_name)
+        if state is not None:
+            return bool(state.get('log_transform', False))
+        return False
+
+    def _create_stats_transform_combo(self, attr_name, log_transform=False):
+        """Build a per-row transform combo for stats_table."""
+        combo = WheelIgnoringComboBox()
+        combo.addItems([
+            QCoreApplication.translate("Tab 2", "None"),
+            QCoreApplication.translate("Tab 2", "Logarithmic"),
+        ])
+        combo.setToolTip(
+            QCoreApplication.translate(
+                "Tab 2",
+                "Data transform for this parameter. Changing it recalculates "
+                "statistics and variogram for this parameter only.",
+            )
+        )
+        combo.blockSignals(True)
+        combo.setCurrentIndex(1 if log_transform else 0)
+        combo.blockSignals(False)
+        combo.currentIndexChanged.connect(
+            lambda _index, a=attr_name: self._on_stats_table_transform_changed(a)
+        )
+        return combo
+
+    def _set_stats_table_transform_cell(self, row, attr_name):
+        """Install or refresh the transform combo on one stats table row."""
+        log_transform = self._get_attribute_log_transform(attr_name)
+        existing = self.stats_table.cellWidget(row, STATS_TRANSFORM_COL)
+        if isinstance(existing, QComboBox):
+            self._syncing_stats_table = True
+            existing.blockSignals(True)
+            try:
+                existing.setCurrentIndex(1 if log_transform else 0)
+            finally:
+                existing.blockSignals(False)
+                self._syncing_stats_table = False
+            return
+        if existing is not None:
+            self.stats_table.removeCellWidget(row, STATS_TRANSFORM_COL)
+        combo = self._create_stats_transform_combo(attr_name, log_transform)
+        self.stats_table.setCellWidget(row, STATS_TRANSFORM_COL, combo)
+
+    def _sync_stats_transform_combo(self, attr_name, log_transform):
+        """Set transform combo index without triggering recalculation."""
+        row = self._stats_table_row_for_attribute(attr_name)
+        if row < 0:
+            return
+        combo = self.stats_table.cellWidget(row, STATS_TRANSFORM_COL)
+        if combo is None:
+            return
+        self._syncing_stats_table = True
+        combo.blockSignals(True)
+        try:
+            combo.setCurrentIndex(1 if log_transform else 0)
+        finally:
+            combo.blockSignals(False)
+            self._syncing_stats_table = False
+
+    def _recalculate_single_attribute_statistics(self, attr_name):
+        """
+        Recompute stats, variogram and CV for one parameter.
+
+        Used when the per-row transform combo changes.
+        """
+        ok, error = self._compute_and_store_attribute_statistics(
+            attr_name, force_reextract=False
+        )
+        if ok:
+            row = self._stats_table_row_for_attribute(attr_name)
+            if row >= 0:
+                self._syncing_stats_table = True
+                self.stats_table.blockSignals(True)
+                try:
+                    self._populate_stats_table_row(row, attr_name)
+                    self._adjust_stats_table_height()
+                finally:
+                    self.stats_table.blockSignals(False)
+                    self._syncing_stats_table = False
+            if attr_name == self._current_analysis_attribute():
+                self._refresh_tab2_parameter_views(attr_name)
+        return ok, error
+
+    def _on_stats_table_transform_changed(self, attr_name):
+        """Recalculate one parameter when its row transform combo changes."""
+        if self._syncing_stats_table:
+            return
+
+        layer = self.input_data_layer.currentLayer()
+        if not layer:
+            return
+
+        parameters = self._selected_analysis_parameters()
+        if attr_name not in parameters:
+            return
+
+        row = self._stats_table_row_for_attribute(attr_name)
+        if row < 0:
+            return
+
+        combo = self.stats_table.cellWidget(row, STATS_TRANSFORM_COL)
+        if combo is None:
+            return
+
+        log_transform = combo.currentIndex() == 1
+        prev_transform = self._get_attribute_log_transform(attr_name)
+        if log_transform == prev_transform:
+            return
+
+        state = dict(self._get_variogram_state(attr_name) or {})
+        state['log_transform'] = log_transform
+        if 'weight' not in state:
+            state['weight'] = self._get_attribute_weight(attr_name)
+        self._set_variogram_state(attr_name, state)
+
+        ok, error = self._recalculate_single_attribute_statistics(attr_name)
+        if not ok:
+            state['log_transform'] = prev_transform
+            self._set_variogram_state(attr_name, state)
+            self._sync_stats_transform_combo(attr_name, prev_transform)
+            self.stats_info_label.setText(
+                QCoreApplication.translate(
+                    "Tab 2", "«{param}»: {error}"
+                ).format(
+                    param=attr_name,
+                    error=error or QCoreApplication.translate(
+                        "Tab 2", "Recalculation failed."
+                    ),
+                )
+            )
+            self.stats_info_label.setStyleSheet(
+                "color: red; font-style: italic;"
+            )
+            return
+
+        stored = self.stats_by_attribute.get(attr_name)
+        if stored and attr_name == self._current_analysis_attribute():
+            self._set_stats_view_info_label(attr_name, stored)
+        elif stored:
+            self.stats_info_label.setText(
+                QCoreApplication.translate(
+                    "Tab 2",
+                    "Statistics recalculated for «{param}».",
+                ).format(param=attr_name)
+            )
+            self.stats_info_label.setStyleSheet(
+                "color: gray; font-style: italic;"
+            )
+
+    def _equal_parameter_weight(self, n_parameters=None):
+        """Equal share so N parameter defaults sum to 1.0."""
+        if n_parameters is None:
+            n_parameters = len(self._selected_analysis_parameters())
+        if n_parameters <= 0:
+            return 1.0
+        return 1.0 / n_parameters
+
+    def _apply_equal_parameter_weights(self, parameters=None):
+        """Set weight = 1/N for every selected parameter (overwrites existing)."""
+        if parameters is None:
+            parameters = self._selected_analysis_parameters()
+        n = len(parameters)
+        if n == 0:
+            return
+        share = self._equal_parameter_weight(n)
+        for attr_name in parameters:
+            state = dict(self._get_variogram_state(attr_name) or {})
+            state['weight'] = share
+            if 'log_transform' not in state:
+                state['log_transform'] = False
+            self._set_variogram_state(attr_name, state)
+
+    def _format_parameter_weight(self, weight):
+        """Format a parameter weight for display in stats_table."""
+        return f"{float(weight):.2f}"
+
+    def _get_attribute_weight(self, attr_name):
+        """Per-parameter combination weight stored in variogram state (tab 4)."""
+        state = self._get_variogram_state(attr_name)
+        if state is not None and 'weight' in state:
+            return float(state['weight'])
+        return self._equal_parameter_weight()
+
+    def _set_stats_table_weight_cell(self, row, attr_name):
+        """Write the editable weight cell for one stats table row."""
+        read_only = Qt.ItemIsSelectable | Qt.ItemIsEnabled
+        editable = read_only | Qt.ItemIsEditable
+        weight_text = self._format_parameter_weight(
+            self._get_attribute_weight(attr_name)
+        )
+        item = self.stats_table.item(row, STATS_COL_WEIGHT)
+        if item is None:
+            item = QTableWidgetItem(weight_text)
+            self.stats_table.setItem(row, STATS_COL_WEIGHT, item)
+        else:
+            item.setText(weight_text)
+        item.setFlags(editable)
+
+    def _revert_stats_table_weight_cell(self, row, attr_name):
+        """Restore the weight cell from stored state after invalid input."""
+        self._syncing_stats_table = True
+        try:
+            self._set_stats_table_weight_cell(row, attr_name)
+        finally:
+            self._syncing_stats_table = False
+
+    def _on_stats_table_weight_changed(self, item):
+        """
+        Persist weight when the inline editor commits (Enter, Tab, or focus lost).
+
+        itemChanged does not fire on every keystroke while typing.
+        """
+        if self._syncing_stats_table or item.column() != STATS_COL_WEIGHT:
+            return
+
+        row = item.row()
+        parameters = self._selected_analysis_parameters()
+        if row < 0 or row >= len(parameters):
+            return
+
+        attr_name = parameters[row]
+        try:
+            weight = float(item.text())
+        except (ValueError, TypeError):
+            self._revert_stats_table_weight_cell(row, attr_name)
+            return
+
+        if weight <= 0:
+            self._revert_stats_table_weight_cell(row, attr_name)
+            return
+
+        state = dict(self._get_variogram_state(attr_name) or {})
+        state['weight'] = weight
+        self._set_variogram_state(attr_name, state)
+
+        self._syncing_stats_table = True
+        try:
+            item.setText(self._format_parameter_weight(weight))
+        finally:
+            self._syncing_stats_table = False
+
+    def _stats_table_row_for_attribute(self, attr_name):
+        parameters = self._selected_analysis_parameters()
+        try:
+            return parameters.index(attr_name)
+        except ValueError:
+            return -1
+
+    def _stats_table_estimated_viewport_width(self, row_count):
+        """Estimate stats_table viewport width before the first layout pass."""
+        table = self.stats_table
+        width = table.viewport().width()
+        if width > 0:
+            return width
+
+        width = table.width()
+        parent = table.parentWidget()
+        while width <= 0 and parent is not None:
+            width = parent.width()
+            parent = parent.parentWidget()
+        if width <= 0:
+            return 0
+
+        width -= 2 * table.frameWidth()
+        if table.verticalHeader().isVisible():
+            width -= table.verticalHeader().width()
+        if row_count > STATS_TABLE_MAX_VISIBLE_ROWS:
+            width -= table.verticalScrollBar().sizeHint().width()
+        return max(width, 0)
+
+    def _stats_table_horizontal_scrollbar_height(self, row_count):
+        """
+        Extra height for the stats_table horizontal scrollbar when column content
+        is wider than the viewport (prevents the last row from being covered).
+        """
+        table = self.stats_table
+        if table.horizontalScrollBarPolicy() == Qt.ScrollBarAlwaysOff:
+            return 0
+
+        content_width = table.horizontalHeader().length()
+        viewport_width = table.viewport().width()
+        if viewport_width <= 0:
+            viewport_width = self._stats_table_estimated_viewport_width(row_count)
+
+        if viewport_width <= 0:
+            # The table has no size yet; recalculate after layout.
+            QTimer.singleShot(0, self._adjust_stats_table_height)
+            return 0
+
+        if content_width > viewport_width:
+            return table.horizontalScrollBar().sizeHint().height()
+        return 0
+
+    def _adjust_stats_table_height(self):
+        """Set stats_table height to fit visible rows and reserve scrollbar space."""
+        if getattr(self, '_adjusting_stats_table_height', False):
+            return
+        if not hasattr(self, 'stats_table'):
+            return
+
+        self._adjusting_stats_table_height = True
+        try:
+            table = self.stats_table
+            table.resizeRowsToContents()
+
+            header_height = (
+                0
+                if table.horizontalHeader().isHidden()
+                else table.horizontalHeader().height()
+            )
+            frame = table.frameWidth() * 2
+            row_count = table.rowCount()
+
+            if row_count == 0:
+                height = header_height + frame + 4
+                table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            else:
+                visible_rows = min(row_count, STATS_TABLE_MAX_VISIBLE_ROWS)
+                rows_height = sum(
+                    table.rowHeight(row) for row in range(visible_rows)
+                )
+                height = header_height + rows_height + frame
+                if row_count <= STATS_TABLE_MAX_VISIBLE_ROWS:
+                    table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                else:
+                    table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+                height += self._stats_table_horizontal_scrollbar_height(row_count)
+
+            table.setMinimumHeight(height)
+            table.setMaximumHeight(height)
+        finally:
+            self._adjusting_stats_table_height = False
+
+    def _extract_layer_data_for_attribute(self, attr_name, force_reextract=False):
+        """Extract or return cached raw layer data for one parameter."""
+        layer = self.input_data_layer.currentLayer()
+        if not layer or not attr_name:
+            return None
+
+        cached = self._layer_data_by_attribute.get(attr_name)
+        if (
+            not force_reextract
+            and cached is not None
+            and cached.get('layer') is layer
+        ):
+            return cached
+
+        point_ids, coordinates, raw_values, null_count, _well_weights = (
+            extract_point_records_from_layer(layer, attr_name)
+        )
+        if (
+            point_ids is None
+            or coordinates is None
+            or raw_values is None
+            or len(raw_values) == 0
+        ):
+            return {
+                'error': QCoreApplication.translate(
+                    "Tab 2", "No valid data for «{param}»."
+                ).format(param=attr_name),
+            }
+
+        cached = {
+            'layer': layer,
+            'point_ids': point_ids,
+            'coordinates': coordinates,
+            'raw_values': raw_values,
+            'null_count': null_count,
+        }
+        self._layer_data_by_attribute[attr_name] = cached
+        return cached
+
+    def _compute_and_store_attribute_statistics(
+        self, attr_name, force_reextract=False
+    ):
+        """Compute descriptive stats and variogram state for one parameter."""
+        layer = self.input_data_layer.currentLayer()
+        if not layer:
+            return False, QCoreApplication.translate("Tab 2", "No layer selected.")
+
+        layer_data = self._extract_layer_data_for_attribute(
+            attr_name, force_reextract=force_reextract
+        )
+        if not layer_data:
+            return False, QCoreApplication.translate(
+                "Tab 2", "No valid data for «{param}»."
+            ).format(param=attr_name)
+        if layer_data.get('error'):
+            return False, layer_data['error']
+
+        raw_values = layer_data['raw_values']
+        coordinates = layer_data['coordinates']
+        point_ids = layer_data['point_ids']
+        null_count = layer_data.get('null_count', 0)
+
+        if (
+            raw_values is None
+            or coordinates is None
+            or point_ids is None
+            or len(raw_values) == 0
+        ):
+            return False, QCoreApplication.translate(
+                "Tab 2", "No valid data for «{param}»."
+            ).format(param=attr_name)
+
+        log_transform = self._get_attribute_log_transform(attr_name)
+        transform = 'log' if log_transform else 'none'
+        coordinates, transformed, excluded_non_positive, error = (
+            align_coordinates_with_transform(coordinates, raw_values, transform)
+        )
+        if error:
+            return False, error
+
+        stats_dict = compute_descriptive_stats(transformed)
+        if stats_dict is None:
+            return False, QCoreApplication.translate(
+                "Tab 2",
+                "No valid data after applying the transformation for «{param}».",
+            ).format(param=attr_name)
+
+        aligned_point_ids = align_point_ids_with_transform(
+            point_ids, raw_values, transform
+        )
+
+        self.stats_by_attribute[attr_name] = {
+            'stats': stats_dict,
+            'coordinates': coordinates,
+            'values': transformed,
+            'point_ids': aligned_point_ids,
+            'null_count': null_count,
+            'excluded_non_positive': excluded_non_positive,
+            'transform': transform,
+            'log_transform': log_transform,
+        }
+
+        existing_state = self._get_variogram_state(attr_name) or {}
+        synced_state = dict(existing_state)
+        synced_state['log_transform'] = log_transform
+        if 'weight' not in synced_state:
+            synced_state['weight'] = self._equal_parameter_weight()
+        self._set_variogram_state(attr_name, synced_state)
+
+        self._update_variogram_from_statistics(
+            coordinates,
+            transformed,
+            attr_name,
+            log_transform,
+            force_reextract,
+        )
+        self._refresh_tab2_cross_validation(attr_name)
+        return True, None
+
+    def _calculate_all_attribute_statistics(self, force_reextract=False):
+        """Calculate statistics for every Tab-1 selected parameter."""
+        layer = self.input_data_layer.currentLayer()
+        parameters = self._selected_analysis_parameters()
+
+        if not layer or not parameters:
+            self.clear_stats_table()
+            return
+
+        self._sync_stats_table_structure()
+
+        success_count = 0
+        error_messages = []
+        for attr_name in parameters:
+            ok, error = self._compute_and_store_attribute_statistics(
+                attr_name, force_reextract=force_reextract
+            )
+            if ok:
+                success_count += 1
+            elif error:
+                error_messages.append(
+                    QCoreApplication.translate(
+                        "Tab 2", "«{param}»: {error}"
+                    ).format(param=attr_name, error=error)
+                )
+
+        self._populate_stats_table_all()
+        self._sync_var_params_table_from_store()
+
+        if success_count:
+            self.stats_info_label.setText(
+                QCoreApplication.translate(
+                    "Tab 2",
+                    "Statistics calculated for {n} parameter(s). "
+                    "Use Parameter below to inspect plots and variograms.",
+                ).format(n=success_count)
+            )
+            self.stats_info_label.setStyleSheet(
+                "color: gray; font-style: italic;"
+            )
+        elif error_messages:
+            self.stats_info_label.setText(" · ".join(error_messages))
+            self.stats_info_label.setStyleSheet(
+                "color: red; font-style: italic;"
+            )
+
+        active_attr = self._current_analysis_attribute()
+        if active_attr and active_attr in self.stats_by_attribute:
+            self._refresh_tab2_parameter_views(active_attr)
+        elif success_count:
+            self._refresh_tab2_parameter_views(parameters[0])
+
+    def _set_stats_view_info_label(self, attr_name, stored):
+        """Info label for the active parameter's plots and variogram views."""
+        info_parts = [
+            QCoreApplication.translate(
+                "Tab 2", "Viewing «{param}»"
+            ).format(param=attr_name)
+        ]
+        null_count = stored.get('null_count', 0)
+        if null_count > 0:
+            info_parts.append(
+                QCoreApplication.translate(
+                    "Tab 2", "{count} null value(s) omitted"
+                ).format(count=null_count)
+            )
+        transform = stored.get('transform', 'none')
+        excluded = stored.get('excluded_non_positive', 0)
+        if transform == 'log' and excluded > 0:
+            info_parts.append(
+                QCoreApplication.translate(
+                    "Tab 2", "{count} value(s) ≤ 0 omitted for log"
+                ).format(count=excluded)
+            )
+        if transform == 'log':
+            info_parts.append(
+                QCoreApplication.translate("Tab 2", "(Log transformation)")
+            )
+        self.stats_info_label.setText(" · ".join(info_parts))
+        self.stats_info_label.setStyleSheet("color: gray; font-style: italic;")
+
+    def _refresh_tab2_parameter_views(self, attr_name):
+        """Refresh plots, variogram and CV for one parameter without recomputing stats."""
+        if not attr_name:
+            self._clear_stats_plots()
+            self._clear_cross_validation()
+            return
+
+        stored = self.stats_by_attribute.get(attr_name)
+        if not stored:
+            self._clear_stats_plots()
+            self._clear_cross_validation()
+            return
+
+        self._update_stats_plots(
+            stored['coordinates'], stored['values'], attr_name
+        )
+        log_transform = stored.get('log_transform', False)
+        self._update_variogram_from_statistics(
+            stored['coordinates'],
+            stored['values'],
+            attr_name,
+            log_transform,
+            force_reextract=False,
+        )
+        self._refresh_tab2_cross_validation(attr_name)
+        self._set_stats_view_info_label(attr_name, stored)
+        self._sync_var_params_table_from_store()
+
+    def _sync_stats_table_structure(self):
+        """Resize stats table rows when Tab-1 parameter selection changes."""
+        parameters = self._selected_analysis_parameters()
+        self._sync_attr_name_combo()
+
+        if not parameters:
+            self.stats_table.setRowCount(0)
+            self._adjust_stats_table_height()
+            self.stats_by_attribute.clear()
+            self._layer_data_by_attribute.clear()
+            self.stats_info_label.setText(
+                QCoreApplication.translate(
+                    "Tab 2",
+                    "Select attributes on tab 1, then click Calculate geostatistics.",
+                )
+            )
+            self.stats_info_label.setStyleSheet(
+                "color: gray; font-style: italic;"
+            )
+            return
+
+        self.stats_by_attribute = {
+            name: data
+            for name, data in self.stats_by_attribute.items()
+            if name in parameters
+        }
+        self._layer_data_by_attribute = {
+            name: data
+            for name, data in self._layer_data_by_attribute.items()
+            if name in parameters
+        }
+
+        self._apply_equal_parameter_weights(parameters)
+
+        self.stats_table.setRowCount(len(parameters))
+        self.stats_table.setVerticalHeaderLabels(parameters)
+        self.stats_table.verticalHeader().setVisible(True)
+
+        read_only = Qt.ItemIsSelectable | Qt.ItemIsEnabled
+        for row in range(len(parameters)):
+            attr_name = parameters[row]
+            self._set_stats_table_weight_cell(row, attr_name)
+            self._set_stats_table_transform_cell(row, attr_name)
+            for col in range(
+                STATS_VALUE_COL_OFFSET, self.stats_table.columnCount()
+            ):
+                item = self.stats_table.item(row, col)
+                if item is None:
+                    item = QTableWidgetItem("—")
+                    self.stats_table.setItem(row, col, item)
+                else:
+                    item.setText("—")
+                item.setFlags(read_only)
+                item.setToolTip("")
+                item.setBackground(QBrush())
+
+        self._populate_stats_table_all()
+
+    def _populate_stats_table_row(self, row, attr_name):
+        """Fill one stats table row from stored statistics."""
+        read_only = Qt.ItemIsSelectable | Qt.ItemIsEnabled
+
+        self._set_stats_table_weight_cell(row, attr_name)
+        self._set_stats_table_transform_cell(row, attr_name)
+
+        stored = self.stats_by_attribute.get(attr_name)
+
+        if stored and stored.get('stats'):
+            stats_dict = stored['stats']
+            for col, key in enumerate(STAT_KEYS):
+                table_col = col + STATS_VALUE_COL_OFFSET
+                value = stats_dict[key]
+                if key == 'count':
+                    text = str(int(value))
+                elif np.isnan(value):
+                    text = "—"
+                else:
+                    text = f"{value:.3f}"
+                item = self.stats_table.item(row, table_col)
+                if item is None:
+                    item = QTableWidgetItem(text)
+                    self.stats_table.setItem(row, table_col, item)
+                else:
+                    item.setText(text)
+                item.setFlags(read_only)
+                apply_distribution_shape_cell_style(item, key, value)
+        else:
+            for col in range(
+                STATS_VALUE_COL_OFFSET, self.stats_table.columnCount()
+            ):
+                item = self.stats_table.item(row, col)
+                if item is None:
+                    item = QTableWidgetItem("—")
+                    self.stats_table.setItem(row, col, item)
+                else:
+                    item.setText("—")
+                item.setFlags(read_only)
+                item.setToolTip("")
+                item.setBackground(QBrush())
+
+    def _populate_stats_table_all(self):
+        """Fill every stats table row from stats_by_attribute."""
+        parameters = self._selected_analysis_parameters()
+        if not parameters:
+            return
+        self._syncing_stats_table = True
+        self.stats_table.blockSignals(True)
+        try:
+            for row, attr_name in enumerate(parameters):
+                self._populate_stats_table_row(row, attr_name)
+            self.stats_table.resizeColumnsToContents()
+        finally:
+            self.stats_table.blockSignals(False)
+            self._syncing_stats_table = False
+        self._adjust_stats_table_height()
 
     def _variogram_data_fingerprint(self, attr_name, log_transform, values):
         values = np.asarray(values, dtype=float)
@@ -3069,12 +3981,15 @@ class MonitoringNetworksDialog(QDialog):
         if self._syncing_variogram:
             return
 
-        param_item = self.var_params_table.item(row, VAR_COL_PARAM)
+        attribute = self._current_analysis_attribute()
         combo = self.var_params_table.cellWidget(row, VAR_COL_MODEL)
-        if not param_item or combo is None:
+        if not attribute or combo is None:
             return
 
-        attribute = param_item.text()
+        param_item = self.var_params_table.item(row, VAR_COL_PARAM)
+        if not param_item or param_item.text() != attribute:
+            return
+
         model_type = combo.currentText()
         state = dict(self._get_variogram_state(attribute) or {})
         state['model_type'] = model_type
@@ -3096,29 +4011,40 @@ class MonitoringNetworksDialog(QDialog):
         """
         Returns coordinates, transformed values and point IDs for tab 2 analysis.
 
-        Reuses cached layer extraction and applies the current transform choice.
+        Prefers stored statistics; otherwise applies the active parameter transform.
         """
-        if (
-            self._cached_coordinates is None
-            or self._cached_raw_values is None
-            or self._cached_point_ids is None
-        ):
+        attr_name = self._current_analysis_attribute()
+        if not attr_name:
+            return None, None, None
+
+        stored = self.stats_by_attribute.get(attr_name)
+        if stored is not None:
+            return (
+                stored['coordinates'],
+                stored['values'],
+                stored['point_ids'],
+            )
+
+        layer_data = self._layer_data_by_attribute.get(attr_name)
+        if layer_data is None:
+            layer_data = self._extract_layer_data_for_attribute(attr_name)
+        if not layer_data or layer_data.get('error'):
             return None, None, None
 
         transform = (
-            'log' if self.stats_transform_combo.currentIndex() == 1 else 'none'
+            'log' if self._get_attribute_log_transform(attr_name) else 'none'
         )
         coordinates, values, _, error = align_coordinates_with_transform(
-            self._cached_coordinates,
-            self._cached_raw_values,
+            layer_data['coordinates'],
+            layer_data['raw_values'],
             transform,
         )
         if error or coordinates is None:
             return None, None, None
 
         point_ids = align_point_ids_with_transform(
-            self._cached_point_ids,
-            self._cached_raw_values,
+            layer_data['point_ids'],
+            layer_data['raw_values'],
             transform,
         )
         return coordinates, values, point_ids
@@ -3163,7 +4089,6 @@ class MonitoringNetworksDialog(QDialog):
             item.setFlags(flags)
 
         set_cell(VAR_COL_PARAM, attr_name)
-        set_cell(VAR_COL_WEIGHT, f"{state.get('weight', 1.0):.2f}", editable)
         set_cell(
             VAR_COL_TRANSFORM,
             self._transform_display_text(state.get('log_transform', False)),
@@ -3176,23 +4101,26 @@ class MonitoringNetworksDialog(QDialog):
         self.var_params_table.setCellWidget(row, VAR_COL_MODEL, model_combo)
         set_cell(VAR_COL_NUGGET, f"{state.get('nugget', 0):.3f}", editable)
         set_cell(VAR_COL_SILL, f"{state.get('sill', 0):.3f}", editable)
-        set_cell(VAR_COL_RANGE, f"{state.get('range', 0):.2f}", editable)
+        set_cell(VAR_COL_RANGE, f"{state.get('range', 0):.3f}", editable)
         set_cell(VAR_COL_R2, f"{state.get('r2', 0):.3f}")
 
     def _sync_var_params_table_from_store(self, attributes=None):
-        """Refresh var_params_table from variogram_models_by_attribute."""
+        """Refresh var_params_table for the active tab-2 parameter only."""
         if not hasattr(self, 'var_params_table'):
             return
-        if attributes is None:
-            attributes = list(self.variogram_models_by_attribute.keys())
+        del attributes  # kept for call-site compatibility; table is active-param only
+
+        attr_name = self._current_analysis_attribute()
+        state = self._get_variogram_state(attr_name) if attr_name else None
+
         self._syncing_variogram = True
         self.var_params_table.blockSignals(True)
         try:
-            self.var_params_table.setRowCount(len(attributes))
-            for row, attr_name in enumerate(attributes):
-                self._write_var_params_table_row(
-                    row, attr_name, self._get_variogram_state(attr_name)
-                )
+            if not attr_name or not state:
+                self.var_params_table.setRowCount(0)
+            else:
+                self.var_params_table.setRowCount(1)
+                self._write_var_params_table_row(0, attr_name, state)
             self.var_params_table.resizeColumnsToContents()
         finally:
             self.var_params_table.blockSignals(False)
@@ -3206,7 +4134,7 @@ class MonitoringNetworksDialog(QDialog):
         if not attr:
             return
 
-        log_transform = self.stats_transform_combo.currentIndex() == 1
+        log_transform = self._get_attribute_log_transform(attr)
         existing = self._get_variogram_state(attr) or {}
         values = None
         if self.variogram_widget.current_data:
@@ -3224,7 +4152,7 @@ class MonitoringNetworksDialog(QDialog):
             'sill': float(params.get('sill', 0)),
             'range': float(params.get('range', 0)),
             'r2': float(self.variogram_widget.r2_label.text() or 0),
-            'weight': float(existing.get('weight', 1.0)),
+            'weight': float(existing.get('weight', self._equal_parameter_weight())),
             'log_transform': log_transform,
             'data_fingerprint': fingerprint,
         }
@@ -3236,9 +4164,7 @@ class MonitoringNetworksDialog(QDialog):
     def _update_store_from_table_cell(self, attr_name, col, text):
         """Update variogram_models_by_attribute from an edited table cell."""
         state = dict(self._get_variogram_state(attr_name))
-        if col == VAR_COL_WEIGHT:
-            state['weight'] = float(text)
-        elif col == VAR_COL_NUGGET:
+        if col == VAR_COL_NUGGET:
             state['nugget'] = float(text)
         elif col == VAR_COL_SILL:
             state['sill'] = float(text)
@@ -3287,26 +4213,69 @@ class MonitoringNetworksDialog(QDialog):
 
     def on_attribute_changed(self):
         """Handles the selection of attributes in the data selection tab (supports multi-selection)."""
-        self._sync_attr_name_combo()
+        self._sync_stats_table_structure()
         self._clear_variogram_widget()
         if not self.selected_data_parameters.selectedItems():
             self.clear_stats_table()
+            return
+        attr = self._current_analysis_attribute()
+        if attr and attr in self.stats_by_attribute:
+            self._refresh_tab2_parameter_views(attr)
+        else:
+            self._clear_stats_plots()
+            self._clear_cross_validation()
 
     def clear_stats_table(self):
-        """Clears statistics table and resets the info label."""
-        for col in range(STATS_VALUE_COL_OFFSET, self.stats_table.columnCount()):
-            item = self.stats_table.item(0, col)
-            if item is None:
-                item = QTableWidgetItem("")
-                self.stats_table.setItem(0, col, item)
+        """Clears statistics table, stored stats and resets the info label."""
+        self.stats_by_attribute.clear()
+        self._layer_data_by_attribute.clear()
+        parameters = self._selected_analysis_parameters()
+        self.stats_table.setRowCount(len(parameters))
+        if parameters:
+            self.stats_table.setVerticalHeaderLabels(parameters)
+            self.stats_table.verticalHeader().setVisible(True)
+        read_only = Qt.ItemIsSelectable | Qt.ItemIsEnabled
+        for row in range(self.stats_table.rowCount()):
+            attr_name = (
+                parameters[row] if row < len(parameters) else None
+            )
+            if attr_name:
+                self._set_stats_table_weight_cell(row, attr_name)
             else:
-                item.setText("")
+                weight_item = self.stats_table.item(row, STATS_COL_WEIGHT)
+                default_weight = self._format_parameter_weight(
+                    self._equal_parameter_weight()
+                )
+                if weight_item is None:
+                    weight_item = QTableWidgetItem(default_weight)
+                    self.stats_table.setItem(
+                        row, STATS_COL_WEIGHT, weight_item
+                    )
+                else:
+                    weight_item.setText(default_weight)
+            self.stats_table.removeCellWidget(row, STATS_TRANSFORM_COL)
+            if attr_name:
+                self._set_stats_table_transform_cell(row, attr_name)
+            for col in range(
+                STATS_VALUE_COL_OFFSET, self.stats_table.columnCount()
+            ):
+                item = self.stats_table.item(row, col)
+                if item is None:
+                    item = QTableWidgetItem("—")
+                    self.stats_table.setItem(row, col, item)
+                else:
+                    item.setText("—")
+                item.setFlags(read_only)
+                item.setToolTip("")
+                item.setBackground(QBrush())
         self.stats_info_label.setText(
             QCoreApplication.translate(
-                "Tab 2", "Select an attribute to view its statistics."
+                "Tab 2",
+                "Select attributes on tab 1, then click Calculate geostatistics.",
             )
         )
         self.stats_info_label.setStyleSheet("color: gray; font-style: italic;")
+        self._adjust_stats_table_height()
         self._clear_stats_plots()
         self._clear_cross_validation()
 
@@ -3499,7 +4468,13 @@ class MonitoringNetworksDialog(QDialog):
         self.stats_map_canvas.draw()
 
     def _populate_stats_table(self, stats_dict):
-        """Fills the single statistics row from a stats dictionary."""
+        """Fills the active parameter's statistics row from a stats dictionary."""
+        attr_name = self._current_analysis_attribute()
+        if not attr_name:
+            return
+        row = self._stats_table_row_for_attribute(attr_name)
+        if row < 0:
+            return
         for col, key in enumerate(STAT_KEYS):
             table_col = col + STATS_VALUE_COL_OFFSET
             value = stats_dict[key]
@@ -3508,128 +4483,18 @@ class MonitoringNetworksDialog(QDialog):
             elif np.isnan(value):
                 text = "—"
             else:
-                text = f"{value:.2f}"
-            item = self.stats_table.item(0, table_col)
+                text = f"{value:.3f}"
+            item = self.stats_table.item(row, table_col)
             if item is None:
                 item = QTableWidgetItem(text)
-                self.stats_table.setItem(0, table_col, item)
+                self.stats_table.setItem(row, table_col, item)
             else:
                 item.setText(text)
+            apply_distribution_shape_cell_style(item, key, value)
 
     def refresh_attribute_statistics(self, force_reextract=False):
-        """Recalculates and displays statistics for the selected attribute."""
-        layer = self.input_data_layer.currentLayer()
-        attr_name = self._current_analysis_attribute()
-
-        if not layer or attr_name is None:
-            self.clear_stats_table()
-            return
-        use_cache = (
-            not force_reextract
-            and self._cached_layer is layer
-            and self._cached_attribute == attr_name
-            and self._cached_raw_values is not None
-            and self._cached_coordinates is not None
-            and self._cached_point_ids is not None
-        )
-
-        if use_cache:
-            raw_values = self._cached_raw_values
-            coordinates = self._cached_coordinates
-            point_ids = self._cached_point_ids
-            null_count = self._cached_null_count
-        else:
-            point_ids, coordinates, raw_values, null_count, _ = (
-                extract_point_records_from_layer(layer, attr_name)
-            )
-            self._cached_layer = layer
-            self._cached_attribute = attr_name
-            self._cached_raw_values = raw_values
-            self._cached_coordinates = coordinates
-            self._cached_point_ids = point_ids
-            self._cached_null_count = null_count
-
-        if (
-            raw_values is None
-            or coordinates is None
-            or point_ids is None
-            or len(raw_values) == 0
-        ):
-            self.clear_stats_table()
-            self.stats_info_label.setText(
-                QCoreApplication.translate(
-                    "Tab 2",
-                    "No valid data for the selected attribute.",
-                )
-            )
-            self.stats_info_label.setStyleSheet("color: red; font-style: italic;")
-            return
-
-        transform = 'log' if self.stats_transform_combo.currentIndex() == 1 else 'none'
-        coordinates, transformed, excluded_non_positive, error = (
-            align_coordinates_with_transform(coordinates, raw_values, transform)
-        )
-
-        if error:
-            self.clear_stats_table()
-            self.stats_info_label.setText(
-                QCoreApplication.translate("Tab 2", error)
-            )
-            self.stats_info_label.setStyleSheet("color: red; font-style: italic;")
-            return
-
-        stats_dict = compute_descriptive_stats(transformed)
-        if stats_dict is None:
-            self.clear_stats_table()
-            self.stats_info_label.setText(
-                QCoreApplication.translate(
-                    "Tab 2",
-                    "No valid data after applying the transformation.",
-                )
-            )
-            self.stats_info_label.setStyleSheet("color: red; font-style: italic;")
-            return
-
-        self._populate_stats_table(stats_dict)
-        self._update_stats_plots(coordinates, transformed, attr_name)
-
-        info_parts = [
-            QCoreApplication.translate(
-                "Tab 2", "Statistics for «{param}»"
-            ).format(param=attr_name)
-        ]
-        if null_count > 0:
-            info_parts.append(
-                QCoreApplication.translate(
-                    "Tab 2", "{count} null value(s) omitted"
-                ).format(count=null_count)
-            )
-        if transform == 'log' and excluded_non_positive > 0:
-            info_parts.append(
-                QCoreApplication.translate(
-                    "Tab 2", "{count} value(s) ≤ 0 omitted for log"
-                ).format(count=excluded_non_positive)
-            )
-        if transform == 'log':
-            info_parts.append(
-                QCoreApplication.translate("Tab 2", "(Log transformation)")
-            )
-
-        self.stats_info_label.setText(" · ".join(info_parts))
-        self.stats_info_label.setStyleSheet("color: gray; font-style: italic;")
-
-        log_transform = transform == 'log'
-        existing_state = self._get_variogram_state(attr_name)
-        if existing_state is not None:
-            synced_state = dict(existing_state)
-            synced_state['log_transform'] = log_transform
-            self._set_variogram_state(attr_name, synced_state)
-
-        self._update_variogram_from_statistics(
-            coordinates, transformed, attr_name, log_transform, force_reextract
-        )
-
-        self._refresh_tab2_cross_validation(attr_name)
+        """Legacy entry point: recalculate all selected parameters."""
+        self._calculate_all_attribute_statistics(force_reextract=force_reextract)
 
     def _update_variogram_from_statistics(
         self, coordinates, values, attr_name, log_transform, force_reextract
@@ -3661,10 +4526,12 @@ class MonitoringNetworksDialog(QDialog):
             self.variogram_widget.update_plot(emit_signal=False)
 
     def _find_params_table_row(self, attr_name):
-        for row in range(self.var_params_table.rowCount()):
-            item = self.var_params_table.item(row, 0)
-            if item and item.text() == attr_name:
-                return row
+        """Return row 0 when the variogram table shows the given parameter."""
+        if self.var_params_table.rowCount() != 1:
+            return -1
+        item = self.var_params_table.item(0, VAR_COL_PARAM)
+        if item and item.text() == attr_name:
+            return 0
         return -1
 
     def _set_params_table_cell(self, row, col, text):
@@ -3673,6 +4540,24 @@ class MonitoringNetworksDialog(QDialog):
             self.var_params_table.setItem(row, col, QTableWidgetItem(str(text)))
         else:
             item.setText(str(text))
+
+    def _grid_buffer_spacing_factor(self):
+        """Buffer setting as a multiple of node spacing (default 1.0)."""
+        if not hasattr(self, 'buffer_spin'):
+            return 1.0
+        return float(self.buffer_spin.value())
+
+    def _effective_grid_buffer_map_units(self):
+        """
+        Buffer distance applied outside the concave hull, in map units.
+
+        Computed as (buffer × node spacing). For example, factor 1.0 with
+        spacing 100 m yields a 100 m outward buffer on the hull.
+        """
+        if not hasattr(self, 'spacing_spin'):
+            return 0.0
+        spacing = float(self.spacing_spin.value())
+        return self._grid_buffer_spacing_factor() * spacing
 
     def on_spacing_changed(self, value):
         """Handles spacing change and updates point estimate"""
@@ -3688,10 +4573,10 @@ class MonitoringNetworksDialog(QDialog):
             width = extent.width()
             height = extent.height()
             spacing = self.spacing_spin.value()
-            buffer = self.buffer_spin.value() if hasattr(self, 'buffer_spin') else 0
+            buffer = self._effective_grid_buffer_map_units()
             
             if spacing > 0 and width > 0 and height > 0:
-                # Adjust dimensions with buffer
+                # Rough extent estimate: layer bbox expanded by the hull buffer.
                 width_with_buffer = width + (2 * buffer)
                 height_with_buffer = height + (2 * buffer)
                 
@@ -3717,7 +4602,9 @@ class MonitoringNetworksDialog(QDialog):
         """
         Previews the estimation grid by generating nodes over a concave hull
         that covers the input points, using the defined spacing and buffer.
-        Uses the QGIS concave hull algorithm with ALPHA = 0.7 and no holes.
+
+        The buffer is applied as a multiple of node spacing (see tab 3 control).
+        Uses the QGIS concave hull algorithm (user-defined ALPHA, no holes).
         """
         layer = self.input_data_layer.currentLayer()
         if not layer:
@@ -3733,7 +4620,8 @@ class MonitoringNetworksDialog(QDialog):
             from shapely.geometry import Point, Polygon
             from shapely.ops import unary_union
 
-            buffer = self.buffer_spin.value()
+            buffer_factor = self._grid_buffer_spacing_factor()
+            buffer = self._effective_grid_buffer_map_units()
             spacing = self.spacing_spin.value()
 
             # Input well/point coordinates
@@ -3784,10 +4672,10 @@ class MonitoringNetworksDialog(QDialog):
                 prov.addFeatures(features)
                 point_layer.updateExtents()
 
-                # Run concave hull with alpha = 0.7, without holes
+                # Run concave hull with user ALPHA, without holes
                 alg_params = {
                     'INPUT': point_layer,
-                    'ALPHA': 0.7,
+                    'ALPHA': float(self.alpha_spin.value()),
                     'HOLES': False,
                     'OUTPUT': 'memory:concave_hull'
                 }
@@ -3846,6 +4734,7 @@ class MonitoringNetworksDialog(QDialog):
                 'n_nodes': n_nodes,
                 'hull_polygon': hull_polygon,
                 'spacing': spacing,
+                'buffer_spacing_factor': buffer_factor,
                 'buffer': buffer,
                 'n_x': len(x_coords),
                 'n_y': len(y_coords),
@@ -3897,11 +4786,11 @@ class MonitoringNetworksDialog(QDialog):
             ax.plot(
                 hull_x,
                 hull_y,
-                color='blue',
-                linestyle='--',
-                linewidth=1,
+                color='#e0d9d8',
+                #linestyle='-',
+                linewidth=0.5,
                 label=QCoreApplication.translate(
-                    "Tab 3", "Hull (QGIS, buffered)"
+                    "Tab 3", "Buffered hull"
                 ),
             )
 
@@ -3909,9 +4798,9 @@ class MonitoringNetworksDialog(QDialog):
             if n_nodes > 0:
                 ax.scatter(
                     estimation_points[:, 0], estimation_points[:, 1],
-                    c='black', marker='o',
+                    c='gray', #marker='o',
                     label=QCoreApplication.translate("Tab 3", "Estimation grid"),
-                    s=5, alpha=0.7, edgecolors='black', linewidths=0.5
+                    s=30, alpha=0.5, edgecolors='black', linewidths=0.3
                 )
 
             ax.set_xlabel(QCoreApplication.translate("Tab 3", "X"))
@@ -3921,16 +4810,17 @@ class MonitoringNetworksDialog(QDialog):
                     "Tab 3", "Estimation Grid on QGIS Concave Hull"
                 )
             )
-            ax.legend(loc='best')
+            ax.legend(loc='best', bbox_to_anchor=(1, 0.5), prop={'size': 8})
             ax.grid(True, alpha=0.3)
             ax.set_aspect('equal')
 
             self.grid_canvas.draw()
 
             # Keep grid parameters for export
-            self.grid_type_saved = 'Concave Hull (QGIS)'
+            self.grid_type_saved = 'Generated'
             self.n_nodes_saved = n_nodes
             self.buffer_saved = buffer
+            self.buffer_spacing_factor_saved = buffer_factor
 
             self._update_mn_grid_weight_info()
 
@@ -4000,7 +4890,12 @@ class MonitoringNetworksDialog(QDialog):
             # Saved or current grid parameters
             grid_type = getattr(self, 'grid_type_saved', 'Rectangular')
             n_nodes = getattr(self, 'n_nodes_saved', 0)
-            buffer = getattr(self, 'buffer_saved', self.buffer_spin.value() if hasattr(self, 'buffer_spin') else 100)
+            if grid_info is not None:
+                buffer = float(grid_info.get(
+                    'buffer', self._effective_grid_buffer_map_units()
+                ))
+            else:
+                buffer = self._effective_grid_buffer_map_units()
             
             temp_layer.dataProvider().addAttributes(fields)
             temp_layer.updateFields()
@@ -4069,37 +4964,50 @@ class MonitoringNetworksDialog(QDialog):
                 ).format(error=str(e), details=traceback.format_exc()),
             )
     
-    def _draw_imported_estimation_grid(self, xs, ys, weights):
+    def _draw_imported_estimation_grid(self, xs, ys, weights=None):
         """
-        Draws an imported estimation grid with a discrete weight legend.
+        Draws an imported estimation grid on tab 3.
 
-        Each unique grid weight is shown as a separate legend entry instead of
-        a continuous color ramp.
+        When ``weights`` is provided, each unique weight gets a discrete legend
+        entry. Without weights, nodes are drawn with a single uniform style.
         """
         self.grid_figure.clear()
         ax = self.grid_figure.add_subplot(111)
 
         xs = np.asarray(xs, dtype=float)
         ys = np.asarray(ys, dtype=float)
-        weights = np.asarray(weights, dtype=float)
-        unique_weights = np.unique(weights)
-        cmap = plt.get_cmap('viridis')
-        n_unique = unique_weights.size
 
-        for index, weight_val in enumerate(unique_weights):
-            mask = weights == weight_val
-            if not np.any(mask):
-                continue
-            color = cmap(index / max(n_unique - 1, 1))
+        if weights is not None:
+            weights = np.asarray(weights, dtype=float)
+            unique_weights = np.unique(weights)
+            cmap = plt.get_cmap('viridis')
+            n_unique = unique_weights.size
+
+            for index, weight_val in enumerate(unique_weights):
+                mask = weights == weight_val
+                if not np.any(mask):
+                    continue
+                color = cmap(index / max(n_unique - 1, 1))
+                ax.scatter(
+                    xs[mask],
+                    ys[mask],
+                    c=[color],
+                    s=30,
+                    alpha=0.9,
+                    edgecolors='k',
+                    linewidths=0.3,
+                    label=f"{weight_val:g}",
+                    zorder=3,
+                )
+        else:
             ax.scatter(
-                xs[mask],
-                ys[mask],
-                c=[color],
+                xs,
+                ys,
+                c='#4a90d9',
                 s=30,
                 alpha=0.9,
                 edgecolors='k',
                 linewidths=0.3,
-                label=f"{weight_val:g}",
                 zorder=3,
             )
 
@@ -4117,20 +5025,23 @@ class MonitoringNetworksDialog(QDialog):
         )
         ax.set_xlabel(QCoreApplication.translate("Tab 3", "X"))
         ax.set_ylabel(QCoreApplication.translate("Tab 3", "Y"))
-        ax.legend(
-            title=QCoreApplication.translate("Tab 3", "Weight"),
-            loc='best',
-            fontsize=8,
-        )
+        if weights is not None:
+            ax.legend(
+                title=QCoreApplication.translate("Tab 3", "Weight"),
+                loc='best',
+                fontsize=8,
+            )
         ax.grid(True, alpha=0.3)
         ax.set_aspect('equal', 'box')
         self.grid_canvas.draw()
 
     def load_grid_as_layer(self):
         """
-        Load estimation grid from an .xlsx file and plot on Tab 3.
-        Simply assumes the first 4 columns are id, x, y, weight;
-        skips records that are incomplete or non-numeric in any of those fields.
+        Load estimation grid from an .xlsx file and plot on tab 3.
+
+        Uses the first columns in order: ID, X, Y, and optionally weight.
+        Rows with invalid ID or coordinates are skipped. Weight is optional;
+        when absent or empty for all rows, the grid is imported as unweighted.
         """
         try:
             file_path = self._prompt_open_xlsx(
@@ -4170,14 +5081,14 @@ class MonitoringNetworksDialog(QDialog):
                 )
                 return
 
-            if len(table_rows[0]) < 4:
+            if len(table_rows[0]) < 3:
                 QMessageBox.warning(
                     self,
                     QCoreApplication.translate("Tab 3", "Invalid File"),
                     QCoreApplication.translate(
                         "Tab 3",
-                        "The selected file must have at least 4 columns for "
-                        "ID, X, Y, and Weight (in that order).",
+                        "The selected file must have at least 3 columns for "
+                        "ID, X, and Y (in that order). Weight is optional.",
                     ),
                 )
                 return
@@ -4185,30 +5096,34 @@ class MonitoringNetworksDialog(QDialog):
             ids = []
             xs = []
             ys = []
-            weights = []
+            row_weights = []
             for row in table_rows[1:]:
-                if row is None or len(row) < 4:
+                if row is None or len(row) < 3:
                     continue
-                id_val, x_val, y_val, w_val = row[0], row[1], row[2], row[3]
-                if (
-                    id_val is None
-                    or x_val is None
-                    or y_val is None
-                    or w_val is None
-                ):
+                id_val, x_val, y_val = row[0], row[1], row[2]
+                if id_val is None or x_val is None or y_val is None:
                     continue
                 try:
                     x_f = float(x_val)
                     y_f = float(y_val)
-                    w_f = float(w_val)
                 except (ValueError, TypeError):
                     continue
-                if np.isnan(x_f) or np.isnan(y_f) or np.isnan(w_f):
+                if np.isnan(x_f) or np.isnan(y_f):
                     continue
+
+                weight_val = None
+                if len(row) >= 4 and row[3] is not None:
+                    try:
+                        w_f = float(row[3])
+                        if not np.isnan(w_f):
+                            weight_val = w_f
+                    except (ValueError, TypeError):
+                        pass
+
                 ids.append(id_val)
                 xs.append(x_f)
                 ys.append(y_f)
-                weights.append(w_f)
+                row_weights.append(weight_val)
 
             if not ids:
                 QMessageBox.warning(
@@ -4216,47 +5131,64 @@ class MonitoringNetworksDialog(QDialog):
                     QCoreApplication.translate("Tab 3", "Error"),
                     QCoreApplication.translate(
                         "Tab 3",
-                        "No valid records with ID, X, Y, and Weight found in "
-                        "the file.",
+                        "No valid records with ID, X, and Y found in the file.",
                     ),
                 )
                 return
 
             xs = np.asarray(xs, dtype=float)
             ys = np.asarray(ys, dtype=float)
-            weights = np.asarray(weights, dtype=float)
             grid_points = np.column_stack([xs, ys])
             n_nodes = grid_points.shape[0]
+
+            has_weights = any(weight is not None for weight in row_weights)
+            weights = None
+            if has_weights:
+                weights = np.asarray(
+                    [weight if weight is not None else 1.0 for weight in row_weights],
+                    dtype=float,
+                )
 
             # Save grid information for workflow integration
             self.current_grid_info = {
                 'grid_points': grid_points,
                 'n_nodes': n_nodes,
                 'ids': np.asarray(ids),
-                'weights': weights,
                 'grid_type': "imported_from_xlsx",
                 'buffer': 0.0,
                 'n_x': None,  # unknown for imported grid
-                'n_y': None
+                'n_y': None,
             }
+            if has_weights:
+                self.current_grid_info['weights'] = weights
+                self.current_ceg_values = weights
+            else:
+                self.current_ceg_values = None
+
             self.current_grid_points = grid_points
 
             self._update_mn_grid_weight_info()
 
-            # For compatibility with CEG values if needed
-            self.current_ceg_values = weights
-
             # Plot on Tab 3 (Estimation Grid Visualization)
             self._draw_imported_estimation_grid(xs, ys, weights)
+
+            if has_weights:
+                success_message = QCoreApplication.translate(
+                    "Tab 3",
+                    "Grid loaded successfully with {count} points "
+                    "(columns: ID, X, Y, weight).",
+                ).format(count=n_nodes)
+            else:
+                success_message = QCoreApplication.translate(
+                    "Tab 3",
+                    "Grid loaded successfully with {count} points "
+                    "(columns: ID, X, Y; no node weights).",
+                ).format(count=n_nodes)
 
             QMessageBox.information(
                 self,
                 QCoreApplication.translate("Tab 3", "Success"),
-                QCoreApplication.translate(
-                    "Tab 3",
-                    "Grid loaded successfully with {count} points.\n"
-                    "(used columns: first 4 columns of file)",
-                ).format(count=n_nodes),
+                success_message,
             )
         except Exception as e:
             import traceback
@@ -4340,34 +5272,24 @@ class VariogramWidget(QWidget):
         if self.current_data is None:
             return
 
-        # Access progress elements from main dialog
+        # Progress updates go through the main dialog (text is shown inside the bar).
         main_dialog = self.dialog
-        progress_bar = getattr(main_dialog, 'var_progress_bar', None)
-        status_label = getattr(main_dialog, 'var_progress_status_label', None)
+        set_progress = getattr(main_dialog, '_set_variogram_progress', None)
 
-        # Show progress bar and set initial status
-        if progress_bar and status_label:
-            progress_bar.setValue(0)
-            status_label.setText(
-                QCoreApplication.translate(
-                    "Tab 2", "State: Starting variogram calculation..."
-                )
+        if set_progress is not None:
+            set_progress(
+                0, "State: Starting variogram calculation..."
             )
-            QApplication.processEvents()
 
         try:
             coordinates = self.current_data['coordinates']
             values = self.current_data['values']
             model_type = self.model_combo.currentText()
 
-            if progress_bar and status_label:
-                progress_bar.setValue(10)
-                status_label.setText(
-                    QCoreApplication.translate(
-                        "Tab 2", "State: Computing experimental variogram..."
-                    )
+            if set_progress is not None:
+                set_progress(
+                    10, "State: Computing experimental variogram..."
                 )
-                QApplication.processEvents()
 
             bin_edges = np.linspace(0, self.current_data['max_dist']/2,15)
             bin_center, gamma = gs.vario_estimate(coordinates.T, values, bin_edges=bin_edges)
@@ -4388,14 +5310,8 @@ class VariogramWidget(QWidget):
             bin_center = bin_center[valid_mask]
             gamma = gamma[valid_mask]
 
-            if progress_bar and status_label:
-                progress_bar.setValue(30)
-                status_label.setText(
-                    QCoreApplication.translate(
-                        "Tab 2", "State: Computing initial values..."
-                    )
-                )
-                QApplication.processEvents()
+            if set_progress is not None:
+                set_progress(30, "State: Computing initial values...")
 
             var_values = np.var(values)
             mean_gamma = np.mean(gamma) if len(gamma) > 0 else var_values
@@ -4407,14 +5323,8 @@ class VariogramWidget(QWidget):
             estimated_sill = max_gamma
             estimated_range = max_dist_used / 3.0  # Common approximation
             
-            if progress_bar and status_label:
-                progress_bar.setValue(50)
-                status_label.setText(
-                    QCoreApplication.translate(
-                        "Tab 2", "State: Creating variogram model..."
-                    )
-                )
-                QApplication.processEvents()
+            if set_progress is not None:
+                set_progress(50, "State: Creating variogram model...")
 
             if model_type == 'spherical':
                 model = gs.Spherical(dim=2)
@@ -4427,14 +5337,8 @@ class VariogramWidget(QWidget):
             else:
                 model = gs.Matern(dim=2)
             
-            if progress_bar and status_label:
-                progress_bar.setValue(70)
-                status_label.setText(
-                    QCoreApplication.translate(
-                        "Tab 2", "State: Setting initial parameters..."
-                    )
-                )
-                QApplication.processEvents()
+            if set_progress is not None:
+                set_progress(70, "State: Setting initial parameters...")
 
             try:
                 # Set initial values before fitting
@@ -4453,26 +5357,11 @@ class VariogramWidget(QWidget):
             # Initialize r2 with a default value
             r2 = 0.0
 
-            if progress_bar and status_label:
-                progress_bar.setValue(80)
-                status_label.setText(
-                    QCoreApplication.translate(
-                        "Tab 2", "State: Fitting variogram model..."
-                    )
-                )
-                QApplication.processEvents()
+            if set_progress is not None:
+                set_progress(80, "State: Fitting variogram model...")
 
             try:
                 try:
-                    if progress_bar and status_label:
-                        progress_bar.setValue(80)
-                        status_label.setText(
-                            QCoreApplication.translate(
-                                "Tab 2", "State: Fitting variogram model..."
-                            )
-                        )
-                        QApplication.processEvents()
-
                     para, pcov, r2 = model.fit_variogram(
                         bin_center,
                         gamma,
@@ -4525,28 +5414,18 @@ class VariogramWidget(QWidget):
                             "You can adjust the parameters manually.",
                         ).format(error=str(fit_error2)),
                     )
-                    if progress_bar and status_label:
-                        progress_bar.setValue(100)
-                        status_label.setText(
-                            QCoreApplication.translate(
-                                "Tab 2", "State: Completed with estimated values"
-                            )
+                    if set_progress is not None:
+                        set_progress(
+                            100, "State: Completed with estimated values"
                         )
-                        QApplication.processEvents()
 
                         # Reset progress elements after a short delay
                         from qgis.PyQt.QtCore import QTimer
                         QTimer.singleShot(3000, lambda: self._hide_progress_elements())
             
             # Update spinboxes
-            if progress_bar and status_label:
-                progress_bar.setValue(95)
-                status_label.setText(
-                    QCoreApplication.translate(
-                        "Tab 2", "State: Updating controls..."
-                    )
-                )
-                QApplication.processEvents()
+            if set_progress is not None:
+                set_progress(95, "State: Updating controls...")
 
             self.nugget_spin.setValue(max(0.0, model.nugget))
             self.sill_spin.setValue(max(0.0, model.var + model.nugget))
@@ -4567,24 +5446,15 @@ class VariogramWidget(QWidget):
             self.update_plot(emit_signal=False)
 
             # Complete progress
-            if progress_bar and status_label:
-                progress_bar.setValue(100)
-                status_label.setText(
-                    QCoreApplication.translate(
-                        "Tab 2", "State: Completed successfully"
-                    )
-                )
-                QApplication.processEvents()
+            if set_progress is not None:
+                set_progress(100, "State: Completed successfully")
 
                 # Reset progress elements after a short delay
                 from qgis.PyQt.QtCore import QTimer
                 QTimer.singleShot(2000, lambda: self._hide_progress_elements())
         except Exception as e:
-            if progress_bar and status_label:
-                progress_bar.setValue(0)
-                status_label.setText(
-                    QCoreApplication.translate("Tab 2", "State: Error")
-                )
+            if set_progress is not None:
+                set_progress(0, "State: Error")
             QMessageBox.warning(
                 self,
                 QCoreApplication.translate("Tab 2", "Error"),
@@ -4594,17 +5464,11 @@ class VariogramWidget(QWidget):
             )
 
     def _hide_progress_elements(self):
-        """Reset progress elements after completion."""
+        """Reset progress bar after variogram auto-fit completes."""
         main_dialog = self.dialog
-        progress_bar = getattr(main_dialog, 'var_progress_bar', None)
-        status_label = getattr(main_dialog, 'var_progress_status_label', None)
-
-        if progress_bar:
-            progress_bar.setValue(0)
-        if status_label:
-            status_label.setText(
-                QCoreApplication.translate("Tab 2", "State: Ready")
-            )
+        reset_progress = getattr(main_dialog, '_reset_variogram_progress', None)
+        if reset_progress is not None:
+            reset_progress()
 
     def clear(self):
         """Clears data, model controls and plot when input layer/attributes change."""
@@ -4782,6 +5646,19 @@ class VariogramWidget(QWidget):
                 print(f"Error updating plot: {str(e)}")
         
         self.canvas.draw()
+
+
+class StatsTableHeightFilter(QObject):
+    """Recalculate stats_table height when the table is resized."""
+
+    def __init__(self, dialog):
+        super().__init__(dialog)
+        self._dialog = dialog
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Resize:
+            self._dialog._adjust_stats_table_height()
+        return False
 
 
 class WheelIgnoringComboBox(QComboBox):

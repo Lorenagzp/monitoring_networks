@@ -742,7 +742,7 @@ def compute_total_variance_percent(normalized_variances):
     return np.full(varianzas.shape, 100.0, dtype=float)
 
 
-def compute_variance_reduction_curve(optimization_input):
+def compute_variance_reduction_curve(optimization_input, progress_callback=None):
     """
     Greedy Kalman well prioritization with an ordinary-kriging variance curve.
 
@@ -765,12 +765,22 @@ def compute_variance_reduction_curve(optimization_input):
         At step t, V(t) = sum_p( w_p * OK_variance_p(t) )
         Baseline V(0) = n_grid nodes (geostat_app_kalman_v10 convention).
 
+    Args:
+        optimization_input: Wells, grid, parameters and optional weights.
+        progress_callback: Optional ``callable(fraction, message, **kwargs)``
+            invoked during phase 1 and phase 2. ``fraction`` is in [0, 1].
+            ``message`` identifies the phase (e.g. ``"selecting"``).
+
     Returns:
         dict with n_points, normalized_variances, variance_reduction (%),
         total_variance_percent (remaining variance on a 0–100 scale),
         selection_order, grid_node_count, combined_mode, parameters,
         parameter_weights; or None if inputs are insufficient.
     """
+    def emit_progress(fraction, message="", **kwargs):
+        if progress_callback is not None:
+            progress_callback(fraction, message, **kwargs)
+
     if not isinstance(optimization_input, OptimizationInput):
         return None
 
@@ -832,11 +842,13 @@ def compute_variance_reduction_curve(optimization_input):
             )
         )
 
+    emit_progress(0.05, "preparing")
+
     selected = []
     disponibles = list(range(n_candidates))
 
     # Phase 1: greedily pick the well with highest combined variance reduction.
-    for _step in range(len(disponibles)):
+    for step in range(len(disponibles)):
         best_idx = None
         best_score = -np.inf
 
@@ -861,12 +873,21 @@ def compute_variance_reduction_curve(optimization_input):
             selected.extend(disponibles)
             break
 
+        phase1_fraction = 0.05 + 0.45 * (step + 1) / n_candidates
+        emit_progress(
+            phase1_fraction,
+            "selecting",
+            current=step + 1,
+            total=n_candidates,
+        )
+
     # Phase 2: evaluate weighted OK variance along the fixed selection order.
     num_puntos = [0]
     varianzas = [float(n_grid)]
 
     indices_acumulados = []
-    for idx in selected:
+    n_selected = len(selected)
+    for step, idx in enumerate(selected):
         indices_acumulados.append(idx)
         sel_coords = well_coordinates[indices_acumulados]
         step_vars = []
@@ -883,6 +904,15 @@ def compute_variance_reduction_curve(optimization_input):
         varianzas.append(float(np.dot(param_weights, step_vars)))
         num_puntos.append(len(indices_acumulados))
 
+        if n_selected > 0:
+            phase2_fraction = 0.50 + 0.50 * (step + 1) / n_selected
+            emit_progress(
+                phase2_fraction,
+                "evaluating",
+                current=step + 1,
+                total=n_selected,
+            )
+
     varianzas = np.asarray(varianzas, dtype=float)
     num_puntos = np.asarray(num_puntos, dtype=int)
     var_inicial = varianzas[0]
@@ -892,6 +922,7 @@ def compute_variance_reduction_curve(optimization_input):
         variance_reduction = np.zeros_like(varianzas)
 
     combined_mode = len(parameters) > 1
+    emit_progress(1.0, "complete")
     return {
         'n_points': num_puntos,
         'normalized_variances': varianzas,
