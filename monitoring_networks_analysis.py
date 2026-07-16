@@ -176,9 +176,13 @@ def extract_coordinates_and_values_from_layer(layer, attribute):
         return None, None, 0
 
 
-def extract_layer_coordinates(layer):
+def extract_layer_coordinates(layer, include_fids=None):
     """
     Extracts XY coordinates from every point feature in a vector layer.
+
+    Args:
+        layer: QgsVectorLayer with point geometries.
+        include_fids: optional set of feature IDs to keep; None keeps all.
 
     Returns:
         ndarray of shape (n_points, 2), or None when the layer is invalid
@@ -192,6 +196,8 @@ def extract_layer_coordinates(layer):
 
         coordinates = []
         for feature in layer.getFeatures():
+            if include_fids is not None and feature.id() not in include_fids:
+                continue
             geom = feature.geometry()
             if not geom or geom.isEmpty():
                 continue
@@ -354,9 +360,15 @@ def _sanitize_well_weights(weights):
     return np.where(weights > 0, weights, fallback)
 
 
-def extract_point_records_from_layer(layer, attribute, id_field=None, weight_field=None):
+def extract_point_records_from_layer(
+    layer, attribute, id_field=None, weight_field=None, include_fids=None
+):
     """
     Extracts point IDs, coordinates, values and optional well weights.
+
+    Args:
+        include_fids: optional set of feature IDs to keep; None keeps all.
+            Unchecked wells on Tab 1 are excluded before null/value filtering.
 
     Returns:
         tuple: (point_ids, coordinates, values, null_count, well_weights)
@@ -388,6 +400,9 @@ def extract_point_records_from_layer(layer, attribute, id_field=None, weight_fie
         null_count = 0
 
         for feature in layer.getFeatures():
+            if include_fids is not None and feature.id() not in include_fids:
+                continue
+
             geom = feature.geometry()
             if not geom:
                 continue
@@ -449,6 +464,79 @@ def extract_point_records_from_layer(layer, attribute, id_field=None, weight_fie
         return None, None, None, 0, None
 
 
+def build_point_id_layer_attribute_map(layer, attribute, include_fids=None):
+    """
+    Map point ID strings to full layer attribute dicts for valid analysis points.
+
+    Uses the same point-ID assignment and attribute validity rules as
+    ``extract_point_records_from_layer`` so export rows align with optimization.
+
+    Args:
+        include_fids: optional set of feature IDs to keep; None keeps all.
+
+    Returns:
+        tuple: (field_names, records_by_point_id)
+            field_names: layer field names in QgsFields order.
+            records_by_point_id: dict mapping point_id str -> {field: raw value}.
+        Returns ([], {}) when the layer or attribute is invalid.
+    """
+    try:
+        from qgis.core import QgsVectorLayer
+        from PyQt5.QtCore import QVariant
+
+        if not isinstance(layer, QgsVectorLayer):
+            return [], {}
+
+        fields = layer.fields()
+        field_names = [field.name() for field in fields]
+        if not field_names:
+            return [], {}
+
+        field_index = fields.indexOf(attribute)
+        if field_index == -1:
+            return [], {}
+
+        id_field = resolve_point_id_field(layer, attribute)
+        id_index = fields.indexOf(id_field) if id_field else -1
+
+        records_by_point_id = {}
+        for feature in layer.getFeatures():
+            if include_fids is not None and feature.id() not in include_fids:
+                continue
+            if not feature.geometry():
+                continue
+
+            value = feature[attribute]
+            if value is None or (isinstance(value, QVariant) and value.isNull()):
+                continue
+
+            try:
+                float_value = float(value)
+                if np.isnan(float_value) or np.isinf(float_value):
+                    continue
+            except (ValueError, TypeError):
+                continue
+
+            if id_index >= 0:
+                raw_id = feature[id_field]
+                if raw_id is None or (
+                    isinstance(raw_id, QVariant) and raw_id.isNull()
+                ):
+                    point_id = str(feature.id())
+                else:
+                    point_id = str(raw_id)
+            else:
+                point_id = str(feature.id())
+
+            records_by_point_id[point_id] = {
+                name: feature[name] for name in field_names
+            }
+
+        return field_names, records_by_point_id
+    except Exception:
+        return [], {}
+
+
 def align_point_ids_with_transform(point_ids, raw_values, transform='none'):
     """Keeps point IDs aligned with align_coordinates_with_transform filtering."""
     point_ids = np.asarray(point_ids, dtype=object)
@@ -482,6 +570,53 @@ def build_covariance_model(model_type, nugget, sill, range_val):
     if model_type == 'stable':
         return gs.Stable(dim=2, var=var, len_scale=len_scale, nugget=nugget)
     return gs.Matern(dim=2, var=var, len_scale=len_scale, nugget=nugget)
+
+
+# Number of lag-bin edges for experimental variogram (shared by fit and plot).
+VARIOGRAM_N_BINS = 15
+
+
+def compute_variogram_lag_r2(bin_center, gamma, model):
+    """
+    Coefficient of determination for experimental vs model variogram at lag bins.
+
+    Uses the same bins shown on the Tab 2 plot:
+
+        γ_hat(h) = model.variogram(bin_center)
+        SS_res = Σ (γ_exp − γ_hat)²
+        SS_tot = Σ (γ_exp − mean(γ_exp))²
+        R² = 1 − SS_res / SS_tot
+
+    This UI metric replaces gstools ``fit_variogram(..., return_r2=True)`` so
+    reported R² tracks visual lag-bin alignment after auto-fit and manual edits.
+
+    Returns:
+        float R², or 0.0 when bins are insufficient or SS_tot is ~0.
+    """
+    bin_center = np.asarray(bin_center, dtype=float).ravel()
+    gamma = np.asarray(gamma, dtype=float).ravel()
+    if bin_center.size < 2 or gamma.size != bin_center.size or model is None:
+        return 0.0
+
+    try:
+        gamma_hat = np.asarray(model.variogram(bin_center), dtype=float).ravel()
+    except Exception:
+        return 0.0
+
+    if gamma_hat.size != gamma.size:
+        return 0.0
+
+    valid = np.isfinite(gamma) & np.isfinite(gamma_hat)
+    if np.sum(valid) < 2:
+        return 0.0
+
+    y = gamma[valid]
+    y_hat = gamma_hat[valid]
+    ss_res = float(np.sum((y - y_hat) ** 2))
+    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+    if ss_tot <= 1e-15:
+        return 0.0
+    return float(1.0 - ss_res / ss_tot)
 
 
 def compute_cross_validation_summary(errors):
@@ -593,7 +728,7 @@ def run_ordinary_kriging_cross_validation(
     if np.sum(np.isfinite(predicted)) < 3:
         return None
 
-    errors = values - predicted
+    errors = predicted - values # predicted - measureds
     se = np.sqrt(kriging_var)
     with np.errstate(divide='ignore', invalid='ignore'):
         standardized = np.where(se > 0, errors / se, np.nan)
@@ -742,6 +877,192 @@ def compute_total_variance_percent(normalized_variances):
     return np.full(varianzas.shape, 100.0, dtype=float)
 
 
+def wells_at_fraction_of_max_reduction(results, fraction=0.9):
+    """
+    Smallest well count where prioritized variance reduction reaches a fraction
+    of the maximum achievable reduction (same threshold as the Tab 4 90% line).
+
+    Uses ``variance_reduction`` and ``n_points`` from
+    ``compute_variance_reduction_curve`` (priority / Kalman order).
+
+    Args:
+        results: Optimize results dict (must include variance_reduction, n_points).
+        fraction: Target share of max reduction in (0, 1], e.g. 0.9 for 90%.
+
+    Returns:
+        int well count, or None when the curve is missing or empty.
+    """
+    if not results:
+        return None
+
+    reduction = np.asarray(results.get('variance_reduction', []), dtype=float)
+    n_points = np.asarray(results.get('n_points', []), dtype=int)
+    if reduction.size < 2 or n_points.size != reduction.size:
+        return None
+
+    max_reduction = float(reduction[-1])
+    # No measurable reduction: fall back to the full network size.
+    if max_reduction <= 0.0:
+        return int(n_points[-1])
+
+    target = float(fraction) * max_reduction
+    # Index 0 is the zero-well baseline; search from the first selected well.
+    for i in range(1, reduction.size):
+        if reduction[i] >= target:
+            return int(n_points[i])
+    return int(n_points[-1])
+
+
+def _greedy_kalman_selection_order(
+    param_states,
+    param_weights,
+    pesos_norm,
+    well_weights,
+    mode='max',
+    progress_callback=None,
+    progress_start=0.05,
+    progress_end=0.50,
+    progress_message='selecting',
+):
+    """
+    Phase-1 greedy well ordering from Kalman candidate scores.
+
+    score(k) = well_weight[k] * sum_p(w_p * reduction_p(k))
+
+    Args:
+        mode: ``'max'`` picks largest score first (priority order).
+            ``'min'`` picks smallest score first (adverse order).
+        progress_callback: Optional ``callable(fraction, message, **kwargs)``.
+        progress_start / progress_end: Fraction range for this phase.
+
+    Tie-break: when scores are equal, the first candidate in the current
+    ``disponibles`` iteration order wins (stable, same as the original
+    max-greedy loop that used strict ``>`` / ``<`` comparisons).
+
+    Returns:
+        List of well indices in selection order.
+    """
+    n_candidates = param_states[0]['C_cc'].shape[0] if param_states else 0
+    selected = []
+    disponibles = list(range(n_candidates))
+    minimize = mode == 'min'
+
+    for step in range(len(disponibles)):
+        best_idx = None
+        best_score = np.inf if minimize else -np.inf
+
+        for k in disponibles:
+            combined_reduction = 0.0
+            for weight, state in zip(param_weights, param_states):
+                combined_reduction += weight * _kalman_candidate_reduction(
+                    k, state, pesos_norm
+                )
+            well_factor = well_weights[k] if well_weights is not None else 1.0
+            score = well_factor * combined_reduction
+            # Strict inequality keeps the first equal score (tie-break).
+            if minimize:
+                if score < best_score:
+                    best_score = score
+                    best_idx = k
+            elif score > best_score:
+                best_score = score
+                best_idx = k
+
+        # Same residual threshold as the original max-greedy: once no
+        # meaningful reduction remains, append leftover wells as-is.
+        if best_idx is not None and best_score > 1e-15:
+            for state in param_states:
+                _kalman_rank1_update(best_idx, state)
+            selected.append(best_idx)
+            disponibles.remove(best_idx)
+        else:
+            selected.extend(disponibles)
+            break
+
+        if progress_callback is not None and n_candidates > 0:
+            fraction = progress_start + (
+                (progress_end - progress_start) * (step + 1) / n_candidates
+            )
+            progress_callback(
+                fraction,
+                progress_message,
+                current=step + 1,
+                total=n_candidates,
+            )
+
+    return selected
+
+
+def _ok_variance_curve_along_order(
+    selected,
+    well_coordinates,
+    grid_coordinates,
+    parameters,
+    param_models,
+    param_weights,
+    grid_weights,
+    n_grid,
+    progress_callback=None,
+    progress_start=0.50,
+    progress_end=1.0,
+    progress_message='evaluating',
+):
+    """
+    Phase-2 OK total-variance curve along a fixed well order.
+
+    Returns:
+        dict with n_points, normalized_variances, variance_reduction,
+        total_variance_percent.
+    """
+    num_puntos = [0]
+    varianzas = [float(n_grid)]
+    indices_acumulados = []
+    n_selected = len(selected)
+
+    for step, idx in enumerate(selected):
+        indices_acumulados.append(idx)
+        sel_coords = well_coordinates[indices_acumulados]
+        step_vars = []
+        for param, model in zip(parameters, param_models):
+            sel_vals = np.asarray(param.values, dtype=float)[indices_acumulados]
+            var_ok = _mean_simple_kriging_variance(
+                sel_coords,
+                sel_vals,
+                grid_coordinates,
+                model,
+                grid_weights=grid_weights,
+            )
+            step_vars.append(var_ok)
+        varianzas.append(float(np.dot(param_weights, step_vars)))
+        num_puntos.append(len(indices_acumulados))
+
+        if progress_callback is not None and n_selected > 0:
+            fraction = progress_start + (
+                (progress_end - progress_start) * (step + 1) / n_selected
+            )
+            progress_callback(
+                fraction,
+                progress_message,
+                current=step + 1,
+                total=n_selected,
+            )
+
+    varianzas = np.asarray(varianzas, dtype=float)
+    num_puntos = np.asarray(num_puntos, dtype=int)
+    var_inicial = varianzas[0]
+    if var_inicial > 0:
+        variance_reduction = (1.0 - varianzas / var_inicial) * 100.0
+    else:
+        variance_reduction = np.zeros_like(varianzas)
+
+    return {
+        'n_points': num_puntos,
+        'normalized_variances': varianzas,
+        'variance_reduction': variance_reduction,
+        'total_variance_percent': compute_total_variance_percent(varianzas),
+    }
+
+
 def compute_variance_reduction_curve(optimization_input, progress_callback=None):
     """
     Greedy Kalman well prioritization with an ordinary-kriging variance curve.
@@ -760,8 +1081,10 @@ def compute_variance_reduction_curve(optimization_input, progress_callback=None)
         score(k) = well_weight[k] * sum_p( w_p * reduction_p(k) )
         where reduction_p(k) is the weighted grid variance drop if well k is
         assimilated for parameter p, and w_p are tab-2 weights (normalized).
+        Priority order uses max score; adverse order uses min score (least
+        reduction first) on a fresh covariance state.
 
-    Phase 2 — variance-reduction curve along the selected order:
+    Phase 2 — variance-reduction curve along each selected order:
         At step t, V(t) = sum_p( w_p * OK_variance_p(t) )
         Baseline V(0) = n_grid nodes (geostat_app_kalman_v10 convention).
 
@@ -772,9 +1095,9 @@ def compute_variance_reduction_curve(optimization_input, progress_callback=None)
             ``message`` identifies the phase (e.g. ``"selecting"``).
 
     Returns:
-        dict with n_points, normalized_variances, variance_reduction (%),
-        total_variance_percent (remaining variance on a 0–100 scale),
-        selection_order, grid_node_count, combined_mode, parameters,
+        dict with priority curve keys (n_points, normalized_variances,
+        variance_reduction, total_variance_percent, selection_order) plus
+        adverse_* counterparts, grid_node_count, combined_mode, parameters,
         parameter_weights; or None if inputs are insufficient.
     """
     def emit_progress(fraction, message="", **kwargs):
@@ -826,109 +1149,96 @@ def compute_variance_reduction_curve(optimization_input, progress_callback=None)
         param_weights = raw_weights / np.sum(raw_weights)
 
     # One Kalman covariance state per parameter (same wells, different variograms).
-    param_states = []
     param_models = []
     for param in parameters:
-        model = build_covariance_model(
-            param.model_type,
-            param.nugget,
-            param.sill,
-            param.range_val,
+        param_models.append(
+            build_covariance_model(
+                param.model_type,
+                param.nugget,
+                param.sill,
+                param.range_val,
+            )
         )
-        param_models.append(model)
-        param_states.append(
+
+    def fresh_param_states():
+        return [
             _init_kalman_covariance_state(
                 well_coordinates, grid_coordinates, model
             )
-        )
+            for model in param_models
+        ]
 
     emit_progress(0.05, "preparing")
 
-    selected = []
-    disponibles = list(range(n_candidates))
+    # Phase 1a: priority order (largest variance reduction first).
+    selected = _greedy_kalman_selection_order(
+        fresh_param_states(),
+        param_weights,
+        pesos_norm,
+        well_weights,
+        mode='max',
+        progress_callback=emit_progress,
+        progress_start=0.05,
+        progress_end=0.275,
+        progress_message='selecting',
+    )
 
-    # Phase 1: greedily pick the well with highest combined variance reduction.
-    for step in range(len(disponibles)):
-        best_idx = None
-        best_score = -np.inf
+    # Phase 1b: adverse order (smallest variance reduction first).
+    adverse_selected = _greedy_kalman_selection_order(
+        fresh_param_states(),
+        param_weights,
+        pesos_norm,
+        well_weights,
+        mode='min',
+        progress_callback=emit_progress,
+        progress_start=0.275,
+        progress_end=0.50,
+        progress_message='selecting_adverse',
+    )
 
-        for k in disponibles:
-            combined_reduction = 0.0
-            for weight, state in zip(param_weights, param_states):
-                combined_reduction += weight * _kalman_candidate_reduction(
-                    k, state, pesos_norm
-                )
-            well_factor = well_weights[k] if well_weights is not None else 1.0
-            score = well_factor * combined_reduction
-            if score > best_score:
-                best_score = score
-                best_idx = k
-
-        if best_idx is not None and best_score > 1e-15:
-            for state in param_states:
-                _kalman_rank1_update(best_idx, state)
-            selected.append(best_idx)
-            disponibles.remove(best_idx)
-        else:
-            selected.extend(disponibles)
-            break
-
-        phase1_fraction = 0.05 + 0.45 * (step + 1) / n_candidates
-        emit_progress(
-            phase1_fraction,
-            "selecting",
-            current=step + 1,
-            total=n_candidates,
-        )
-
-    # Phase 2: evaluate weighted OK variance along the fixed selection order.
-    num_puntos = [0]
-    varianzas = [float(n_grid)]
-
-    indices_acumulados = []
-    n_selected = len(selected)
-    for step, idx in enumerate(selected):
-        indices_acumulados.append(idx)
-        sel_coords = well_coordinates[indices_acumulados]
-        step_vars = []
-        for param, model in zip(parameters, param_models):
-            sel_vals = np.asarray(param.values, dtype=float)[indices_acumulados]
-            var_ok = _mean_simple_kriging_variance(
-                sel_coords,
-                sel_vals,
-                grid_coordinates,
-                model,
-                grid_weights=grid_weights,
-            )
-            step_vars.append(var_ok)
-        varianzas.append(float(np.dot(param_weights, step_vars)))
-        num_puntos.append(len(indices_acumulados))
-
-        if n_selected > 0:
-            phase2_fraction = 0.50 + 0.50 * (step + 1) / n_selected
-            emit_progress(
-                phase2_fraction,
-                "evaluating",
-                current=step + 1,
-                total=n_selected,
-            )
-
-    varianzas = np.asarray(varianzas, dtype=float)
-    num_puntos = np.asarray(num_puntos, dtype=int)
-    var_inicial = varianzas[0]
-    if var_inicial > 0:
-        variance_reduction = (1.0 - varianzas / var_inicial) * 100.0
-    else:
-        variance_reduction = np.zeros_like(varianzas)
+    # Phase 2: OK variance curves along both fixed orders.
+    priority_curve = _ok_variance_curve_along_order(
+        selected,
+        well_coordinates,
+        grid_coordinates,
+        parameters,
+        param_models,
+        param_weights,
+        grid_weights,
+        n_grid,
+        progress_callback=emit_progress,
+        progress_start=0.50,
+        progress_end=0.75,
+        progress_message='evaluating',
+    )
+    adverse_curve = _ok_variance_curve_along_order(
+        adverse_selected,
+        well_coordinates,
+        grid_coordinates,
+        parameters,
+        param_models,
+        param_weights,
+        grid_weights,
+        n_grid,
+        progress_callback=emit_progress,
+        progress_start=0.75,
+        progress_end=1.0,
+        progress_message='evaluating_adverse',
+    )
 
     combined_mode = len(parameters) > 1
     emit_progress(1.0, "complete")
     return {
-        'n_points': num_puntos,
-        'normalized_variances': varianzas,
-        'variance_reduction': variance_reduction,
-        'total_variance_percent': compute_total_variance_percent(varianzas),
+        'n_points': priority_curve['n_points'],
+        'normalized_variances': priority_curve['normalized_variances'],
+        'variance_reduction': priority_curve['variance_reduction'],
+        'total_variance_percent': priority_curve['total_variance_percent'],
         'selection_order': np.asarray(selected, dtype=int),
+        'adverse_n_points': adverse_curve['n_points'],
+        'adverse_normalized_variances': adverse_curve['normalized_variances'],
+        'adverse_variance_reduction': adverse_curve['variance_reduction'],
+        'adverse_total_variance_percent': adverse_curve['total_variance_percent'],
+        'adverse_selection_order': np.asarray(adverse_selected, dtype=int),
         'grid_node_count': int(n_grid),
         'combined_mode': combined_mode,
         'parameters': [param.name for param in parameters],
@@ -947,19 +1257,29 @@ def ordinary_kriging_interpolation(
     nugget,
     sill,
     range_val,
+    return_std_error=False,
 ):
     """
     Ordinary-kriging estimates at grid nodes using the fitted variogram model.
 
+    Args:
+        return_std_error: When True, also return kriging standard error at each
+            grid node: ``sqrt(max(kriging_variance, 0))`` from gstools
+            ``return_var=True`` (same source as leave-one-out CV SE).
+
     Returns:
-        1-D array of estimated values at each grid point, or None on failure.
+        If ``return_std_error`` is False: 1-D estimates array, or None on failure.
+        If True: ``(estimates, std_error)``, or ``(None, None)`` on failure.
     """
+    def _fail():
+        return (None, None) if return_std_error else None
+
     well_coordinates = np.asarray(well_coordinates, dtype=float)
     well_values = np.asarray(well_values, dtype=float).ravel()
     grid_coordinates = np.asarray(grid_coordinates, dtype=float)
 
     if well_values.size < 1 or grid_coordinates.shape[0] < 1:
-        return None
+        return _fail()
 
     model = build_covariance_model(model_type, nugget, sill, range_val)
     cx = well_coordinates[:, 0]
@@ -972,16 +1292,30 @@ def ordinary_kriging_interpolation(
         cond_pos=(cx, cy),
         cond_val=well_values,
     )
-    result = krige((gx, gy))
     n_grid = grid_coordinates.shape[0]
 
-    # Prefer the field stored on the krige object after evaluation
-    if hasattr(krige, 'field') and krige.field is not None:
-        estimates = np.asarray(krige.field, dtype=float)
-    elif isinstance(result, tuple):
-        estimates = np.asarray(result[0], dtype=float)
+    # Request kriging variance when SE is needed; otherwise keep the lighter call.
+    if return_std_error:
+        result = krige((gx, gy), return_var=True)
+        if isinstance(result, tuple) and len(result) >= 2:
+            estimates = np.asarray(result[0], dtype=float)
+            kriging_var = np.asarray(result[1], dtype=float)
+        else:
+            estimates = np.asarray(result, dtype=float)
+            kriging_var = (
+                np.asarray(krige.krige_var, dtype=float)
+                if hasattr(krige, 'krige_var') and krige.krige_var is not None
+                else None
+            )
     else:
-        estimates = np.asarray(result, dtype=float)
+        result = krige((gx, gy))
+        kriging_var = None
+        if hasattr(krige, 'field') and krige.field is not None:
+            estimates = np.asarray(krige.field, dtype=float)
+        elif isinstance(result, tuple):
+            estimates = np.asarray(result[0], dtype=float)
+        else:
+            estimates = np.asarray(result, dtype=float)
 
     estimates = np.asarray(estimates, dtype=float).ravel()
     if estimates.size != n_grid and estimates.size > n_grid:
@@ -989,9 +1323,23 @@ def ordinary_kriging_interpolation(
         estimates = estimates[:n_grid]
 
     if estimates.size != n_grid:
-        return None
+        return _fail()
 
-    return estimates
+    if not return_std_error:
+        return estimates
+
+    if kriging_var is None:
+        return _fail()
+
+    kriging_var = np.asarray(kriging_var, dtype=float).ravel()
+    if kriging_var.size != n_grid and kriging_var.size > n_grid:
+        kriging_var = kriging_var[:n_grid]
+    if kriging_var.size != n_grid:
+        return _fail()
+
+    # Standard error is the square root of (non-negative) kriging variance.
+    std_error = np.sqrt(np.maximum(kriging_var, 0.0))
+    return estimates, std_error
 
 
 def _excel_cell_value(value):
