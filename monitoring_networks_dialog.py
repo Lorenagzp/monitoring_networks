@@ -126,14 +126,13 @@ VARIOGRAM_MODEL_TYPES = [
     'spherical', 'exponential', 'gaussian', 'stable', 'matern',
 ]
 
-CV_SUMMARY_KEYS = ('min', 'max', 'mean', 'mae', 'mse', 'rmse')
+CV_SUMMARY_KEYS = ('min', 'max', 'mean', 'mae', 'rmse')
 
 CV_SUMMARY_FORMATS = {
     'min': '{:.3f}',
     'max': '{:.3f}',
     'mean': '{:.3f}',
     'mae': '{:.3f}',
-    'mse': '{:.3f}',
     'rmse': '{:.3f}',
 }
 
@@ -228,7 +227,6 @@ def cv_summary_header_labels(context_name):
         QCoreApplication.translate(context_name, "Max error"),
         QCoreApplication.translate(context_name, "Mean error"),
         QCoreApplication.translate(context_name, "MAE"),
-        QCoreApplication.translate(context_name, "MSE"),
         QCoreApplication.translate(context_name, "RMSE"),
     ]
 
@@ -301,7 +299,12 @@ class MonitoringNetworksDialog(QDialog):
         # Well marker PathCollections on Tab 5 maps, keyed by canvas id.
         self._ok_map_well_scatters = {}
         self._syncing_variogram = False
-        self._syncing_stats_table = False
+        # Nested guard for programmatic stats_table updates (combos/weights).
+        self._stats_table_sync_depth = 0
+        # When True, batch auto-fit only writes the store (no CV / table refresh).
+        self._batch_fitting_variograms = False
+        # Suppress nested auto_fit progress messages during multi-parameter runs.
+        self._suppress_variogram_progress = False
         # Tab 2 active parameter for plots/variogram (row selection in stats_table).
         self._active_analysis_attribute = None
         self.init_ui()
@@ -585,15 +588,22 @@ class MonitoringNetworksDialog(QDialog):
         # Histogram plot
         PLOT_HEIGHT = 250
         plots_layout = QHBoxLayout()
-        self.stats_hist_figure = Figure(figsize=(4, 3))
+        # constrained_layout recomputes margins on every draw/resize so the
+        # title and axis labels never get clipped when the canvas shrinks.
+        self.stats_hist_figure = Figure(
+            figsize=(4, 3), constrained_layout=True
+        )
         self.stats_hist_canvas = FigureCanvas(self.stats_hist_figure)
         self.stats_hist_canvas.setMinimumHeight(PLOT_HEIGHT)
         self.stats_hist_ax = self.stats_hist_figure.add_subplot(111)
         plots_layout.addWidget(self.stats_hist_canvas) 
 
         # Spatial distribution plot
-        self.stats_map_figure = Figure(figsize=(4, 3))
+        self.stats_map_figure = Figure(
+            figsize=(4, 3), constrained_layout=True
+        )
         self.stats_map_canvas = FigureCanvas(self.stats_map_figure)
+        self.stats_map_canvas.setMinimumHeight(PLOT_HEIGHT)
         self.stats_map_ax = self.stats_map_figure.add_subplot(111)
         plots_layout.addWidget(self.stats_map_canvas)
         stats_layout.addLayout(plots_layout)
@@ -617,6 +627,18 @@ class MonitoringNetworksDialog(QDialog):
             QCoreApplication.translate("Tab 2", "Range"),
             QCoreApplication.translate("Tab 2", "R²"),
         ])
+        range_header = self.var_params_table.horizontalHeaderItem(VAR_COL_RANGE)
+        if range_header is not None:
+            range_header.setToolTip(
+                QCoreApplication.translate(
+                    "Tab 2",
+                    "Range shown is GSTools length scale (len_scale). It is not necessarily the"
+                    "practical range. \nFor Spherical len_scale = practical range\n"
+                    "For Exponential ≈ 3×len_scale\n"
+                    "Gaussian ≈ √3×len_scale\n"
+                    "For Matérn/Stable it depends on the shape parameter.",
+                )
+            )
         #self.var_params_table.setFixedHeight(126)
         # Connect table changes to update the variogram
         self.var_params_table.itemChanged.connect(self.on_params_table_changed)
@@ -691,7 +713,9 @@ class MonitoringNetworksDialog(QDialog):
         self.cv_info_label.setStyleSheet("color: gray; font-style: italic;")
         cv_layout.addWidget(self.cv_info_label)
 
-        self.cv_figure = Figure(figsize=(6, 4))
+        # Recompute margins on every draw and resize so the complete title and
+        # both axis labels remain visible at narrower dialog sizes.
+        self.cv_figure = Figure(figsize=(6, 4), constrained_layout=True)
         self.cv_canvas = FigureCanvas(self.cv_figure)
         self.cv_canvas.setMinimumHeight(PLOT_HEIGHT)
         self.cv_ax = self.cv_figure.add_subplot(111)
@@ -1664,13 +1688,40 @@ class MonitoringNetworksDialog(QDialog):
         )
         self.cv_info_label.setStyleSheet("color: gray; font-style: italic;")
 
-    def _refresh_tab5_views_after_variogram_change(self, attr_name):
-        """Refresh tab 5 maps/CV when variogram inputs change for that parameter."""
-        if attr_name not in getattr(self, 'variance_results', {}):
+    def _invalidate_optimization_after_variogram_change(self, attr_name=None):
+        """
+        Clear Tab 4 optimization results when a variogram changes.
+
+        Well ranking and variance reduction depend on the covariance model
+        (nugget, sill, range, type) and on the transformed values. After a
+        manual parameter edit or a transform change those results are stale
+        and must not remain visible on tabs 4–5.
+
+        Args:
+            attr_name: Parameter whose variogram changed. Also drops the
+                combined-parameter optimization. ``None`` clears all results
+                (e.g. after re-fitting every variogram from Tab 1).
+        """
+        if not hasattr(self, 'variance_results'):
             return
-        if attr_name != self._tab5_reference_parameter():
-            return
-        self._refresh_ok_interpolation_plot()
+
+        if attr_name is None:
+            self.variance_results.clear()
+        else:
+            self.variance_results.pop(attr_name, None)
+            # Combined mode mixes every selected parameter's variogram.
+            self.variance_results.pop(MN_COMBINED_PARAMETERS_KEY, None)
+
+        current = self._current_mn_parameter()
+        if current is None or current not in self.variance_results:
+            self._clear_variance_reduction_plot()
+            self._update_results_well_spinbox()
+            self._clear_ok_interpolation_plots(
+                QCoreApplication.translate(
+                    "Tab 5",
+                    "Variogram changed. Run Optimize on tab 4 again.",
+                )
+            )
 
     def _get_ok_interpolation_context(self):
         """
@@ -3146,6 +3197,8 @@ class MonitoringNetworksDialog(QDialog):
 
     def _set_variogram_progress(self, percent=None, status_message=None):
         """Tab 2 compatibility: write variogram status to the shared bar."""
+        if getattr(self, '_suppress_variogram_progress', False):
+            return
         message = None
         if status_message is not None:
             message = QCoreApplication.translate("Tab 2", status_message)
@@ -4553,6 +4606,18 @@ class MonitoringNetworksDialog(QDialog):
         """
         return self._calculate_all_attribute_statistics(force_reextract=True)
 
+    def _begin_stats_table_sync(self):
+        """Enter a nested programmatic update of stats_table widgets."""
+        self._stats_table_sync_depth += 1
+
+    def _end_stats_table_sync(self):
+        """Leave one nested programmatic update of stats_table widgets."""
+        self._stats_table_sync_depth = max(0, self._stats_table_sync_depth - 1)
+
+    def _is_syncing_stats_table(self):
+        """True while any nested stats_table sync block is active."""
+        return self._stats_table_sync_depth > 0
+
     def _get_attribute_log_transform(self, attr_name):
         """Per-parameter log transform stored in variogram state."""
         state = self._get_variogram_state(attr_name)
@@ -4560,8 +4625,13 @@ class MonitoringNetworksDialog(QDialog):
             return bool(state.get('log_transform', False))
         return False
 
-    def _create_stats_transform_combo(self, attr_name, log_transform=False):
-        """Build a per-row transform combo for stats_table."""
+    def _create_stats_transform_combo(self, log_transform=False):
+        """Build a per-row transform combo for stats_table.
+
+        Identity of the parameter is resolved from the table row of ``sender()``
+        when the index changes, so reused cell widgets stay correct after
+        stats_table rebuilds.
+        """
         combo = WheelIgnoringComboBox()
         combo.addItems([
             QCoreApplication.translate("Tab 2", "None"),
@@ -4577,9 +4647,7 @@ class MonitoringNetworksDialog(QDialog):
         combo.blockSignals(True)
         combo.setCurrentIndex(1 if log_transform else 0)
         combo.blockSignals(False)
-        combo.currentIndexChanged.connect(
-            lambda _index, a=attr_name: self._on_stats_table_transform_changed(a)
-        )
+        combo.currentIndexChanged.connect(self._on_stats_transform_combo_changed)
         return combo
 
     def _set_stats_table_transform_cell(self, row, attr_name):
@@ -4587,17 +4655,17 @@ class MonitoringNetworksDialog(QDialog):
         log_transform = self._get_attribute_log_transform(attr_name)
         existing = self.stats_table.cellWidget(row, STATS_TRANSFORM_COL)
         if isinstance(existing, QComboBox):
-            self._syncing_stats_table = True
+            self._begin_stats_table_sync()
             existing.blockSignals(True)
             try:
                 existing.setCurrentIndex(1 if log_transform else 0)
             finally:
                 existing.blockSignals(False)
-                self._syncing_stats_table = False
+                self._end_stats_table_sync()
             return
         if existing is not None:
             self.stats_table.removeCellWidget(row, STATS_TRANSFORM_COL)
-        combo = self._create_stats_transform_combo(attr_name, log_transform)
+        combo = self._create_stats_transform_combo(log_transform)
         self.stats_table.setCellWidget(row, STATS_TRANSFORM_COL, combo)
 
     def _sync_stats_transform_combo(self, attr_name, log_transform):
@@ -4608,13 +4676,13 @@ class MonitoringNetworksDialog(QDialog):
         combo = self.stats_table.cellWidget(row, STATS_TRANSFORM_COL)
         if combo is None:
             return
-        self._syncing_stats_table = True
+        self._begin_stats_table_sync()
         combo.blockSignals(True)
         try:
             combo.setCurrentIndex(1 if log_transform else 0)
         finally:
             combo.blockSignals(False)
-            self._syncing_stats_table = False
+            self._end_stats_table_sync()
 
     def _recalculate_single_attribute_statistics(self, attr_name):
         """
@@ -4628,25 +4696,75 @@ class MonitoringNetworksDialog(QDialog):
         if ok:
             row = self._stats_table_row_for_attribute(attr_name)
             if row >= 0:
-                self._syncing_stats_table = True
+                self._begin_stats_table_sync()
                 self.stats_table.blockSignals(True)
                 try:
                     self._populate_stats_table_row(row, attr_name)
                     self._adjust_stats_table_height()
                 finally:
                     self.stats_table.blockSignals(False)
-                    self._syncing_stats_table = False
+                    self._end_stats_table_sync()
+            # Transform change invalidates the previous fit; re-estimate once.
+            self._fit_variogram_for_attribute(attr_name, force_reextract=True)
             if attr_name == self._current_analysis_attribute():
                 self._refresh_tab2_parameter_views(attr_name)
         return ok, error
 
-    def _on_stats_table_transform_changed(self, attr_name):
-        """Recalculate one parameter when its row transform combo changes.
-
-        Also activates that parameter for plots/variogram/CV, same as clicking
-        its name in the stats table vertical header.
+    def _stats_transform_needs_recalculation(self, attr_name, log_transform):
         """
-        if self._syncing_stats_table:
+        True when combo/store transform is out of sync with stored stats.
+
+        Recalculate when the requested transform differs from the variogram
+        store, when stats are missing, when stored stats used a different
+        transform, or when the variogram data fingerprint is stale.
+        """
+        prev_transform = self._get_attribute_log_transform(attr_name)
+        if log_transform != prev_transform:
+            return True
+
+        stored = self.stats_by_attribute.get(attr_name)
+        if not stored:
+            return True
+        if bool(stored.get('log_transform', False)) != log_transform:
+            return True
+
+        values = stored.get('values')
+        if values is None:
+            return True
+        expected_fp = self._variogram_data_fingerprint(
+            attr_name, log_transform, values
+        )
+        state = self._get_variogram_state(attr_name) or {}
+        if state.get('data_fingerprint') != expected_fp:
+            return True
+        return False
+
+    def _on_stats_transform_combo_changed(self, _index=None):
+        """
+        Recalculate one parameter when its row transform combo changes.
+
+        Resolves the parameter from the table row that owns ``sender()`` so
+        reused combo widgets never apply the change to the wrong attribute.
+        Also activates that parameter for plots/variogram/CV.
+        """
+        if self._is_syncing_stats_table():
+            return
+
+        combo = self.sender()
+        if not isinstance(combo, QComboBox):
+            return
+
+        row = -1
+        for candidate_row in range(self.stats_table.rowCount()):
+            if (
+                self.stats_table.cellWidget(
+                    candidate_row, STATS_TRANSFORM_COL
+                )
+                is combo
+            ):
+                row = candidate_row
+                break
+        if row < 0:
             return
 
         layer = self.input_data_layer.currentLayer()
@@ -4654,21 +4772,17 @@ class MonitoringNetworksDialog(QDialog):
             return
 
         parameters = self._selected_analysis_parameters()
-        if attr_name not in parameters:
+        if row >= len(parameters):
             return
-
-        row = self._stats_table_row_for_attribute(attr_name)
-        if row < 0:
-            return
-
-        combo = self.stats_table.cellWidget(row, STATS_TRANSFORM_COL)
-        if combo is None:
-            return
+        attr_name = parameters[row]
 
         log_transform = combo.currentIndex() == 1
-        prev_transform = self._get_attribute_log_transform(attr_name)
-        if log_transform == prev_transform:
+        if not self._stats_transform_needs_recalculation(
+            attr_name, log_transform
+        ):
             return
+
+        prev_transform = self._get_attribute_log_transform(attr_name)
 
         # Selecting the transformed parameter drives histogram, map, variogram, CV.
         self._active_analysis_attribute = attr_name
@@ -4757,11 +4871,11 @@ class MonitoringNetworksDialog(QDialog):
 
     def _revert_stats_table_weight_cell(self, row, attr_name):
         """Restore the weight cell from stored state after invalid input."""
-        self._syncing_stats_table = True
+        self._begin_stats_table_sync()
         try:
             self._set_stats_table_weight_cell(row, attr_name)
         finally:
-            self._syncing_stats_table = False
+            self._end_stats_table_sync()
 
     def _on_stats_table_weight_changed(self, item):
         """
@@ -4769,7 +4883,7 @@ class MonitoringNetworksDialog(QDialog):
 
         itemChanged does not fire on every keystroke while typing.
         """
-        if self._syncing_stats_table or item.column() != STATS_COL_WEIGHT:
+        if self._is_syncing_stats_table() or item.column() != STATS_COL_WEIGHT:
             return
 
         row = item.row()
@@ -4792,11 +4906,11 @@ class MonitoringNetworksDialog(QDialog):
         state['weight'] = weight
         self._set_variogram_state(attr_name, state)
 
-        self._syncing_stats_table = True
+        self._begin_stats_table_sync()
         try:
             item.setText(self._format_parameter_weight(weight))
         finally:
-            self._syncing_stats_table = False
+            self._end_stats_table_sync()
 
     def _stats_table_row_for_attribute(self, attr_name):
         parameters = self._selected_analysis_parameters()
@@ -5015,7 +5129,13 @@ class MonitoringNetworksDialog(QDialog):
     def _compute_and_store_attribute_statistics(
         self, attr_name, force_reextract=False
     ):
-        """Compute descriptive stats and variogram state for one parameter."""
+        """
+        Compute and store descriptive statistics for one parameter.
+
+        Variogram fitting is intentionally separate (see
+        ``_fit_variogram_for_attribute``) so Tab 1 can batch-fit all
+        parameters once, and Tab 2 row clicks can reuse stored models.
+        """
         layer = self.input_data_layer.currentLayer()
         if not layer:
             return False, QCoreApplication.translate("Tab 2", "No layer selected.")
@@ -5082,19 +5202,60 @@ class MonitoringNetworksDialog(QDialog):
             synced_state['weight'] = self._equal_parameter_weight()
         self._set_variogram_state(attr_name, synced_state)
 
-        self._update_variogram_from_statistics(
-            coordinates,
-            transformed,
-            attr_name,
-            log_transform,
-            force_reextract,
-        )
-        self._refresh_tab2_cross_validation(attr_name)
         return True, None
+
+    def _fit_variogram_for_attribute(self, attr_name, force_reextract=True):
+        """
+        Estimate and store the variogram model for one parameter.
+
+        Uses values already held in ``stats_by_attribute``. When
+        ``force_reextract`` is True, always auto-fits; otherwise restores the
+        stored model when the data fingerprint still matches.
+        """
+        stored = self.stats_by_attribute.get(attr_name)
+        if not stored:
+            return False
+        self._update_variogram_from_statistics(
+            stored['coordinates'],
+            stored['values'],
+            attr_name,
+            stored.get('log_transform', False),
+            force_reextract=force_reextract,
+        )
+        return True
+
+    def _display_stored_variogram(self, attr_name):
+        """
+        Load the active parameter into the variogram widget without re-fitting.
+
+        Used when the user selects a row in the Tab 2 stats table so switching
+        parameters only redraws the already-estimated model from the store.
+        """
+        if not hasattr(self, 'variogram_widget'):
+            return
+        stored = self.stats_by_attribute.get(attr_name)
+        if not stored:
+            self.variogram_widget.clear()
+            return
+
+        log_transform = stored.get('log_transform', False)
+        self.variogram_widget.set_data(
+            stored['coordinates'],
+            stored['values'],
+            attr_name,
+            log_transform=log_transform,
+            auto_fit=False,
+        )
+        if self._get_variogram_state(attr_name):
+            self._apply_store_to_widget(attr_name)
 
     def _calculate_all_attribute_statistics(self, force_reextract=False):
         """
-        Calculate statistics for every Tab-1 selected parameter.
+        Calculate statistics and estimate variograms for every Tab-1 parameter.
+
+        Phase 1 stores descriptive statistics. Phase 2 auto-fits a variogram
+        for each successful parameter (progress reported per parameter). Tab 2
+        row selection then only displays the stored models.
 
         Returns:
             bool: True if at least one parameter succeeded; False otherwise.
@@ -5118,13 +5279,15 @@ class MonitoringNetworksDialog(QDialog):
 
             success_count = 0
             error_messages = []
+            # Phase 1: descriptive statistics for every selected parameter.
             for index, attr_name in enumerate(parameters):
-                percent = int(round((index / max(n_params, 1)) * 90))
+                percent = int(round((index / max(n_params, 1)) * 40))
                 self._set_progress(
                     percent,
                     QCoreApplication.translate(
                         "Tab 1",
-                        "State: Calculating «{param}» ({current}/{total})...",
+                        "State: Calculating statistics for «{param}» "
+                        "({current}/{total})...",
                     ).format(
                         param=attr_name,
                         current=index + 1,
@@ -5143,6 +5306,40 @@ class MonitoringNetworksDialog(QDialog):
                         ).format(param=attr_name, error=error)
                     )
 
+            # Phase 2: auto-fit variograms for parameters with valid stats.
+            fitted_names = [
+                name for name in parameters if name in self.stats_by_attribute
+            ]
+            n_fit = len(fitted_names)
+            self._batch_fitting_variograms = True
+            self._suppress_variogram_progress = True
+            try:
+                for index, attr_name in enumerate(fitted_names):
+                    percent = 40 + int(
+                        round((index / max(n_fit, 1)) * 55)
+                    )
+                    self._set_progress(
+                        percent,
+                        QCoreApplication.translate(
+                            "Tab 1",
+                            "State: Estimating variogram for «{param}» "
+                            "({current}/{total})...",
+                        ).format(
+                            param=attr_name,
+                            current=index + 1,
+                            total=n_fit,
+                        ),
+                    )
+                    self._fit_variogram_for_attribute(
+                        attr_name, force_reextract=True
+                    )
+            finally:
+                self._batch_fitting_variograms = False
+                self._suppress_variogram_progress = False
+
+            # Re-fitted models invalidate any previous Tab 4 optimization.
+            self._invalidate_optimization_after_variogram_change(None)
+
             self._set_progress(
                 95,
                 QCoreApplication.translate(
@@ -5156,8 +5353,9 @@ class MonitoringNetworksDialog(QDialog):
                 self.stats_info_label.setText(
                     QCoreApplication.translate(
                         "Tab 2",
-                        "Statistics calculated for {n} parameter(s). "
-                        "Use Parameter below to inspect plots and variograms.",
+                        "Statistics and variograms calculated for {n} "
+                        "parameter(s). Click a parameter name to inspect "
+                        "plots and the stored variogram.",
                     ).format(n=success_count)
                 )
                 self.stats_info_label.setStyleSheet(
@@ -5187,6 +5385,8 @@ class MonitoringNetworksDialog(QDialog):
                 )
             return success_count > 0
         except Exception:
+            self._batch_fitting_variograms = False
+            self._suppress_variogram_progress = False
             self._reset_progress(
                 QCoreApplication.translate("Tab 1", "State: Error")
             )
@@ -5222,7 +5422,12 @@ class MonitoringNetworksDialog(QDialog):
         self.stats_info_label.setStyleSheet("color: gray; font-style: italic;")
 
     def _refresh_tab2_parameter_views(self, attr_name):
-        """Refresh plots, variogram and CV for one parameter without recomputing stats."""
+        """
+        Refresh plots, stored variogram and CV for one parameter.
+
+        Does not re-estimate the variogram: models are fitted when leaving
+        Tab 1 (or when the transform changes). Row clicks only switch views.
+        """
         if not attr_name:
             self._clear_stats_plots()
             self._clear_cross_validation()
@@ -5237,14 +5442,7 @@ class MonitoringNetworksDialog(QDialog):
         self._update_stats_plots(
             stored['coordinates'], stored['values'], attr_name
         )
-        log_transform = stored.get('log_transform', False)
-        self._update_variogram_from_statistics(
-            stored['coordinates'],
-            stored['values'],
-            attr_name,
-            log_transform,
-            force_reextract=False,
-        )
+        self._display_stored_variogram(attr_name)
         self._refresh_tab2_cross_validation(attr_name)
         self._set_stats_view_info_label(attr_name, stored)
         self._sync_var_params_table_from_store()
@@ -5357,7 +5555,7 @@ class MonitoringNetworksDialog(QDialog):
         parameters = self._selected_analysis_parameters()
         if not parameters:
             return
-        self._syncing_stats_table = True
+        self._begin_stats_table_sync()
         self.stats_table.blockSignals(True)
         try:
             for row, attr_name in enumerate(parameters):
@@ -5365,7 +5563,7 @@ class MonitoringNetworksDialog(QDialog):
             self.stats_table.resizeColumnsToContents()
         finally:
             self.stats_table.blockSignals(False)
-            self._syncing_stats_table = False
+            self._end_stats_table_sync()
         self._adjust_stats_table_height()
         self._highlight_active_stats_row()
 
@@ -5419,7 +5617,7 @@ class MonitoringNetworksDialog(QDialog):
         # Model type is already in the store; auto_fit reads it and writes R² back.
         self.variogram_widget.auto_fit()
         self._refresh_tab2_cross_validation(attribute)
-        self._refresh_tab5_views_after_variogram_change(attribute)
+        self._invalidate_optimization_after_variogram_change(attribute)
 
     def _get_coordinates_and_transformed_values_for_analysis(self):
         """
@@ -5541,15 +5739,17 @@ class MonitoringNetworksDialog(QDialog):
         """Save fitted/adjusted widget parameters and sync the params table."""
         if self._syncing_variogram:
             return
-        attr = self._current_analysis_attribute()
+
+        # Prefer the attribute loaded in the widget so batch fitting from Tab 1
+        # stores each fit under the correct parameter, not only the active one.
+        widget_data = getattr(self.variogram_widget, 'current_data', None) or {}
+        attr = widget_data.get('attribute') or self._current_analysis_attribute()
         if not attr:
             return
 
         log_transform = self._get_attribute_log_transform(attr)
         existing = self._get_variogram_state(attr) or {}
-        values = None
-        if self.variogram_widget.current_data:
-            values = self.variogram_widget.current_data.get('values')
+        values = widget_data.get('values')
 
         fingerprint = existing.get('data_fingerprint')
         if values is not None:
@@ -5568,9 +5768,16 @@ class MonitoringNetworksDialog(QDialog):
             'data_fingerprint': fingerprint,
         }
         self._set_variogram_state(attr, state)
+
+        # During Next-from-Tab-1 batch fitting, only persist the store; views
+        # and CV are refreshed once after all parameters are processed.
+        if getattr(self, '_batch_fitting_variograms', False):
+            return
+
         self._sync_var_params_table_from_store()
         self._refresh_tab2_cross_validation(attr)
-        self._refresh_tab5_views_after_variogram_change(attr)
+        # Auto-fit / widget edits change the covariance model used by Optimize.
+        self._invalidate_optimization_after_variogram_change(attr)
 
     def _update_store_from_table_cell(self, attr_name, col, text):
         """Update variogram_models_by_attribute from an edited table cell."""
@@ -5586,7 +5793,7 @@ class MonitoringNetworksDialog(QDialog):
         self._set_variogram_state(attr_name, state)
 
     def on_params_table_changed(self, item):
-        """Sync manual table edits back to store, plot, and lag-bin R²."""
+        """Sync manual table edits back to store, plot, and experimental-theoretical R²."""
         if self._syncing_variogram:
             return
 
@@ -5628,7 +5835,7 @@ class MonitoringNetworksDialog(QDialog):
                 if col in (VAR_COL_NUGGET, VAR_COL_SILL, VAR_COL_RANGE):
                     self._refresh_tab2_cross_validation(attribute)
             if col in (VAR_COL_NUGGET, VAR_COL_SILL, VAR_COL_RANGE):
-                self._refresh_tab5_views_after_variogram_change(attribute)
+                self._invalidate_optimization_after_variogram_change(attribute)
         except (ValueError, TypeError):
             pass
         finally:
@@ -5754,7 +5961,7 @@ class MonitoringNetworksDialog(QDialog):
             color='#4a90d9',
             edgecolors='k',
             linewidths=0.5,
-            label=QCoreApplication.translate("Tab 2", "Points"),
+            label=QCoreApplication.translate("Tab 2", "Parameter values"),
         )
 
         if measured.size > 0:
@@ -5785,7 +5992,6 @@ class MonitoringNetworksDialog(QDialog):
         )
         ax.grid(True, alpha=0.3)
         ax.legend(loc='upper left', fontsize=8)
-        self.cv_figure.tight_layout()
         self.cv_canvas.draw()
 
     def _reset_stats_map_axes(self):
@@ -5866,7 +6072,6 @@ class MonitoringNetworksDialog(QDialog):
         )
         ax.set_xlabel(QCoreApplication.translate("Tab 2", "Value"))
         ax.set_ylabel(QCoreApplication.translate("Tab 2", "Frequency"))
-        self.stats_hist_figure.tight_layout()
         self.stats_hist_canvas.draw()
 
         self._reset_stats_map_axes()
@@ -5887,7 +6092,6 @@ class MonitoringNetworksDialog(QDialog):
         )
         self.stats_map_ax.set_xlabel(QCoreApplication.translate("Tab 2", "X"))
         self.stats_map_ax.set_ylabel(QCoreApplication.translate("Tab 2", "Y"))
-        self.stats_map_figure.tight_layout()
         self.stats_map_canvas.draw()
 
     def _populate_stats_table(self, stats_dict):
@@ -6735,7 +6939,7 @@ class VariogramWidget(QWidget):
 
     def _experimental_variogram(self):
         """
-        Experimental lag bins shared by auto-fit, plot, and lag-bin R².
+        Experimental lag bins shared by auto-fit, plot, and experimental-theoretical R².
 
         Returns:
             (bin_center, gamma) or (None, None) when data are insufficient.
@@ -6747,6 +6951,7 @@ class VariogramWidget(QWidget):
         values = self.current_data['values']
         max_dist = self.current_data['max_dist']
         bin_edges = np.linspace(0, max_dist / 2.0, VARIOGRAM_N_BINS)
+        print("bin_edges: ", bin_edges) #debug
         bin_center, gamma = gs.vario_estimate(
             coordinates.T, values, bin_edges=bin_edges
         )
@@ -6882,10 +7087,13 @@ class VariogramWidget(QWidget):
                         set_progress(
                             100, "State: Completed with estimated values"
                         )
-                        from qgis.PyQt.QtCore import QTimer
-                        QTimer.singleShot(
-                            3000, lambda: self._hide_progress_elements()
-                        )
+                        if not getattr(
+                            main_dialog, '_suppress_variogram_progress', False
+                        ):
+                            from qgis.PyQt.QtCore import QTimer
+                            QTimer.singleShot(
+                                3000, lambda: self._hide_progress_elements()
+                            )
 
             if set_progress is not None:
                 set_progress(95, "State: Updating controls...")
@@ -6906,8 +7114,13 @@ class VariogramWidget(QWidget):
 
             if set_progress is not None and fit_ok:
                 set_progress(100, "State: Completed successfully")
-                from qgis.PyQt.QtCore import QTimer
-                QTimer.singleShot(2000, lambda: self._hide_progress_elements())
+                if not getattr(
+                    main_dialog, '_suppress_variogram_progress', False
+                ):
+                    from qgis.PyQt.QtCore import QTimer
+                    QTimer.singleShot(
+                        2000, lambda: self._hide_progress_elements()
+                    )
         except Exception as e:
             if set_progress is not None:
                 set_progress(0, "State: Error")
@@ -6922,6 +7135,10 @@ class VariogramWidget(QWidget):
     def _hide_progress_elements(self):
         """Reset progress bar after variogram auto-fit completes."""
         main_dialog = self.dialog
+        if main_dialog is not None and getattr(
+            main_dialog, '_suppress_variogram_progress', False
+        ):
+            return
         reset_progress = getattr(main_dialog, '_reset_variogram_progress', None)
         if reset_progress is not None:
             reset_progress()
@@ -6977,14 +7194,14 @@ class VariogramWidget(QWidget):
             self.auto_fit()
 
     def update_plot(self, emit_signal=True, params=None):
-        """Redraw experimental + model curves; recompute lag-bin R².
+        """Redraw experimental + model curves; recompute experimental-theoretical R².
 
         Args:
             emit_signal: When True, emit ``params_changed`` including ``r2``.
             params: Optional parameter dict; otherwise read from the dialog store.
 
         Returns:
-            float lag-bin R², or 0.0 when plotting is not possible.
+            float experimental-theoretical R², or 0.0 when plotting is not possible.
         """
         self.figure.clear()
         ax = self.figure.add_subplot(111)
@@ -6996,11 +7213,11 @@ class VariogramWidget(QWidget):
                 bin_center, gamma = self._experimental_variogram()
                 if bin_center is None:
                     raise ValueError("insufficient experimental variogram bins")
-
+                #Plot the experimental variogram curve
                 ax.scatter(
                     bin_center,
                     gamma,
-                    label=QCoreApplication.translate("Tab 2", "Experimental"),
+                    label=QCoreApplication.translate("Tab 2", "Experimental Variogram"),
                     alpha=0.7,
                 )
 
@@ -7020,6 +7237,7 @@ class VariogramWidget(QWidget):
                         'r2': float(r2),
                     })
 
+                #Plot the theoretical variogram curve
                 x_model = np.linspace(0, max_dist / 2.0, 100)
                 y_model = model.variogram(x_model)
                 ax.plot(
@@ -7027,7 +7245,7 @@ class VariogramWidget(QWidget):
                     y_model,
                     'r-',
                     label=QCoreApplication.translate(
-                        "Tab 2", "Model: {model}"
+                        "Tab 2", "Theoretical Model: {model}"
                     ).format(model=resolved['model']),
                 )
 

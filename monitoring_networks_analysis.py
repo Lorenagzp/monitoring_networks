@@ -623,11 +623,11 @@ def compute_cross_validation_summary(errors):
     """
     Builds cross-validation summary metrics from prediction errors.
 
-    The first three statistics are min, max and mean of the signed error
-    (measured - predicted). MAE, MSE and RMSE use only finite error values.
+    Signed-error stats (min, max, mean), MAE and RMSE use finite values of
+    ``error = predicted - measured``.
 
     Returns:
-        dict with keys min, max, mean, mae, mse, rmse.
+        dict with keys min, max, mean, mae, rmse.
     """
     errors = np.asarray(errors, dtype=float).ravel()
     valid_errors = errors[np.isfinite(errors)]
@@ -637,19 +637,15 @@ def compute_cross_validation_summary(errors):
             'max': np.nan,
             'mean': np.nan,
             'mae': np.nan,
-            'mse': np.nan,
             'rmse': np.nan,
         }
 
-    abs_errors = np.abs(valid_errors)
-    mse = float(np.mean(valid_errors ** 2))
     return {
         'min': float(np.min(valid_errors)),
         'max': float(np.max(valid_errors)),
         'mean': float(np.mean(valid_errors)),
-        'mae': float(np.mean(abs_errors)),
-        'mse': mse,
-        'rmse': float(np.sqrt(mse)),
+        'mae': float(np.mean(np.abs(valid_errors))),
+        'rmse': float(np.sqrt(np.mean(valid_errors ** 2))),
     }
 
 
@@ -673,7 +669,7 @@ def run_ordinary_kriging_cross_validation(
     network as conditioning data only.
 
     Returns:
-        dict with summary (error min/max/mean, MAE, MSE, RMSE) and rows
+        dict with summary (error min/max/mean, MAE, RMSE) and rows
         (measured, predicted, error, SE, standardized error, included).
         None when there are fewer than three points or fewer than three
         successful predictions.
