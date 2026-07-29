@@ -83,6 +83,8 @@ from .monitoring_networks_analysis import (
     wells_at_fraction_of_max_reduction,
     build_covariance_model,
     compute_variogram_lag_r2,
+    validate_variogram_autofit,
+    variogram_autofit_fallback_params,
     VARIOGRAM_N_BINS,
     OptimizationInput,
     ParameterInput,
@@ -120,13 +122,12 @@ VAR_COL_MODEL = 2
 VAR_COL_NUGGET = 3
 VAR_COL_SILL = 4
 VAR_COL_RANGE = 5
-VAR_COL_R2 = 6
 
 VARIOGRAM_MODEL_TYPES = [
     'spherical', 'exponential', 'gaussian', 'stable', 'matern',
 ]
 
-CV_SUMMARY_KEYS = ('min', 'max', 'mean', 'mae', 'rmse')
+CV_SUMMARY_KEYS = ('min', 'max', 'mean', 'mae', 'rmse', 'ase', 'rmsse')
 
 CV_SUMMARY_FORMATS = {
     'min': '{:.3f}',
@@ -134,6 +135,8 @@ CV_SUMMARY_FORMATS = {
     'mean': '{:.3f}',
     'mae': '{:.3f}',
     'rmse': '{:.3f}',
+    'ase': '{:.3f}',
+    'rmsse': '{:.3f}',
 }
 
 CV_COL_ID = 0
@@ -228,7 +231,37 @@ def cv_summary_header_labels(context_name):
         QCoreApplication.translate(context_name, "Mean error"),
         QCoreApplication.translate(context_name, "MAE"),
         QCoreApplication.translate(context_name, "RMSE"),
+        QCoreApplication.translate(context_name, "ASE"),
+        QCoreApplication.translate(context_name, "RMSSE"),
     ]
+
+
+def cv_summary_header_tooltips(context_name):
+    """Tooltips for CV summary headers (ArcGIS-style metric names)."""
+    return {
+        'ase': QCoreApplication.translate(
+            context_name,
+            "Average Standard Error (ASE): root mean square of the kriging "
+            "standard errors. Ideally close to RMSE.",
+        ),
+        'rmsse': QCoreApplication.translate(
+            context_name,
+            "Root-Mean-Square Standardized Error (RMSSE): root mean square of "
+            "error/SE. Ideally close to 1.",
+        ),
+    }
+
+
+def apply_cv_summary_header_tooltips(summary_table, context_name):
+    """Attach ASE/RMSSE tooltips to an existing CV summary header row."""
+    tooltips = cv_summary_header_tooltips(context_name)
+    for col, key in enumerate(CV_SUMMARY_KEYS):
+        tip = tooltips.get(key)
+        if not tip:
+            continue
+        header_item = summary_table.horizontalHeaderItem(col)
+        if header_item is not None:
+            header_item.setToolTip(tip)
 
 
 def cv_results_header_labels(context_name):
@@ -281,6 +314,8 @@ class MonitoringNetworksDialog(QDialog):
     def __init__(self, iface, parent=None):
         super().__init__(parent)
         self.iface = iface
+        # Independent top-level window usable alongside QGIS and other instances.
+        self.setWindowModality(Qt.NonModal)
         self.setWindowTitle(QCoreApplication.translate("Main Window", "Monitoring Networks Priorization"))
         self.setMinimumSize(750, 750)
         self._cached_layer = None
@@ -313,6 +348,8 @@ class MonitoringNetworksDialog(QDialog):
         self.stats_by_attribute = {}  # Per-parameter descriptive stats and plot inputs
         self._layer_data_by_attribute = {}  # Per-parameter raw layer extraction cache
         self.variance_results = {}  # Variance reduction curves keyed by parameter
+        # Last Tab 1 parameter selection used to invalidate optimization cache.
+        self._tab1_params_for_optimization = frozenset()
         # Feature IDs included in analysis (Tab 1 checkboxes); None when no layer.
         self._included_well_fids = None
         self._syncing_well_include = False
@@ -401,14 +438,11 @@ class MonitoringNetworksDialog(QDialog):
         layout.addLayout(button_layout)
         
         self.setLayout(layout)
-        # Disable Next only on the last tab (Map); re-enable when leaving it.
-        self.tabs.currentChanged.connect(
-            lambda index: self.next_btn.setEnabled(
-                index < self.tabs.count() - 1
-            )
-        )
+        # Disable Next only on the last tab (Map); refresh Tab 1 progress hint.
+        self.tabs.currentChanged.connect(self._on_main_tab_changed)
         # Tabs 2–5 stay visible but not clickable until Next advances the workflow.
         self._set_workflow_tabs_locked()
+        self._update_tab1_progress_hint()
     
     def setup_data_tab(self):
         """Configures the data selection tab"""
@@ -441,7 +475,7 @@ class MonitoringNetworksDialog(QDialog):
         # Attribute selector section
         attr_group = QGroupBox(QCoreApplication.translate("Tab 1", "Selection of Attributes for Analysis"))
         attr_layout = QVBoxLayout()
-        attr_layout.addWidget(QLabel(QCoreApplication.translate("Tab 1", "Attributes available to use as parameters of the monitoring network:")))
+        attr_layout.addWidget(QLabel(QCoreApplication.translate("Tab 1", "Attributes available to use as parameters of the monitoring network (numeric):")))
         
         # List of selectable attributes
         self.selected_data_parameters = QListWidget()
@@ -456,6 +490,7 @@ class MonitoringNetworksDialog(QDialog):
         self.layer_fields_table = QTableWidget()
         self.layer_fields_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.layer_fields_table.setAlternatingRowColors(True)
+        self.layer_fields_table.setSortingEnabled(True)
         self.layer_fields_table.horizontalHeader().setStretchLastSection(True)
         self.layer_fields_table.setMinimumHeight(140)
         self.layer_fields_table.setMaximumHeight(280)
@@ -552,9 +587,9 @@ class MonitoringNetworksDialog(QDialog):
             QAbstractItemView.DoubleClicked
             | QAbstractItemView.SelectedClicked
         )
-        # Single-row highlight shows which parameter drives plots/variogram/CV.
-        self.stats_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.stats_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        # Active parameter is shown with bold text (not Qt selection fill),
+        # so asymmetry/kurtosis cell colors stay visible.
+        self.stats_table.setSelectionMode(QAbstractItemView.NoSelection)
         self.stats_table.itemChanged.connect(self._on_stats_table_weight_changed)
         # Click the leftmost parameter-name header cell to activate that row.
         self.stats_table.verticalHeader().sectionClicked.connect(
@@ -586,7 +621,7 @@ class MonitoringNetworksDialog(QDialog):
         stats_layout.addWidget(self.stats_info_label) 
 
         # Histogram plot
-        PLOT_HEIGHT = 250
+        PLOT_HEIGHT = 100
         plots_layout = QHBoxLayout()
         # constrained_layout recomputes margins on every draw/resize so the
         # title and axis labels never get clipped when the canvas shrinks.
@@ -612,12 +647,18 @@ class MonitoringNetworksDialog(QDialog):
         stats_group.setLayout(stats_layout)
         layout.addWidget(stats_group)
 
-        # 2. Mathematical models
-        params_group = QGroupBox(QCoreApplication.translate("Tab 2", "Variogram Parameters"))
-        params_layout = QVBoxLayout()
-        
+        # 2. Variogram
+        variogram_group = QGroupBox(QCoreApplication.translate("Tab 2", "Variogram Parameters"))
+        variogram_layout = QVBoxLayout()
+
+        # Auto-fit success/failure status shown above the parameters table.
+        self.var_autofit_status_label = QLabel("")
+        self.var_autofit_status_label.setWordWrap(True)
+        self.var_autofit_status_label.setVisible(False)
+        variogram_layout.addWidget(self.var_autofit_status_label)
+
         self.var_params_table = QTableWidget()
-        self.var_params_table.setColumnCount(7)
+        self.var_params_table.setColumnCount(6)
         self.var_params_table.setHorizontalHeaderLabels([
             QCoreApplication.translate("Tab 2", "Parameter"),
             QCoreApplication.translate("Tab 2", "Transform"),
@@ -625,7 +666,6 @@ class MonitoringNetworksDialog(QDialog):
             QCoreApplication.translate("Tab 2", "Nugget"),
             QCoreApplication.translate("Tab 2", "Sill"),
             QCoreApplication.translate("Tab 2", "Range"),
-            QCoreApplication.translate("Tab 2", "R²"),
         ])
         range_header = self.var_params_table.horizontalHeaderItem(VAR_COL_RANGE)
         if range_header is not None:
@@ -637,6 +677,7 @@ class MonitoringNetworksDialog(QDialog):
                     "For Exponential ≈ 3×len_scale\n"
                     "Gaussian ≈ √3×len_scale\n"
                     "For Matérn/Stable it depends on the shape parameter.",
+                    # TODO: Show separately the practical range and the length scale
                 )
             )
         #self.var_params_table.setFixedHeight(126)
@@ -644,24 +685,19 @@ class MonitoringNetworksDialog(QDialog):
         self.var_params_table.itemChanged.connect(self.on_params_table_changed)
         self.var_params_table.resizeColumnsToContents()
         self.var_params_table.horizontalHeader().setStretchLastSection(True)
-        params_layout.addWidget(self.var_params_table)
-
-        # Progress status (but not progress bar anymore!)
-        params_layout.addStretch()  # To keep layout spacing #Do we need this?
-
-        params_group.setLayout(params_layout)
-        layout.addWidget(params_group)
+        self.var_params_table.setFixedHeight(70) 
+        variogram_layout.addWidget(self.var_params_table)
 
         # 3: Variogram
-        variogram_widget_group = QGroupBox()
-        variogram_widget_layout = QVBoxLayout()
         self.variogram_widget = VariogramWidget(self, self)
         self.variogram_widget.params_changed.connect(
             self._on_variogram_widget_params_changed
         )
-        variogram_widget_layout.addWidget(self.variogram_widget)
-        variogram_widget_group.setLayout(variogram_widget_layout)
-        layout.addWidget(variogram_widget_group)
+        variogram_layout.addWidget(self.variogram_widget)
+        variogram_group.setLayout(variogram_layout)
+        layout.addWidget(variogram_group)
+
+        variogram_layout.addStretch()  # To keep layout spacing #Do we need this?
 
         # Leave-one-out cross-validation (ordinary kriging with fitted variogram).
         # Refreshes when geostatistics runs or when variogram parameters change.
@@ -681,14 +717,23 @@ class MonitoringNetworksDialog(QDialog):
         self.cv_summary_table.setHorizontalHeaderLabels(
             cv_summary_header_labels("Tab 2")
         )
+        apply_cv_summary_header_tooltips(self.cv_summary_table, "Tab 2")
         self.cv_summary_table.verticalHeader().setVisible(False)
         self.cv_summary_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.cv_summary_table.setFixedHeight(70)
         self.cv_summary_table.horizontalHeader().setStretchLastSection(True)
         cv_layout.addWidget(self.cv_summary_table)
 
+        # Recompute margins on every draw and resize so the complete title and
+        # both axis labels remain visible at narrower dialog sizes.
+        self.cv_figure = Figure(figsize=(6, 6), constrained_layout=True)
+        self.cv_canvas = FigureCanvas(self.cv_figure)
+        self.cv_canvas.setMinimumHeight(PLOT_HEIGHT)
+        self.cv_ax = self.cv_figure.add_subplot(111)
+        cv_layout.addWidget(self.cv_canvas)
+
         cv_results_label = QLabel(
-            QCoreApplication.translate("Tab 2", "Cross-Validation Results")
+            QCoreApplication.translate("Tab 2", "Cross-Validation Details")
         )
         cv_layout.addWidget(cv_results_label)
 
@@ -699,6 +744,7 @@ class MonitoringNetworksDialog(QDialog):
         )
         self.cv_results_table.verticalHeader().setVisible(True)
         self.cv_results_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.cv_results_table.setSortingEnabled(True)
         self.cv_results_table.setMinimumHeight(160)
         self.cv_results_table.setMaximumHeight(220)
         self.cv_results_table.horizontalHeader().setStretchLastSection(True)
@@ -713,20 +759,12 @@ class MonitoringNetworksDialog(QDialog):
         self.cv_info_label.setStyleSheet("color: gray; font-style: italic;")
         cv_layout.addWidget(self.cv_info_label)
 
-        # Recompute margins on every draw and resize so the complete title and
-        # both axis labels remain visible at narrower dialog sizes.
-        self.cv_figure = Figure(figsize=(6, 4), constrained_layout=True)
-        self.cv_canvas = FigureCanvas(self.cv_figure)
-        self.cv_canvas.setMinimumHeight(PLOT_HEIGHT)
-        self.cv_ax = self.cv_figure.add_subplot(111)
-        cv_layout.addWidget(self.cv_canvas)
-
         cv_group.setLayout(cv_layout)
         layout.addWidget(cv_group)
         self._clear_cross_validation()
 
         # Add stretch at the end so the content doesn't expand more than necessary
-        #layout.addStretch()
+        layout.addStretch()
         
         # Configure the container widget with the layout
         scroll_widget.setLayout(layout)
@@ -757,30 +795,10 @@ class MonitoringNetworksDialog(QDialog):
         ), 0, 0)
         self.spacing_spin = QDoubleSpinBox()
         self.spacing_spin.setRange(10, 10000)
-        
-        # Default spacing: (max_dist / 2) / 10
-        layer = getattr(self, 'input_data_layer', None)
-        max_dist = None
-        if layer and hasattr(layer, 'currentLayer') and layer.currentLayer() is not None:
-            current_layer = layer.currentLayer()
-            try:
-                if current_layer is not None:
-                    features = list(current_layer.getFeatures())
-                    coords = np.array([[f.geometry().asPoint().x(), f.geometry().asPoint().y()] for f in features if f.geometry().isMultipart() == False and f.geometry().isEmpty() == False])
-                    if len(coords) >= 2:
-                        from scipy.spatial.distance import pdist
-                        max_dist = np.max(pdist(coords))
-            except Exception:
-                pass
-        
-        if max_dist is not None and max_dist > 0:
-            spacing_default = (max_dist / 2) / 10
-        else:
-            spacing_default = 100.0
-        
-        self.spacing_spin.setValue(spacing_default)
         self.spacing_spin.setDecimals(0)
         self.spacing_spin.setSingleStep(1)
+        # Default: (max pairwise distance / 2) / 10; refreshed when Tab 1 layer changes.
+        self._apply_default_node_spacing()
         self.spacing_spin.valueChanged.connect(self.on_spacing_changed)
         gen_grid_layout.addWidget(self.spacing_spin, 0, 1)
         
@@ -826,10 +844,15 @@ class MonitoringNetworksDialog(QDialog):
         )
         gen_grid_layout.addWidget(self.alpha_spin, 3, 1)
         
-        # Calculate grid button
+        # Calculate / save grid buttons side by side
         self.preview_grid_btn = QPushButton(QCoreApplication.translate("Tab 3", "Calculate grid"))
         self.preview_grid_btn.clicked.connect(self.preview_grid)
-        gen_grid_layout.addWidget(self.preview_grid_btn, 4, 1) #, 1, 1
+        self.save_grid_btn = QPushButton(QCoreApplication.translate("Tab 3", "Save Grid as Temporary Layer"))
+        self.save_grid_btn.clicked.connect(self.save_grid_as_layer,1,0)
+        grid_btns = QHBoxLayout()
+        grid_btns.addWidget(self.preview_grid_btn)
+        grid_btns.addWidget(self.save_grid_btn)
+        gen_grid_layout.addLayout(grid_btns, 4, 1, 1,1)
 
         gen_grid_group.setLayout(gen_grid_layout)
         layout.addWidget(gen_grid_group)
@@ -856,15 +879,6 @@ class MonitoringNetworksDialog(QDialog):
         self.grid_figure = Figure(figsize=(8, 6))
         self.grid_canvas = FigureCanvas(self.grid_figure)
         layout.addWidget(self.grid_canvas)
-        
-        # Button to save grid as temporary layer
-        #btn_grid_layout = QHBoxLayout()
-        self.save_grid_btn = QPushButton(QCoreApplication.translate("Tab 3", "Save Grid as Temporary Layer"))
-        self.save_grid_btn.clicked.connect(self.save_grid_as_layer,1,0)
-        #btn_grid_layout.addWidget(self.save_grid_btn)
-        #btn_grid_layout.addStretch()
-        #layout.addLayout(btn_grid_layout) #needed?
-        layout.addWidget(self.save_grid_btn) #,3, 0, 1, 2
         
         # Load the layout elements to the Grid Tab
         self.tab_grid.setLayout(layout)
@@ -899,12 +913,21 @@ class MonitoringNetworksDialog(QDialog):
 
         self.mn_use_well_weights = QCheckBox(
             QCoreApplication.translate(
-                "Tab 4", "Use personalized well weight in the optimization"
+                "Tab 4", "Use personalized well weight"
+            )
+        )
+        self.mn_use_well_weights.setToolTip(
+            QCoreApplication.translate(
+                "Tab 4",
+                "Detected on the input point layer when a field name matches "
+                "(case-insensitive): peso_pozo, well_weight, w_pozo, peso_w, "
+                "well_w, weight_well, pozo_peso, or w. "
+                "The analysis attribute and ID-like fields are ignored.",
             )
         )
         self.mn_use_well_weights.setEnabled(False)
         self.mn_use_well_weights.stateChanged.connect(
-            self._update_mn_well_weight_info
+            self._on_mn_well_weight_toggled
         )
         mn_param_select_layout.addWidget(self.mn_use_well_weights)
 
@@ -917,12 +940,22 @@ class MonitoringNetworksDialog(QDialog):
 
         self.mn_use_grid_weights = QCheckBox(
             QCoreApplication.translate(
-                "Tab 4", "Use estimation grid node weights in the optimization"
+                "Tab 4", "Use estimation grid node weights"
+            )
+        )
+        self.mn_use_grid_weights.setToolTip(
+            QCoreApplication.translate(
+                "Tab 4",
+                "Available after importing an estimation grid Excel on tab 3. "
+                "Required columns in order: ID, X, Y. Optional 4th column: "
+                "weight (used as per-node grid weight). "
+                "Generated grids without an imported weight column cannot use "
+                "this option.",
             )
         )
         self.mn_use_grid_weights.setEnabled(False)
         self.mn_use_grid_weights.stateChanged.connect(
-            self._update_mn_grid_weight_info
+            self._on_mn_grid_weight_toggled
         )
         mn_param_select_layout.addWidget(self.mn_use_grid_weights)
 
@@ -980,8 +1013,8 @@ class MonitoringNetworksDialog(QDialog):
         self.variance_info_label.setWordWrap(True)
         variance_layout.addWidget(self.variance_info_label)
 
-        MN_PLOT_HEIGHT = 280
-        self.variance_figure = Figure(figsize=(6, 4))
+        MN_PLOT_HEIGHT = 250
+        self.variance_figure = Figure(figsize=(6, 3))
         self.variance_canvas = FigureCanvas(self.variance_figure)
         self.variance_canvas.setMinimumHeight(MN_PLOT_HEIGHT)
         self.variance_ax = self.variance_figure.add_subplot(111)
@@ -993,20 +1026,22 @@ class MonitoringNetworksDialog(QDialog):
         variance_layout.addWidget(order_label)
 
         self.mn_prioritization_order_table = QTableWidget()
-        self.mn_prioritization_order_table.setColumnCount(5)
+        self.mn_prioritization_order_table.setColumnCount(6)
         self.mn_prioritization_order_table.setHorizontalHeaderLabels([
             QCoreApplication.translate("Tab 4", "Priority"),
             QCoreApplication.translate("Tab 4", "ID"),
             QCoreApplication.translate("Tab 4", "Well weight"),
             QCoreApplication.translate("Tab 4", "Total variance (%)"),
             QCoreApplication.translate("Tab 4", "Adverse order"),
+            QCoreApplication.translate("Tab 4", "Adverse variance (%)"),
         ])
         self.mn_prioritization_order_table.verticalHeader().setVisible(True)
+        self.mn_prioritization_order_table.setSortingEnabled(True)
         self.mn_prioritization_order_table.setEditTriggers(
             QAbstractItemView.NoEditTriggers
         )
-        self.mn_prioritization_order_table.setMinimumHeight(160)
-        self.mn_prioritization_order_table.setMaximumHeight(280)
+        self.mn_prioritization_order_table.setMinimumHeight(320)
+        #self.mn_prioritization_order_table.setMaximumHeight(380)
         self.mn_prioritization_order_table.horizontalHeader().setStretchLastSection(
             True
         )
@@ -1059,8 +1094,10 @@ class MonitoringNetworksDialog(QDialog):
         self.results_well_spin.setMaximum(3)
         self.results_well_spin.setValue(3)
         self.results_well_spin.setEnabled(False)
+        # Refresh on every change of the spinbox
         self.results_well_spin.valueChanged.connect(
             self._refresh_ok_interpolation_selected_wells
+            #TODO: add a delay after the user stops typing to allow 2 digits to be typed
         )
         wells_row.addWidget(self.results_well_spin)
         self.save_selected_wells_btn = QPushButton(
@@ -1092,7 +1129,7 @@ class MonitoringNetworksDialog(QDialog):
                 "Tab 5", "Show kriging standard error maps"
             )
         )
-        self.results_show_se_maps_cb.setChecked(True)
+        self.results_show_se_maps_cb.setChecked(False)
         self.results_show_se_maps_cb.toggled.connect(
             self._on_results_show_se_maps_toggled
         )
@@ -1181,6 +1218,8 @@ class MonitoringNetworksDialog(QDialog):
         plots_row.addLayout(sel_column, stretch=1)
 
         interp_layout.addLayout(plots_row)
+        # Checkbox starts unchecked and does not emit toggled; hide SE maps now.
+        self._set_ok_se_maps_visible(False)
         interp_group.setLayout(interp_layout)
         results_layout.addWidget(interp_group)
 
@@ -1208,6 +1247,7 @@ class MonitoringNetworksDialog(QDialog):
         summary_table.setHorizontalHeaderLabels(
             cv_summary_header_labels(context_name)
         )
+        apply_cv_summary_header_tooltips(summary_table, context_name)
         summary_table.verticalHeader().setVisible(False)
         summary_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         summary_table.setFixedHeight(70)
@@ -1215,7 +1255,7 @@ class MonitoringNetworksDialog(QDialog):
         layout.addWidget(summary_table)
 
         results_label = QLabel(
-            QCoreApplication.translate(context_name, "Cross-Validation Results")
+            QCoreApplication.translate(context_name, "Cross-Validation Details")
         )
         layout.addWidget(results_label)
 
@@ -1226,6 +1266,7 @@ class MonitoringNetworksDialog(QDialog):
         )
         results_table.verticalHeader().setVisible(True)
         results_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        results_table.setSortingEnabled(True)
         results_table.setMinimumHeight(140)
         results_table.setMaximumHeight(200)
         results_table.horizontalHeader().setStretchLastSection(True)
@@ -1275,12 +1316,12 @@ class MonitoringNetworksDialog(QDialog):
             count_attr = selected[0] if selected else None
         n_wells = self._count_layer_wells(count_attr) if count_attr else 0
 
-        # Prefer the 90%-of-max-reduction well count from prioritized curve.
+        # Prefer the 95%-of-max-reduction well count from prioritized curve.
         default_wells = None
         if attr_name and attr_name in getattr(self, 'variance_results', {}):
             default_wells = wells_at_fraction_of_max_reduction(
                 self.variance_results[attr_name],
-                fraction=0.9,
+                fraction=0.95,
             )
 
         self.results_well_spin.blockSignals(True)
@@ -1339,6 +1380,26 @@ class MonitoringNetworksDialog(QDialog):
             item.setFlags(read_only)
         summary_table.resizeColumnsToContents()
 
+    @staticmethod
+    def _cv_results_numeric_item(value, read_only_flags):
+        """
+        Read-only cell with numeric Qt.DisplayRole for native header sorting.
+
+        Non-finite values use an empty string so nulls do not sort as zero.
+        """
+        item = QTableWidgetItem()
+        item.setFlags(read_only_flags)
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            item.setData(Qt.DisplayRole, "")
+            return item
+        if not np.isfinite(number):
+            item.setData(Qt.DisplayRole, "")
+            return item
+        item.setData(Qt.DisplayRole, float(number))
+        return item
+
     def _populate_cv_results_table(
         self,
         results_table,
@@ -1352,27 +1413,60 @@ class MonitoringNetworksDialog(QDialog):
         no_text = QCoreApplication.translate(context_name, "No")
         read_only = Qt.ItemIsSelectable | Qt.ItemIsEnabled
         selected_row_color = QColor('#d5f5e3')
+
+        # Avoid re-sorting on every setItem while rows are filled.
+        results_table.setSortingEnabled(False)
         results_table.setRowCount(len(cv_rows))
+
+        numeric_keys = (
+            'measured',
+            'predicted',
+            'error',
+            'se',
+            'standardized_error',
+        )
 
         for row, (point_id, row_data) in enumerate(zip(point_ids, cv_rows)):
             included = row_data.get('included', True)
-            cells = [
-                str(point_id),
-                yes_text if included else no_text,
-                f"{row_data['measured']:.3f}",
-                f"{row_data['predicted']:.3f}",
-                f"{row_data['error']:.3f}",
-                f"{row_data['se']:.3f}",
-                f"{row_data['standardized_error']:.3f}",
-            ]
-            for col, text in enumerate(cells):
-                item = QTableWidgetItem(text)
-                item.setFlags(read_only)
+
+            # ID: numeric DisplayRole when the identifier is a finite number.
+            id_item = QTableWidgetItem()
+            id_item.setFlags(read_only)
+            try:
+                id_number = float(point_id)
+            except (TypeError, ValueError):
+                id_number = None
+            if id_number is not None and np.isfinite(id_number):
+                if float(id_number).is_integer():
+                    id_item.setData(Qt.DisplayRole, int(id_number))
+                else:
+                    id_item.setData(Qt.DisplayRole, float(id_number))
+            else:
+                id_item.setData(Qt.DisplayRole, str(point_id))
+            if highlight_selected and included:
+                id_item.setBackground(selected_row_color)
+            results_table.setItem(row, CV_COL_ID, id_item)
+
+            included_item = QTableWidgetItem(
+                yes_text if included else no_text
+            )
+            included_item.setFlags(read_only)
+            if highlight_selected and included:
+                included_item.setBackground(selected_row_color)
+            results_table.setItem(row, CV_COL_INCLUDED, included_item)
+
+            # Measured / Predicted / Error / SE / Standardized Error.
+            for col_offset, key in enumerate(numeric_keys):
+                col = CV_COL_MEASURED + col_offset
+                item = self._cv_results_numeric_item(
+                    row_data.get(key), read_only
+                )
                 if highlight_selected and included:
                     item.setBackground(selected_row_color)
                 results_table.setItem(row, col, item)
 
         results_table.resizeColumnsToContents()
+        results_table.setSortingEnabled(True)
 
     def _on_results_show_se_maps_toggled(self, checked):
         """Show or hide SE map containers without recomputing kriging."""
@@ -1442,15 +1536,114 @@ class MonitoringNetworksDialog(QDialog):
                 pass
 
     def _finalize_ok_map_figure_layout(self, figure, canvas):
-        """Keep titles, axes labels, colorbar, and legend fully inside the canvas."""
+        """Keep titles and axes labels inside the canvas with compact margins.
+
+        When a horizontal colorbar is already attached (extra axes), leave
+        margins alone so the colorbar does not overlap the map.
+        """
         try:
-            figure.tight_layout()
+            if len(figure.axes) <= 1:
+                figure.subplots_adjust(
+                    left=0.14, right=0.96, top=0.90, bottom=0.14
+                )
         except Exception:
-            # Fallback when tight_layout cannot resolve constrained artists.
-            figure.subplots_adjust(
-                left=0.12, right=0.86, top=0.90, bottom=0.12
-            )
+            pass
         canvas.draw()
+
+    @staticmethod
+    def _ok_map_locator_levels(vmin, vmax, nbins=6):
+        """Pretty breaks via MaxNLocator for Tab 5 colorbars and isolines."""
+        from matplotlib.ticker import MaxNLocator
+
+        if vmin is None or vmax is None:
+            return None
+        try:
+            vmin = float(vmin)
+            vmax = float(vmax)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(vmin) or not np.isfinite(vmax):
+            return None
+        if vmin == vmax:
+            return np.asarray([vmin], dtype=float)
+        levels = np.asarray(
+            MaxNLocator(nbins=nbins).tick_values(vmin, vmax),
+            dtype=float,
+        )
+        levels = levels[np.isfinite(levels)]
+        return levels if levels.size else None
+
+    @staticmethod
+    def _format_ok_map_axis_tick(value):
+        """Compact tick label for large projected coordinates."""
+        value = float(value)
+        abs_v = abs(value)
+        if abs_v >= 1e5 or (abs_v > 0 and abs_v < 1e-2):
+            return f'{value:.2e}'
+        if abs_v >= 1000:
+            return f'{value:.0f}'
+        return f'{value:g}'
+
+    def _style_ok_map_axes(self, ax):
+        """3 divisions per axis, 2 labels, no grid, vertical Y tick labels."""
+        from matplotlib.ticker import MaxNLocator
+
+        ax.grid(False)
+        xmin, xmax = ax.get_xlim()
+        ymin, ymax = ax.get_ylim()
+        xticks = np.asarray(
+            MaxNLocator(nbins=3).tick_values(xmin, xmax), dtype=float
+        )
+        yticks = np.asarray(
+            MaxNLocator(nbins=3).tick_values(ymin, ymax), dtype=float
+        )
+        xticks = xticks[(xticks >= xmin) & (xticks <= xmax)]
+        yticks = yticks[(yticks >= ymin) & (yticks <= ymax)]
+        if xticks.size > 3:
+            xticks = xticks[:3]
+        if yticks.size > 3:
+            yticks = yticks[:3]
+
+        def _two_end_labels(ticks):
+            labels = [''] * int(ticks.size)
+            if ticks.size == 0:
+                return labels
+            if ticks.size == 1:
+                labels[0] = self._format_ok_map_axis_tick(ticks[0])
+                return labels
+            labels[0] = self._format_ok_map_axis_tick(ticks[0])
+            labels[-1] = self._format_ok_map_axis_tick(ticks[-1])
+            return labels
+
+        ax.set_xticks(xticks)
+        ax.set_yticks(yticks)
+        ax.set_xticklabels(_two_end_labels(xticks))
+        ax.set_yticklabels(
+            _two_end_labels(yticks), rotation=90, va='center', ha='right'
+        )
+        # Keep axis titles inside the axes band (ylabel above xlabel strip).
+        ax.xaxis.set_label_coords(0.5, -0.10)
+        ax.yaxis.set_label_coords(-0.10, 0.5)
+
+    def _add_ok_map_colorbar(self, figure, mappable, ax, label, levels=None):
+        """Horizontal colorbar below the axes; ticks match isoline levels."""
+        # Reserve bottom space before attaching the colorbar axes.
+        figure.subplots_adjust(
+            left=0.14, right=0.96, top=0.90, bottom=0.20
+        )
+        colorbar = figure.colorbar(
+            mappable,
+            ax=ax,
+            orientation='horizontal',
+            fraction=0.055,
+            pad=0.14,
+            aspect=35,
+            shrink=0.90,
+        )
+        colorbar.set_label(label)
+        if levels is not None and len(levels) > 0:
+            colorbar.set_ticks(np.asarray(levels, dtype=float))
+        return colorbar
 
     def _clear_ok_interpolation_plot_side(
         self, figure, canvas, colorbar_attr, message=..., default_placeholder=None
@@ -1459,7 +1652,7 @@ class MonitoringNetworksDialog(QDialog):
         if figure is None or canvas is None:
             return
 
-        self._disconnect_ok_interp_well_hover(canvas)
+        self._disconnect_point_hover(canvas)
         figure.clear()
         # Placeholder/empty figures have no well markers for this canvas.
         scatters = getattr(self, '_ok_map_well_scatters', None)
@@ -1676,8 +1869,13 @@ class MonitoringNetworksDialog(QDialog):
         measured = np.asarray([row['measured'] for row in rows], dtype=float)
         predicted = np.asarray([row['predicted'] for row in rows], dtype=float)
         valid = np.isfinite(predicted)
+        # Keep well IDs aligned with the filtered scatter points.
+        if point_ids is not None and len(point_ids) == measured.size:
+            plot_ids = [point_ids[i] for i in range(measured.size) if valid[i]]
+        else:
+            plot_ids = None
         self._update_cross_validation_plot(
-            measured[valid], predicted[valid], attr_name
+            measured[valid], predicted[valid], attr_name, point_ids=plot_ids
         )
 
         self.cv_info_label.setText(
@@ -1687,6 +1885,72 @@ class MonitoringNetworksDialog(QDialog):
             ).format(param=attr_name, n=int(np.sum(valid)))
         )
         self.cv_info_label.setStyleSheet("color: gray; font-style: italic;")
+
+    def _clear_all_optimization_results(self, tab5_message=None, tab4_message=None):
+        """
+        Drop every cached Optimize result and reset Tab 4/5 views.
+
+        Used when inputs that affect all rankings change (layer, Tab 1
+        selection, weight toggles, grid rebuild).
+        """
+        if hasattr(self, 'variance_results'):
+            self.variance_results.clear()
+        if hasattr(self, 'prioritization_grid_points'):
+            self.prioritization_grid_points = None
+        self._clear_variance_reduction_plot()
+        if tab4_message and hasattr(self, 'variance_info_label'):
+            self.variance_info_label.setText(tab4_message)
+            self.variance_info_label.setStyleSheet(
+                "color: gray; font-style: italic;"
+            )
+        self._update_results_well_spinbox()
+        self._clear_ok_interpolation_plots(
+            tab5_message
+            if tab5_message is not None
+            else QCoreApplication.translate(
+                "Tab 5",
+                "Optimization cleared. Run Optimize on tab 4 again.",
+            )
+        )
+        self._update_workflow_navigation_state()
+
+    def _load_optimization_views_for_current_parameter(self):
+        """
+        Show cached Optimize results for the Tab 4 combo selection, or clear
+        the views so another parameter's ranking is never left on screen.
+        """
+        param_key = self._current_mn_parameter()
+        if param_key and param_key in getattr(self, 'variance_results', {}):
+            results = self.variance_results[param_key]
+            self._update_variance_reduction_plot(
+                results,
+                self._mn_parameter_display_name(param_key),
+                param_key=param_key,
+            )
+            self._update_prioritization_order_table(
+                results, param_key=param_key
+            )
+            self._refresh_ok_interpolation_plot()
+        else:
+            self._clear_variance_reduction_plot()
+            if hasattr(self, 'variance_info_label'):
+                self.variance_info_label.setText(
+                    QCoreApplication.translate(
+                        "Tab 4",
+                        "No optimization for this parameter. Click Optimize.",
+                    )
+                )
+                self.variance_info_label.setStyleSheet(
+                    "color: gray; font-style: italic;"
+                )
+            self._update_results_well_spinbox()
+            self._clear_ok_interpolation_plots(
+                QCoreApplication.translate(
+                    "Tab 5",
+                    "Run Optimize on tab 4 for the selected parameter.",
+                )
+            )
+        self._update_workflow_navigation_state()
 
     def _invalidate_optimization_after_variogram_change(self, attr_name=None):
         """
@@ -1722,6 +1986,7 @@ class MonitoringNetworksDialog(QDialog):
                     "Variogram changed. Run Optimize on tab 4 again.",
                 )
             )
+        self._update_workflow_navigation_state()
 
     def _get_ok_interpolation_context(self):
         """
@@ -1756,8 +2021,16 @@ class MonitoringNetworksDialog(QDialog):
                 "Run geostatistics on tab 2 for this parameter first.",
             )
 
+        # Univariate OK uses the first listed parameter (not a multivariate model).
+        ok_parameter = (
+            param_data.get('reference_parameter')
+            or self._resolve_cv_parameter_name(attr_name)
+            or attr_name
+        )
+
         return {
             'attr_name': attr_name,
+            'ok_parameter': ok_parameter,
             'param_data': param_data,
             'state': param_data['state'],
             'coordinates': param_data['coordinates'],
@@ -1853,6 +2126,81 @@ class MonitoringNetworksDialog(QDialog):
         self.results_se_color_limits = self._ok_interpolation_color_limits(all_se)
         return self.results_se_color_limits
 
+    def _grid_field_to_raster(self, grid_xy, values):
+        """
+        Build a regular 2-D raster from estimation-grid nodes.
+
+        Shared by Tab 5 O.K. / S.E. plots and the GeoTIFF export path.
+        Tab 3 grids are rectangular lattices clipped to a hull, so unique X/Y
+        reconstruct the mesh; missing cells stay NaN.
+
+        Returns:
+            (xs, ys, Z) with Z shape (len(ys), len(xs)), row 0 = min Y
+            (imshow origin='lower'), or None if reshape fails.
+        """
+        grid_xy = np.asarray(grid_xy, dtype=float)
+        values = np.asarray(values, dtype=float).ravel()
+        if (
+            grid_xy.ndim != 2
+            or grid_xy.shape[1] != 2
+            or values.size != grid_xy.shape[0]
+            or values.size == 0
+        ):
+            return None
+
+        # Round for stable unique axes when floating-point coords jitter slightly.
+        xs = np.unique(np.round(grid_xy[:, 0], decimals=8))
+        ys = np.unique(np.round(grid_xy[:, 1], decimals=8))
+        if xs.size < 2 or ys.size < 2:
+            return None
+
+        x_idx = {float(x): i for i, x in enumerate(xs)}
+        y_idx = {float(y): i for i, y in enumerate(ys)}
+        z = np.full((ys.size, xs.size), np.nan, dtype=float)
+        for (x, y), value in zip(grid_xy, values):
+            if not np.isfinite(value):
+                continue
+            xi = x_idx.get(float(np.round(x, decimals=8)))
+            yi = y_idx.get(float(np.round(y, decimals=8)))
+            if xi is None or yi is None:
+                continue
+            z[yi, xi] = float(value)
+        return xs, ys, z
+
+    def _raster_cell_size(self, xs, ys):
+        """Pixel width/height: prefer Tab 3 spacing, else median axis diffs."""
+        xs = np.asarray(xs, dtype=float)
+        ys = np.asarray(ys, dtype=float)
+        dx = float(np.median(np.diff(xs))) if xs.size > 1 else 1.0
+        dy = float(np.median(np.diff(ys))) if ys.size > 1 else 1.0
+        grid_info = getattr(self, 'current_grid_info', None) or {}
+        spacing = grid_info.get('spacing')
+        if spacing is not None:
+            try:
+                spacing = float(spacing)
+                if spacing > 0:
+                    dx = spacing
+                    dy = spacing
+            except (TypeError, ValueError):
+                pass
+        if dx <= 0:
+            dx = 1.0
+        if dy <= 0:
+            dy = 1.0
+        return dx, dy
+
+    def _raster_imshow_extent(self, xs, ys):
+        """Cell-edge extent for imshow given sorted cell-center coordinates."""
+        xs = np.asarray(xs, dtype=float)
+        ys = np.asarray(ys, dtype=float)
+        dx, dy = self._raster_cell_size(xs, ys)
+        return [
+            float(xs[0] - 0.5 * dx),
+            float(xs[-1] + 0.5 * dx),
+            float(ys[0] - 0.5 * dy),
+            float(ys[-1] + 0.5 * dy),
+        ]
+
     def _draw_ok_interpolation_map(
         self,
         figure,
@@ -1865,17 +2213,21 @@ class MonitoringNetworksDialog(QDialog):
         title,
         color_limits=None,
     ):
-        """Draw OK interpolation with contours, isolines, and well markers.
+        """Draw OK interpolation as nearest neighbor imshow with contour isolines.
 
-        Well IDs on selected/red markers are shown on hover only.
+        Color ramp and isolines share MaxNLocator(nbins=6) levels from the
+        all-wells min–max when ``color_limits`` is provided. Well IDs on well
+        markers are shown on hover only (raw IDs, not translated).
         """
         coordinates = context['coordinates']
-        attr_name = context['attr_name']
+        # Colorbar shows the interpolated parameter (first of combined list).
+        ok_parameter = context.get('ok_parameter') or context['attr_name']
         selected_indices = np.asarray(selected_indices, dtype=int)
         n_selected = selected_indices.size
 
         gx = context['grid'][:, 0]
         gy = context['grid'][:, 1]
+        self._disconnect_point_hover(canvas)
         ax.clear()
 
         if color_limits is None:
@@ -1883,42 +2235,47 @@ class MonitoringNetworksDialog(QDialog):
         vmin = vmax = None
         if color_limits is not None:
             vmin, vmax = color_limits
+        levels = self._ok_map_locator_levels(vmin, vmax, nbins=6)
 
+        raster = self._grid_field_to_raster(context['grid'], estimates)
+        mappable = None
         try:
-            import matplotlib.tri as mtri
-            triangulation = mtri.Triangulation(gx, gy)
-            if vmin is not None and vmax is not None:
-                levels = np.linspace(vmin, vmax, 21)
-                contour = ax.tricontourf(
-                    triangulation,
-                    estimates,
-                    levels=levels,
-                    cmap='viridis',
-                    vmin=vmin,
-                    vmax=vmax,
-                )
-            else:
-                levels = 20
-                contour = ax.tricontourf(
-                    triangulation,
-                    estimates,
-                    levels=levels,
-                    cmap='viridis',
-                )
-            # Isolines use the same levels as the filled surface (triangulation path only).
-            ax.tricontour(
-                triangulation,
-                estimates,
-                levels=levels,
-                colors='#333333',
-                linewidths=0.5,
-                alpha=0.65,
-                zorder=2,
+            if raster is None:
+                raise ValueError("cannot reshape OK field to a regular raster")
+            xs, ys, z = raster
+            z_plot = np.ma.masked_invalid(z)
+            mappable = ax.imshow(
+                z_plot,
+                origin='lower',
+                extent=self._raster_imshow_extent(xs, ys),
+                aspect='equal',
+                interpolation='nearest',
+                cmap='viridis',
+                vmin=vmin,
+                vmax=vmax,
+                zorder=1,
             )
-            colorbar = figure.colorbar(contour, ax=ax, label=attr_name)
+            if levels is not None and levels.size > 0:
+                contours = ax.contour(
+                    xs,
+                    ys,
+                    z_plot,
+                    levels=levels,
+                    colors='black',
+                    linewidths=0.4,
+                    zorder=2,
+                )
+                ax.clabel(
+                    contours,
+                    levels=levels,
+                    inline=True,
+                    fontsize=7,
+                    colors='black',
+                    fmt='%g',
+                )
         except Exception:
-            # Scatter fallback when triangulation/contouring fails (no isolines).
-            scatter = ax.scatter(
+            # Scatter fallback when the node set is not a regular lattice.
+            mappable = ax.scatter(
                 gx,
                 gy,
                 c=estimates,
@@ -1928,8 +2285,6 @@ class MonitoringNetworksDialog(QDialog):
                 vmin=vmin,
                 vmax=vmax,
             )
-            colorbar = figure.colorbar(scatter, ax=ax, label=attr_name)
-        setattr(self, colorbar_attr, colorbar)
 
         all_selected = n_selected == coordinates.shape[0]
 
@@ -1951,17 +2306,24 @@ class MonitoringNetworksDialog(QDialog):
         )
         self._register_ok_map_well_scatter(canvas, well_scatter)
 
+        # Hover targets: all wells in the network (raw IDs, never translated).
         point_ids = context.get('point_ids')
-        self._attach_ok_interp_well_hover(
-            canvas, ax, coordinates, point_ids, selected_indices
-        )
+        if point_ids is not None and coordinates is not None:
+            coords = np.asarray(coordinates, dtype=float)
+            id_labels = [str(pid) for pid in point_ids]
+            if len(id_labels) == coords.shape[0]:
+                self._attach_point_hover(canvas, ax, coords, id_labels)
 
         ax.set_xlabel(QCoreApplication.translate("Tab 5", "X"))
         ax.set_ylabel(QCoreApplication.translate("Tab 5", "Y"))
         ax.set_title(title)
         ax.legend(loc='best', fontsize=8)
         ax.set_aspect('equal')
-        ax.grid(True, alpha=0.3)
+        self._style_ok_map_axes(ax)
+        colorbar = self._add_ok_map_colorbar(
+            figure, mappable, ax, ok_parameter, levels=levels
+        )
+        setattr(self, colorbar_attr, colorbar)
         self._apply_ok_map_wells_visibility()
         self._finalize_ok_map_figure_layout(figure, canvas)
 
@@ -1977,10 +2339,10 @@ class MonitoringNetworksDialog(QDialog):
         title,
         color_limits=None,
     ):
-        """Draw OK kriging standard-error surface with well markers.
+        """Draw OK kriging standard-error surface as nearest-neighbor imshow.
 
-        Uses the same triangulation path as the estimate map; colormap is
-        ``Reds`` so SE is visually distinct from estimate ``viridis``.
+        No isolines. Colormap is ``Reds`` so SE is visually distinct from
+        estimate ``viridis``. Colorbar ticks use MaxNLocator(nbins=6).
         """
         coordinates = context['coordinates']
         selected_indices = np.asarray(selected_indices, dtype=int)
@@ -1988,6 +2350,7 @@ class MonitoringNetworksDialog(QDialog):
 
         gx = context['grid'][:, 0]
         gy = context['grid'][:, 1]
+        self._disconnect_point_hover(canvas)
         ax.clear()
 
         if color_limits is None:
@@ -1995,31 +2358,29 @@ class MonitoringNetworksDialog(QDialog):
         vmin = vmax = None
         if color_limits is not None:
             vmin, vmax = color_limits
+        levels = self._ok_map_locator_levels(vmin, vmax, nbins=6)
 
         se_label = QCoreApplication.translate("Tab 5", "Standard error")
+        raster = self._grid_field_to_raster(context['grid'], std_error)
+        mappable = None
         try:
-            import matplotlib.tri as mtri
-            triangulation = mtri.Triangulation(gx, gy)
-            if vmin is not None and vmax is not None:
-                levels = np.linspace(vmin, vmax, 21)
-                contour = ax.tricontourf(
-                    triangulation,
-                    std_error,
-                    levels=levels,
-                    cmap='Reds',
-                    vmin=vmin,
-                    vmax=vmax,
-                )
-            else:
-                contour = ax.tricontourf(
-                    triangulation,
-                    std_error,
-                    levels=20,
-                    cmap='Reds',
-                )
-            colorbar = figure.colorbar(contour, ax=ax, label=se_label)
+            if raster is None:
+                raise ValueError("cannot reshape SE field to a regular raster")
+            xs, ys, z = raster
+            z_plot = np.ma.masked_invalid(z)
+            mappable = ax.imshow(
+                z_plot,
+                origin='lower',
+                extent=self._raster_imshow_extent(xs, ys),
+                aspect='equal',
+                interpolation='nearest',
+                cmap='Reds',
+                vmin=vmin,
+                vmax=vmax,
+                zorder=1,
+            )
         except Exception:
-            scatter = ax.scatter(
+            mappable = ax.scatter(
                 gx,
                 gy,
                 c=std_error,
@@ -2029,8 +2390,6 @@ class MonitoringNetworksDialog(QDialog):
                 vmin=vmin,
                 vmax=vmax,
             )
-            colorbar = figure.colorbar(scatter, ax=ax, label=se_label)
-        setattr(self, colorbar_attr, colorbar)
 
         all_selected = n_selected == coordinates.shape[0]
         sel_coords = coordinates[selected_indices]
@@ -2051,12 +2410,24 @@ class MonitoringNetworksDialog(QDialog):
         )
         self._register_ok_map_well_scatter(canvas, well_scatter)
 
+        # Hover targets: all wells in the network (raw IDs, never translated).
+        point_ids = context.get('point_ids')
+        if point_ids is not None and coordinates is not None:
+            coords = np.asarray(coordinates, dtype=float)
+            id_labels = [str(pid) for pid in point_ids]
+            if len(id_labels) == coords.shape[0]:
+                self._attach_point_hover(canvas, ax, coords, id_labels)
+
         ax.set_xlabel(QCoreApplication.translate("Tab 5", "X"))
         ax.set_ylabel(QCoreApplication.translate("Tab 5", "Y"))
         ax.set_title(title)
         ax.legend(loc='best', fontsize=8)
         ax.set_aspect('equal')
-        ax.grid(True, alpha=0.3)
+        self._style_ok_map_axes(ax)
+        colorbar = self._add_ok_map_colorbar(
+            figure, mappable, ax, se_label, levels=levels
+        )
+        setattr(self, colorbar_attr, colorbar)
         self._apply_ok_map_wells_visibility()
         self._finalize_ok_map_figure_layout(figure, canvas)
 
@@ -2100,12 +2471,13 @@ class MonitoringNetworksDialog(QDialog):
         )
 
         n_total = context['values'].size
+        ok_parameter = context.get('ok_parameter') or context['attr_name']
         if network_indices is None:
             info_label.setText(
                 QCoreApplication.translate(
                     "Tab 5",
                     "Leave-one-out cross-validation for «{param}» ({n} points).",
-                ).format(param=context['attr_name'], n=n_total)
+                ).format(param=ok_parameter, n=n_total)
             )
         else:
             info_label.setText(
@@ -2114,7 +2486,7 @@ class MonitoringNetworksDialog(QDialog):
                     "Cross-validation for «{param}» using {n_network} network "
                     "wells ({n_total} points).",
                 ).format(
-                    param=context['attr_name'],
+                    param=ok_parameter,
                     n_network=len(network_indices),
                     n_total=n_total,
                 )
@@ -2202,10 +2574,11 @@ class MonitoringNetworksDialog(QDialog):
         self.results_all_interp_ax = self.results_all_interp_figure.axes[0]
         color_limits = self._ok_interpolation_color_limits(estimates)
         self.results_interp_color_limits = color_limits
+        ok_parameter = context.get('ok_parameter') or context['attr_name']
         title = QCoreApplication.translate(
             "Tab 5",
             "O.K. – {param}\n(all {n} wells)",
-        ).format(param=context['attr_name'], n=n_wells)
+        ).format(param=ok_parameter, n=n_wells)
         self._draw_ok_interpolation_map(
             self.results_all_interp_figure,
             self.results_all_interp_canvas,
@@ -2235,8 +2608,8 @@ class MonitoringNetworksDialog(QDialog):
             self.results_se_color_limits = se_limits
             se_title = QCoreApplication.translate(
                 "Tab 5",
-                "S.E. – {param} (all {n} wells)",
-            ).format(param=context['attr_name'], n=n_wells)
+                "S.E. – {param} \n(all {n} wells)",
+            ).format(param=ok_parameter, n=n_wells)
             self._draw_ok_std_error_map(
                 self.results_all_se_figure,
                 self.results_all_se_canvas,
@@ -2389,10 +2762,11 @@ class MonitoringNetworksDialog(QDialog):
             )
             self.results_sel_interp_ax = self.results_sel_interp_figure.axes[0]
             color_limits = self._ensure_ok_interpolation_color_limits(context)
+            ok_parameter = context.get('ok_parameter') or context['attr_name']
             title = QCoreApplication.translate(
                 "Tab 5",
                 "O.K. – {param}\n({n} wells)",
-            ).format(param=context['attr_name'], n=n_use)
+            ).format(param=ok_parameter, n=n_use)
             self._draw_ok_interpolation_map(
                 self.results_sel_interp_figure,
                 self.results_sel_interp_canvas,
@@ -2421,8 +2795,8 @@ class MonitoringNetworksDialog(QDialog):
                 se_limits = self._ensure_ok_se_color_limits(context)
                 se_title = QCoreApplication.translate(
                     "Tab 5",
-                    "Kriging SE – {param} ({n} wells)",
-                ).format(param=context['attr_name'], n=n_use)
+                    "S.E. – {param} \n({n} wells)",
+                ).format(param=ok_parameter, n=n_use)
                 self._draw_ok_std_error_map(
                     self.results_sel_se_figure,
                     self.results_sel_se_canvas,
@@ -2456,13 +2830,17 @@ class MonitoringNetworksDialog(QDialog):
         finally:
             if report_progress:
                 if completed_ok:
-                    self._set_progress(
-                        100,
-                        QCoreApplication.translate(
-                            "Tab 5", "State: Completed"
-                        ),
-                    )
-                    QTimer.singleShot(1000, self._reset_progress)
+                    combined_hint = self._tab5_combined_ok_progress_hint()
+                    if combined_hint is not None:
+                        self._set_progress(0, combined_hint)
+                    else:
+                        self._set_progress(
+                            100,
+                            QCoreApplication.translate(
+                                "Tab 5", "State: Completed"
+                            ),
+                        )
+                        QTimer.singleShot(1000, self._reset_progress)
                 else:
                     self._reset_progress()
 
@@ -2488,11 +2866,15 @@ class MonitoringNetworksDialog(QDialog):
             self._refresh_ok_interpolation_plots(
                 refresh_all=True, refresh_selected=True
             )
-            self._set_progress(
-                100,
-                QCoreApplication.translate("Tab 5", "State: Completed"),
-            )
-            QTimer.singleShot(1000, self._reset_progress)
+            combined_hint = self._tab5_combined_ok_progress_hint()
+            if combined_hint is not None:
+                self._set_progress(0, combined_hint)
+            else:
+                self._set_progress(
+                    100,
+                    QCoreApplication.translate("Tab 5", "State: Completed"),
+                )
+                QTimer.singleShot(1000, self._reset_progress)
         except Exception:
             self._reset_progress(
                 QCoreApplication.translate("Tab 5", "State: Error")
@@ -2636,8 +3018,8 @@ class MonitoringNetworksDialog(QDialog):
         """
         Maps scattered estimation-grid values onto a regular 2-D raster array.
 
-        The Tab 3 grid may be hull-clipped (not a full rectangle). Unique X/Y
-        coordinates define the raster lattice; missing cells use ``nodata``.
+        Wraps ``_grid_field_to_raster`` and adapts it for GDAL GeoTIFF export:
+        north-up row order and ``nodata`` for cells outside the hull.
 
         Returns:
             (raster_array, geotransform) where raster_array is float32 with
@@ -2645,50 +3027,15 @@ class MonitoringNetworksDialog(QDialog):
             6-tuple (origin_x, pixel_width, 0, origin_y, 0, -pixel_height).
             Returns (None, None) when spacing cannot be inferred.
         """
-        grid_xy = np.asarray(grid_xy, dtype=float)
-        estimates = np.asarray(estimates, dtype=float).ravel()
-        if grid_xy.ndim != 2 or grid_xy.shape[0] != estimates.size:
+        built = self._grid_field_to_raster(grid_xy, estimates)
+        if built is None:
             return None, None
+        xs, ys, z = built
+        dx, dy = self._raster_cell_size(xs, ys)
 
-        # Round for stable unique axes when floating-point coords jitter slightly.
-        xs = np.unique(np.round(grid_xy[:, 0], decimals=8))
-        ys = np.unique(np.round(grid_xy[:, 1], decimals=8))
-        if xs.size < 2 or ys.size < 2:
-            return None, None
-
-        dx = float(np.median(np.diff(xs)))
-        dy = float(np.median(np.diff(ys)))
-        if dx <= 0 or dy <= 0:
-            return None, None
-
-        # Prefer Tab 3 spacing when available (more robust than median diffs).
-        grid_info = getattr(self, 'current_grid_info', None) or {}
-        spacing = grid_info.get('spacing')
-        if spacing is not None:
-            try:
-                spacing = float(spacing)
-                if spacing > 0:
-                    dx = spacing
-                    dy = spacing
-            except (TypeError, ValueError):
-                pass
-
-        n_cols = int(xs.size)
-        n_rows = int(ys.size)
-        raster = np.full((n_rows, n_cols), nodata, dtype=np.float32)
-
-        x_to_col = {float(x): i for i, x in enumerate(xs)}
-        # North-up: largest Y is row 0.
-        y_to_row = {float(y): (n_rows - 1 - i) for i, y in enumerate(ys)}
-
-        for (x, y), value in zip(grid_xy, estimates):
-            if not np.isfinite(value):
-                continue
-            col = x_to_col.get(float(np.round(x, decimals=8)))
-            row = y_to_row.get(float(np.round(y, decimals=8)))
-            if col is None or row is None:
-                continue
-            raster[row, col] = float(value)
+        # North-up for GDAL: flip so row 0 is max Y; fill NaN with nodata.
+        raster = np.flipud(z).astype(np.float32, copy=False)
+        raster = np.where(np.isfinite(raster), raster, np.float32(nodata))
 
         # GDAL geotransform: top-left corner of the top-left pixel.
         origin_x = float(xs[0]) - dx / 2.0
@@ -2696,7 +3043,9 @@ class MonitoringNetworksDialog(QDialog):
         geotransform = (origin_x, dx, 0.0, origin_y, 0.0, -dy)
         return raster, geotransform
 
-    def _write_temp_geotiff(self, raster, geotransform, crs, nodata=-9999.0):
+    def _write_temp_geotiff(
+        self, raster, geotransform, crs, nodata=-9999.0, band_description=None
+    ):
         """Writes a single-band Float32 GeoTIFF to a temp file; returns its path."""
         import tempfile
         from osgeo import gdal, osr
@@ -2728,6 +3077,8 @@ class MonitoringNetworksDialog(QDialog):
 
         band = dataset.GetRasterBand(1)
         band.SetNoDataValue(float(nodata))
+        if band_description:
+            band.SetDescription(str(band_description))
         band.WriteArray(raster)
         band.FlushCache()
         dataset.FlushCache()
@@ -2863,12 +3214,17 @@ class MonitoringNetworksDialog(QDialog):
             )
             return
 
-        display_name = self._mn_parameter_display_name(context['attr_name'])
+        # Layer name uses the interpolated parameter, not "Parameters combined".
+        display_name = context.get('ok_parameter') or context['attr_name']
         try:
             from qgis.core import QgsRasterLayer
 
             tif_path = self._write_temp_geotiff(
-                raster, geotransform, layer.crs(), nodata=nodata
+                raster,
+                geotransform,
+                layer.crs(),
+                nodata=nodata,
+                band_description=display_name,
             )
             layer_name = QCoreApplication.translate(
                 "Tab 5",
@@ -2981,6 +3337,12 @@ class MonitoringNetworksDialog(QDialog):
             return
 
         next_index = current + 1
+        if current == 2 and not self._has_estimation_grid():
+            self._update_workflow_navigation_state()
+            return
+        if current == 3 and not self._has_current_optimization():
+            self._update_workflow_navigation_state()
+            return
         self._enable_workflow_tab(next_index)
         self.tabs.setCurrentIndex(next_index)
 
@@ -2999,6 +3361,55 @@ class MonitoringNetworksDialog(QDialog):
             text = f"{value:.6g}"
             return text
         return str(value)
+
+    @staticmethod
+    def _is_numeric_qgs_field(field):
+        """True when the QgsField type is Int / Double / LongLong."""
+        if field is None:
+            return False
+        return field.type() in (QVariant.Int, QVariant.Double, QVariant.LongLong)
+
+    @classmethod
+    def make_layer_attribute_table_item(cls, value, field, read_only_flags):
+        """
+        Build a read-only cell for Tab 1 layer attribute values.
+
+        Numeric QgsFields store an int/float in Qt.DisplayRole so native
+        QTableWidget header sorting is numeric (not lexicographic). Null or
+        non-finite values stay as an empty string (not 0).
+        """
+        item = QTableWidgetItem()
+        item.setFlags(read_only_flags)
+
+        if value is None or (isinstance(value, QVariant) and value.isNull()):
+            item.setData(Qt.DisplayRole, "")
+            return item
+        if isinstance(value, QVariant):
+            value = value.value()
+        if value is None:
+            item.setData(Qt.DisplayRole, "")
+            return item
+
+        if cls._is_numeric_qgs_field(field):
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                item.setData(
+                    Qt.DisplayRole, cls._format_layer_field_value(value)
+                )
+                return item
+            if not np.isfinite(number):
+                item.setData(Qt.DisplayRole, "")
+                return item
+            # Prefer int DisplayRole for integer field types.
+            if field.type() in (QVariant.Int, QVariant.LongLong):
+                item.setData(Qt.DisplayRole, int(round(number)))
+            else:
+                item.setData(Qt.DisplayRole, float(number))
+            return item
+
+        item.setData(Qt.DisplayRole, cls._format_layer_field_value(value))
+        return item
 
     def _all_layer_feature_ids(self, layer):
         """Returns the set of all feature IDs in the layer."""
@@ -3115,6 +3526,8 @@ class MonitoringNetworksDialog(QDialog):
         self._syncing_well_include = True
         try:
             self.layer_fields_table.blockSignals(True)
+            # Disable sorting while filling so rows are not reordered mid-loop.
+            self.layer_fields_table.setSortingEnabled(False)
             self.layer_fields_table.clear()
             self.layer_fields_table.setRowCount(0)
             self.layer_fields_table.setColumnCount(0)
@@ -3161,13 +3574,17 @@ class MonitoringNetworksDialog(QDialog):
                 self.layer_fields_table.setItem(row, 0, include_item)
 
                 for col, field_name in enumerate(field_names):
-                    text = self._format_layer_field_value(feature[field_name])
-                    value_item = QTableWidgetItem(text)
-                    value_item.setFlags(read_only)
+                    # Numeric fields use numeric DisplayRole for native sort.
+                    value_item = self.make_layer_attribute_table_item(
+                        feature[field_name],
+                        fields[col],
+                        read_only,
+                    )
                     self.layer_fields_table.setItem(row, col + 1, value_item)
 
             self.layer_fields_table.resizeColumnsToContents()
         finally:
+            self.layer_fields_table.setSortingEnabled(True)
             self.layer_fields_table.blockSignals(False)
             self._syncing_well_include = False
 
@@ -3187,13 +3604,165 @@ class MonitoringNetworksDialog(QDialog):
             self.progress_bar.setFormat(status_message)
         QApplication.processEvents()
 
+    def _tab1_progress_hint(self):
+        """Idle guidance text for Tab 1 based on attribute selection."""
+        if self._selected_analysis_parameters():
+            return QCoreApplication.translate(
+                "Tab 1", "Click Next to run the geostatistics"
+            )
+        return QCoreApplication.translate(
+            "Tab 1",
+            "Select an attribute of the layer to use as optimization param",
+        )
+
+    def _update_tab1_progress_hint(self):
+        """Show Tab 1 guidance on the progress bar when idle on that tab."""
+        if not hasattr(self, 'progress_bar') or not hasattr(self, 'tabs'):
+            return
+        if self.tabs.currentIndex() != 0:
+            return
+        if self.progress_bar.value() > 0:
+            return
+        self._set_progress(0, self._tab1_progress_hint())
+
+    def _has_estimation_grid(self):
+        """True when Tab 3 has a generated or imported estimation grid."""
+        points = getattr(self, 'current_grid_points', None)
+        return points is not None and len(points) > 0
+
+    def _has_current_optimization(self):
+        """True when Tab 4 has optimization results for the active parameter."""
+        attr_name = self._current_mn_parameter()
+        if not attr_name:
+            return False
+        return attr_name in getattr(self, 'variance_results', {})
+
+    def _can_advance_from_tab(self, index):
+        """Whether the guided workflow may move to the next tab from ``index``."""
+        last_index = self.tabs.count() - 1
+        if index >= last_index:
+            return False
+        if index == 2:
+            return self._has_estimation_grid()
+        if index == 3:
+            return self._has_current_optimization()
+        return True
+
+    def _tab3_progress_hint(self):
+        """Idle guidance on Tab 3 when no estimation grid is available."""
+        if self._has_estimation_grid():
+            return QCoreApplication.translate(
+                "Tab 3", "Click Next to continue to well prioritization."
+            )
+        return QCoreApplication.translate(
+            "Tab 3",
+            "Calculate or import an estimation grid to continue.",
+        )
+
+    def _tab4_progress_hint(self):
+        """Idle guidance on Tab 4 when optimization has not been run."""
+        if self._has_current_optimization():
+            return QCoreApplication.translate(
+                "Tab 4", "Click Next to view the optimization map."
+            )
+        return QCoreApplication.translate(
+            "Tab 4",
+            "Run Optimize to compute well prioritization before continuing.",
+        )
+
+    def _update_tab3_progress_hint(self):
+        """Show Tab 3 guidance on the progress bar when idle."""
+        if not hasattr(self, 'progress_bar') or not hasattr(self, 'tabs'):
+            return
+        if self.tabs.currentIndex() != 2:
+            return
+        if self.progress_bar.value() > 0:
+            return
+        self._set_progress(0, self._tab3_progress_hint())
+
+    def _update_tab4_progress_hint(self):
+        """Show Tab 4 guidance on the progress bar when idle."""
+        if not hasattr(self, 'progress_bar') or not hasattr(self, 'tabs'):
+            return
+        if self.tabs.currentIndex() != 3:
+            return
+        if self.progress_bar.value() > 0:
+            return
+        self._set_progress(0, self._tab4_progress_hint())
+
+    def _update_workflow_navigation_state(self):
+        """Refresh Next-button state and tab-specific idle progress hints."""
+        if not hasattr(self, 'tabs') or not hasattr(self, 'next_btn'):
+            return
+        index = self.tabs.currentIndex()
+        self.next_btn.setEnabled(self._can_advance_from_tab(index))
+        if index == 0:
+            self._update_tab1_progress_hint()
+        elif index == 2:
+            self._update_tab3_progress_hint()
+        elif index == 3:
+            self._update_mn_well_weight_info()
+            self._update_tab4_progress_hint()
+        elif index == self.tabs.count() - 1:
+            self._update_tab5_progress_hint()
+
+    def _tab5_combined_ok_progress_hint(self):
+        """Idle note for Tab 5 when OK maps use the first combined parameter."""
+        if not self._is_combined_mn_parameter(self._current_mn_parameter()):
+            return None
+        ok_parameter = self._tab5_reference_parameter()
+        if not ok_parameter:
+            return None
+        return QCoreApplication.translate(
+            "Tab 5",
+            "O.K. Interpolation was generated with just the first listed "
+            "parameter of the combined ones («{param}»).",
+        ).format(param=ok_parameter)
+
+    def _update_tab5_progress_hint(self):
+        """Show the combined-OK note when idle on Tab 5."""
+        if not hasattr(self, 'progress_bar') or not hasattr(self, 'tabs'):
+            return
+        # Tab 5 is the last main tab (Map).
+        if self.tabs.currentIndex() != self.tabs.count() - 1:
+            return
+        if self.progress_bar.value() > 0:
+            return
+        hint = self._tab5_combined_ok_progress_hint()
+        if hint is not None:
+            self._set_progress(0, hint)
+
+    def _on_main_tab_changed(self, index):
+        """Update Next-button enable state and tab-specific progress hints."""
+        self._update_workflow_navigation_state()
+
     def _reset_progress(self, status_message=None):
         """Reset the shared progress bar to idle (Ready) or a custom message."""
         if status_message is None:
-            status_message = QCoreApplication.translate(
-                "Main Window", "State: Ready"
-            )
+            if hasattr(self, 'tabs'):
+                tab_index = self.tabs.currentIndex()
+                if tab_index == 0:
+                    status_message = self._tab1_progress_hint()
+                elif tab_index == 2:
+                    status_message = self._tab3_progress_hint()
+                elif tab_index == 3:
+                    status_message = self._tab4_progress_hint()
+                elif tab_index == self.tabs.count() - 1:
+                    status_message = self._tab5_combined_ok_progress_hint()
+                    if status_message is None:
+                        status_message = QCoreApplication.translate(
+                            "Main Window", "State: Ready"
+                        )
+                else:
+                    status_message = QCoreApplication.translate(
+                        "Main Window", "State: Ready"
+                    )
+            else:
+                status_message = QCoreApplication.translate(
+                    "Main Window", "State: Ready"
+                )
         self._set_progress(0, status_message)
+        self._update_workflow_navigation_state()
 
     def _set_variogram_progress(self, percent=None, status_message=None):
         """Tab 2 compatibility: write variogram status to the shared bar."""
@@ -3221,7 +3790,54 @@ class MonitoringNetworksDialog(QDialog):
         finally:
             self._syncing_variogram = False
 
+        self._clear_variogram_autofit_status()
         self._reset_variogram_progress()
+
+    def _set_variogram_autofit_status(self, ok):
+        """Show success/failure message above the variogram parameters table."""
+        if not hasattr(self, 'var_autofit_status_label'):
+            return
+        label = self.var_autofit_status_label
+        if ok is None:
+            label.clear()
+            label.setVisible(False)
+            return
+        if ok:
+            label.setText(
+                QCoreApplication.translate(
+                    "Tab 2",
+                    "Variogram parameters auto-fit succeeded. "
+                    "You can compare different models.",
+                )
+            )
+            label.setStyleSheet("color: #1e8449; font-style: italic;")
+        else:
+            label.setText(
+                QCoreApplication.translate(
+                    "Tab 2",
+                    "Auto-fit was not successful; adjust the model and "
+                    "parameters manually.",
+                )
+            )
+            label.setStyleSheet("color: #a04000; font-style: italic;")
+        label.setVisible(True)
+
+    def _refresh_variogram_autofit_status(self, attr_name=None):
+        """Refresh autofit status label from stored state for one parameter."""
+        if attr_name is None:
+            attr_name = self._current_analysis_attribute()
+        if not attr_name:
+            self._clear_variogram_autofit_status()
+            return
+        state = self._get_variogram_state(attr_name)
+        if not state or 'autofit_ok' not in state:
+            self._clear_variogram_autofit_status()
+            return
+        self._set_variogram_autofit_status(bool(state.get('autofit_ok')))
+
+    def _clear_variogram_autofit_status(self):
+        """Hide the autofit status label (layer/data reset)."""
+        self._set_variogram_autofit_status(None)
 
     def _clear_estimation_grid(self):
         """
@@ -3270,6 +3886,7 @@ class MonitoringNetworksDialog(QDialog):
             )
 
         self._update_mn_grid_weight_info()
+        self._update_workflow_navigation_state()
 
     def on_layer_changed(self, layer):
         """Update the layer information and the numeric attributes."""
@@ -3283,6 +3900,7 @@ class MonitoringNetworksDialog(QDialog):
         self._layer_data_by_attribute.clear()
         self.variogram_models_by_attribute.clear()
         self.variance_results = {}
+        self._tab1_params_for_optimization = frozenset()
         self._sync_var_params_table_from_store()
         self.selected_data_parameters.clear()
         self.clear_stats_table()
@@ -3301,10 +3919,17 @@ class MonitoringNetworksDialog(QDialog):
         if not layer:
             self.layer_info.clear()
             self._refresh_layer_fields_table(None)
+            self._apply_default_node_spacing(None)
+            if hasattr(self, 'estimated_points_label'):
+                self.estimated_points_label.setText(
+                    QCoreApplication.translate("Tab 3", "N/A")
+                )
+            self._update_tab1_progress_hint()
             return
 
         self._refresh_layer_fields_table(layer)
-        # Spacing-based node estimate depends on the new layer extent.
+        # Recalculate Tab 3 default spacing and node estimate for the new layer.
+        self._apply_default_node_spacing(layer)
         if hasattr(self, 'update_estimated_points'):
             self.update_estimated_points()
         info = QCoreApplication.translate(
@@ -3326,6 +3951,7 @@ class MonitoringNetworksDialog(QDialog):
         for field in layer.fields():
             if field.type() in (QVariant.Int, QVariant.Double, QVariant.LongLong):
                 self.selected_data_parameters.addItem(field.name())
+        self._update_tab1_progress_hint()
 
     def _current_analysis_attribute(self):
         """Returns the Tab 2 active parameter (stats-table row selection), or None."""
@@ -3339,22 +3965,31 @@ class MonitoringNetworksDialog(QDialog):
         return attr
 
     def _highlight_active_stats_row(self):
-        """Select the stats_table row that matches the active parameter."""
+        """Mark the active parameter row with bold text (no selection fill)."""
         if not hasattr(self, 'stats_table'):
             return
+
+        self.stats_table.clearSelection()
+
         attr = self._current_analysis_attribute()
-        if not attr:
-            self.stats_table.clearSelection()
-            return
-        row = self._stats_table_row_for_attribute(attr)
-        if row < 0:
-            self.stats_table.clearSelection()
-            return
-        self.stats_table.blockSignals(True)
-        try:
-            self.stats_table.selectRow(row)
-        finally:
-            self.stats_table.blockSignals(False)
+        active_row = (
+            self._stats_table_row_for_attribute(attr) if attr else -1
+        )
+
+        for row in range(self.stats_table.rowCount()):
+            bold = row == active_row
+            header_item = self.stats_table.verticalHeaderItem(row)
+            if header_item is not None:
+                font = header_item.font()
+                font.setBold(bold)
+                header_item.setFont(font)
+            for col in range(self.stats_table.columnCount()):
+                item = self.stats_table.item(row, col)
+                if item is None:
+                    continue
+                font = item.font()
+                font.setBold(bold)
+                item.setFont(font)
 
     def _on_stats_table_parameter_header_clicked(self, row):
         """
@@ -3507,12 +4142,20 @@ class MonitoringNetworksDialog(QDialog):
             return
 
         layer = self.input_data_layer.currentLayer()
+        selected = self._selected_analysis_parameters()
         attr_name = self._current_mn_parameter()
-        weight_field = None
-        lookup_attr = attr_name
+        # Prefer Tab 1 selection so a single selected parameter still resolves
+        # a lookup attribute when the Tab 4 combo is empty/disabled.
         if self._is_combined_mn_parameter(attr_name):
-            selected = self._selected_analysis_parameters()
             lookup_attr = selected[0] if selected else None
+        elif selected:
+            lookup_attr = selected[0]
+        elif attr_name:
+            lookup_attr = attr_name
+        else:
+            lookup_attr = None
+
+        weight_field = None
         if layer and lookup_attr:
             weight_field = resolve_well_weight_field(layer, lookup_attr)
 
@@ -3545,24 +4188,42 @@ class MonitoringNetworksDialog(QDialog):
                 ).format(field=weight_field)
             )
 
+    def _on_mn_well_weight_toggled(self, _checked):
+        """User toggled well weights: rankings that used the old setting are stale."""
+        if getattr(self, 'variance_results', None):
+            self._clear_all_optimization_results(
+                tab5_message=QCoreApplication.translate(
+                    "Tab 5",
+                    "Weight option changed. Run Optimize on tab 4 again.",
+                ),
+                tab4_message=QCoreApplication.translate(
+                    "Tab 4",
+                    "Well weight option changed. Click Optimize again.",
+                ),
+            )
+        self._update_mn_well_weight_info()
+
+    def _on_mn_grid_weight_toggled(self, _checked):
+        """User toggled grid weights: rankings that used the old setting are stale."""
+        if getattr(self, 'variance_results', None):
+            self._clear_all_optimization_results(
+                tab5_message=QCoreApplication.translate(
+                    "Tab 5",
+                    "Weight option changed. Run Optimize on tab 4 again.",
+                ),
+                tab4_message=QCoreApplication.translate(
+                    "Tab 4",
+                    "Grid weight option changed. Click Optimize again.",
+                ),
+            )
+        self._update_mn_grid_weight_info()
+
     def _on_mn_parameter_changed(self, _index):
-        """Refresh tab 4/5 views when the optimized parameter changes."""
+        """Show cached Optimize results for the selected parameter, or clear UI."""
         self._update_results_well_spinbox()
         self._update_mn_well_weight_info()
         self._update_mn_grid_weight_info()
-
-        param_key = self._current_mn_parameter()
-        if param_key and param_key in self.variance_results:
-            results = self.variance_results[param_key]
-            self._update_variance_reduction_plot(
-                results,
-                self._mn_parameter_display_name(param_key),
-            )
-            self._update_prioritization_order_table(
-                results, param_key=param_key
-            )
-
-        self._refresh_ok_interpolation_plot()
+        self._load_optimization_views_for_current_parameter()
 
     def _mn_combined_parameters_label(self):
         return QCoreApplication.translate("Tab 4", "Parameters combined")
@@ -3589,11 +4250,13 @@ class MonitoringNetworksDialog(QDialog):
 
     def _current_mn_parameter(self):
         """Returns tab-4 parameter key (name or MN_COMBINED_PARAMETERS_KEY), or None."""
+        selected = self._selected_analysis_parameters()
         if (
             not hasattr(self, 'mn_param_select_combo')
             or not self.mn_param_select_combo.isEnabled()
         ):
-            return None
+            # Combo may be disabled before sync; Tab 1 selection is still valid.
+            return selected[0] if selected else None
         data = self.mn_param_select_combo.currentData()
         if data == MN_COMBINED_PARAMETERS_KEY:
             return MN_COMBINED_PARAMETERS_KEY
@@ -3601,8 +4264,10 @@ class MonitoringNetworksDialog(QDialog):
             return str(data)
         text = self.mn_param_select_combo.currentText()
         if text == QCoreApplication.translate("Tab 4", "No parameter selected"):
-            return None
-        return text
+            return selected[0] if selected else None
+        if text:
+            return text
+        return selected[0] if selected else None
 
     def _load_optimization_parameters(self, param_names):
         """
@@ -3822,6 +4487,7 @@ class MonitoringNetworksDialog(QDialog):
         if not hasattr(self, 'variance_ax'):
             return
 
+        self._disconnect_point_hover(getattr(self, 'variance_canvas', None))
         self.variance_ax.clear()
         self.variance_ax.text(
             0.5,
@@ -3881,6 +4547,10 @@ class MonitoringNetworksDialog(QDialog):
 
         selection_order = np.asarray(selection_order, dtype=int)
         total_variance = resolve_total_variance_series(results)
+        # Adverse remaining variance (%) along adverse_selection_order (index 0 = baseline).
+        adverse_total_variance = np.asarray(
+            results.get('adverse_total_variance_percent', []), dtype=float
+        )
 
         # Map well index -> 1-based adverse rank (least reduction first).
         adverse_rank_by_well_idx = {}
@@ -3892,7 +4562,10 @@ class MonitoringNetworksDialog(QDialog):
                 adverse_rank_by_well_idx[int(well_idx)] = adverse_rank
 
         read_only = Qt.ItemIsSelectable | Qt.ItemIsEnabled
-        self.mn_prioritization_order_table.setRowCount(selection_order.size)
+        table = self.mn_prioritization_order_table
+        # Avoid re-sorting on every setItem while rows are being filled.
+        table.setSortingEnabled(False)
+        table.setRowCount(selection_order.size)
 
         for row, well_idx in enumerate(selection_order):
             rank = row + 1
@@ -3903,38 +4576,232 @@ class MonitoringNetworksDialog(QDialog):
                 else str(well_idx)
             )
             if well_weights is not None and well_idx < well_weights.size:
-                weight_text = f"{float(well_weights[well_idx]):.3f}"
+                weight_val = float(well_weights[well_idx])
             else:
-                weight_text = "1.000"
+                weight_val = 1.0
 
             if rank < total_variance.size:
-                total_var_text = format_total_variance_pct(total_variance[rank])
+                total_var_val = float(total_variance[rank])
+                if not np.isfinite(total_var_val):
+                    total_var_val = None
             else:
-                total_var_text = format_total_variance_pct(None)
+                total_var_val = None
 
             adverse_rank = adverse_rank_by_well_idx.get(well_idx)
-            adverse_text = str(adverse_rank) if adverse_rank is not None else "—"
+            adverse_var_val = None
+            if (
+                adverse_rank is not None
+                and adverse_rank < adverse_total_variance.size
+            ):
+                adverse_var_val = float(adverse_total_variance[adverse_rank])
+                if not np.isfinite(adverse_var_val):
+                    adverse_var_val = None
 
-            cells = [
-                str(rank),
-                well_id,
-                weight_text,
-                total_var_text,
-                adverse_text,
-            ]
-            for col, text in enumerate(cells):
-                item = QTableWidgetItem(text)
-                item.setFlags(read_only)
-                self.mn_prioritization_order_table.setItem(row, col, item)
+            # Numeric DisplayRole so header sorting is numeric (not lexicographic).
+            priority_item = QTableWidgetItem()
+            priority_item.setData(Qt.DisplayRole, int(rank))
+            priority_item.setFlags(read_only)
+            table.setItem(row, 0, priority_item)
 
-        self.mn_prioritization_order_table.resizeColumnsToContents()
+            id_item = QTableWidgetItem(well_id)
+            id_item.setFlags(read_only)
+            table.setItem(row, 1, id_item)
 
-    def _update_variance_reduction_plot(self, results, display_name):
+            weight_item = QTableWidgetItem()
+            weight_item.setData(Qt.DisplayRole, float(weight_val))
+            weight_item.setFlags(read_only)
+            table.setItem(row, 2, weight_item)
+
+            var_item = QTableWidgetItem()
+            if total_var_val is None:
+                var_item.setData(Qt.DisplayRole, format_total_variance_pct(None))
+            else:
+                var_item.setData(Qt.DisplayRole, float(total_var_val))
+            var_item.setFlags(read_only)
+            table.setItem(row, 3, var_item)
+
+            adverse_item = QTableWidgetItem()
+            if adverse_rank is None:
+                adverse_item.setData(Qt.DisplayRole, "—")
+            else:
+                adverse_item.setData(Qt.DisplayRole, int(adverse_rank))
+            adverse_item.setFlags(read_only)
+            table.setItem(row, 4, adverse_item)
+
+            adverse_var_item = QTableWidgetItem()
+            if adverse_var_val is None:
+                adverse_var_item.setData(
+                    Qt.DisplayRole, format_total_variance_pct(None)
+                )
+            else:
+                adverse_var_item.setData(Qt.DisplayRole, float(adverse_var_val))
+            adverse_var_item.setFlags(read_only)
+            table.setItem(row, 5, adverse_var_item)
+
+        table.resizeColumnsToContents()
+        table.setSortingEnabled(True)
+
+    def _variance_curve_hover_points(self, n_points, y_values, selection_order, point_ids):
+        """
+        Build hover markers for a variance-reduction curve.
+
+        n_points[0] is the zero-wells baseline (no ID). For n >= 1 the well
+        added at that step is selection_order[n - 1].
+        """
+        n_points = np.asarray(n_points, dtype=float).ravel()
+        y_values = np.asarray(y_values, dtype=float).ravel()
+        selection_order = np.asarray(selection_order, dtype=int).ravel()
+        if (
+            point_ids is None
+            or n_points.size == 0
+            or y_values.size != n_points.size
+            or selection_order.size == 0
+        ):
+            return np.empty((0, 2)), []
+
+        xs = []
+        ys = []
+        labels = []
+        for x_val, y_val in zip(n_points, y_values):
+            n_wells = int(round(float(x_val)))
+            if n_wells < 1 or n_wells > selection_order.size:
+                continue
+            if not np.isfinite(y_val):
+                continue
+            well_idx = int(selection_order[n_wells - 1])
+            if well_idx < 0 or well_idx >= len(point_ids):
+                continue
+            xs.append(float(x_val))
+            ys.append(float(y_val))
+            labels.append(str(point_ids[well_idx]))
+
+        if not labels:
+            return np.empty((0, 2)), []
+        return np.column_stack([xs, ys]), labels
+
+    def _disconnect_point_hover(self, canvas):
+        """Disconnect prior motion handler; clear canvas._point_hover_* refs."""
+        if canvas is None:
+            return
+        cid = getattr(canvas, '_point_hover_cid', None)
+        if cid is not None:
+            canvas.mpl_disconnect(cid)
+        canvas._point_hover_cid = None
+        canvas._point_hover_ann = None
+
+    def _attach_point_hover(
+        self, canvas, ax, xy, labels, *, pixel_tol=12, format_label=None
+    ):
+        """
+        Show an annotation for the nearest point under the cursor.
+
+        Nearest neighbor uses screen pixels via ax.transData.transform(xy)
+        so x/y units with different scales still feel natural.
+
+        xy: (N, 2) data coordinates
+        labels: sequence length N (well IDs as raw strings; never translated)
+        format_label: optional callable(label) -> str; default str(label)
+
+        The annotation is excluded from constrained_layout so edge tooltips
+        do not stretch the axes. Offset flips toward the axes interior.
+        """
+        self._disconnect_point_hover(canvas)
+        if canvas is None or ax is None:
+            return
+
+        hover_coords = np.asarray(xy, dtype=float)
+        if hover_coords.ndim != 2 or hover_coords.shape[0] == 0:
+            return
+        if len(labels) != hover_coords.shape[0]:
+            return
+
+        if format_label is None:
+            format_label = str
+        # Precompute display strings so the motion handler stays cheap.
+        display_labels = [format_label(label) for label in labels]
+
+        offset_pts = 8
+        hover_ann = ax.annotate(
+            '',
+            xy=(0, 0),
+            xytext=(offset_pts, offset_pts),
+            textcoords='offset points',
+            fontsize=8,
+            ha='left',
+            va='bottom',
+            bbox=dict(boxstyle='round,pad=0.3', fc='white', ec='gray'),
+            visible=False,
+            zorder=10,
+        )
+        # Keep tooltip out of layout so draw_idle does not reflow margins.
+        hover_ann.set_in_layout(False)
+        canvas._point_hover_ann = hover_ann
+
+        def _place_label_inward(ann, display_xy):
+            """Flip offset/alignment so the label stays inside ax.bbox."""
+            bbox = ax.bbox
+            dx = offset_pts if display_xy[0] <= bbox.x0 + bbox.width * 0.5 else -offset_pts
+            dy = offset_pts if display_xy[1] <= bbox.y0 + bbox.height * 0.5 else -offset_pts
+            ann.set_position((dx, dy))
+            ann.set_ha('left' if dx > 0 else 'right')
+            ann.set_va('bottom' if dy > 0 else 'top')
+
+        def on_motion(event):
+            ann = canvas._point_hover_ann
+            if ann is None:
+                return
+            if event.inaxes != ax or event.x is None or event.y is None:
+                if ann.get_visible():
+                    ann.set_visible(False)
+                    canvas.draw_idle()
+                return
+
+            # Pixel-space distance: independent of data-axis scale differences.
+            pts = ax.transData.transform(hover_coords)
+            mouse = np.array([event.x, event.y])
+            dist = np.hypot(pts[:, 0] - mouse[0], pts[:, 1] - mouse[1])
+            nearest = int(np.argmin(dist))
+            if dist[nearest] < pixel_tol:
+                label = display_labels[nearest]
+                point_xy = (
+                    float(hover_coords[nearest, 0]),
+                    float(hover_coords[nearest, 1]),
+                )
+                prev = (
+                    ann.get_text(),
+                    ann.get_visible(),
+                    ann.get_position(),
+                    ann.get_ha(),
+                    ann.get_va(),
+                )
+                ann.xy = point_xy
+                ann.set_text(label)
+                _place_label_inward(ann, pts[nearest])
+                ann.set_visible(True)
+                now = (
+                    ann.get_text(),
+                    ann.get_visible(),
+                    ann.get_position(),
+                    ann.get_ha(),
+                    ann.get_va(),
+                )
+                if now != prev:
+                    canvas.draw_idle()
+            elif ann.get_visible():
+                ann.set_visible(False)
+                canvas.draw_idle()
+
+        canvas._point_hover_cid = canvas.mpl_connect(
+            'motion_notify_event', on_motion
+        )
+
+    def _update_variance_reduction_plot(self, results, display_name, param_key=None):
         """Plot remaining total variance (%) for priority and adverse orders.
 
-        Well IDs are listed in the optimization-order table, not on the chart.
+        Well ID labels appear on marker hover (same pattern as tab 5 maps).
         90%/95% reference lines follow the prioritized (max-reduction) curve.
         """
+        self._disconnect_point_hover(getattr(self, 'variance_canvas', None))
         ax = self.variance_ax
         ax.clear()
 
@@ -3944,29 +4811,31 @@ class MonitoringNetworksDialog(QDialog):
         ax.plot(
             n_points,
             total_variance,
-            marker='^',
-            color='#27ae60',
-            linewidth=2,
-            markersize=5,
+            marker='o',
+            color='#3aa82d',
+            linewidth=1,
+            markersize=3,
             label=QCoreApplication.translate("Tab 4", "Prioritized wells"),
         )
 
         adverse_n_points = results.get('adverse_n_points')
         adverse_total = results.get('adverse_total_variance_percent')
+        adverse_order = results.get('adverse_selection_order')
         if adverse_n_points is not None and adverse_total is not None:
             adverse_n_points = np.asarray(adverse_n_points, dtype=float)
             adverse_total = np.asarray(adverse_total, dtype=float)
             ax.plot(
                 adverse_n_points,
                 adverse_total,
-                marker='^',
-                color='#8e44ad',
-                linewidth=2,
-                markersize=5,
+                marker='o',
+                color='#e13232',
+                linewidth=1,
+                markersize=3,
                 label=QCoreApplication.translate("Tab 4", "Adverse order"),
             )
         else:
             adverse_total = None
+            adverse_n_points = None
 
         final_pct = float(total_variance[-1]) if total_variance.size else 0.0
         max_reduction_pct = 100.0 - final_pct
@@ -3975,20 +4844,21 @@ class MonitoringNetworksDialog(QDialog):
             level_95 = 100.0 - 0.95 * max_reduction_pct
             ax.axhline(
                 level_90,
-                linestyle='--',
-                color='#e67e22',
-                linewidth=1.2,
+                linestyle='dotted',
+                color='deepskyblue',
+                linewidth=1,
                 label=QCoreApplication.translate(
-                    "Tab 4", "90% of maximum reduction"
+                    "Tab 4", "90% of max reduction ({:.2f}%)".format(level_90)
+               
                 ),
             )
             ax.axhline(
                 level_95,
-                linestyle='--',
-                color='#c0392b',
-                linewidth=1.2,
+                linestyle='dotted',
+                color='mediumblue',
+                linewidth=1,
                 label=QCoreApplication.translate(
-                    "Tab 4", "95% of maximum reduction"
+                    "Tab 4", "95% of max reduction ({:.2f}%)".format(level_95)
                 ),
             )
 
@@ -4023,6 +4893,46 @@ class MonitoringNetworksDialog(QDialog):
 
         self.variance_figure.tight_layout()
         self.variance_canvas.draw()
+
+        # Hover IDs for markers that correspond to an added well (n >= 1).
+        if param_key is None:
+            param_key = self._current_mn_parameter()
+        point_ids = None
+        if param_key is not None:
+            param_data = self._get_mn_parameter_data(param_key)
+            if param_data is not None:
+                point_ids = param_data.get('point_ids')
+
+        hover_coords_list = []
+        hover_labels = []
+        selection_order = results.get('selection_order')
+        if selection_order is not None and point_ids is not None:
+            coords, labels = self._variance_curve_hover_points(
+                n_points, total_variance, selection_order, point_ids
+            )
+            if labels:
+                hover_coords_list.append(coords)
+                hover_labels.extend(labels)
+        if (
+            adverse_n_points is not None
+            and adverse_total is not None
+            and adverse_order is not None
+            and point_ids is not None
+        ):
+            coords, labels = self._variance_curve_hover_points(
+                adverse_n_points, adverse_total, adverse_order, point_ids
+            )
+            if labels:
+                hover_coords_list.append(coords)
+                hover_labels.extend(labels)
+
+        if hover_labels:
+            self._attach_point_hover(
+                self.variance_canvas,
+                self.variance_ax,
+                np.vstack(hover_coords_list),
+                hover_labels,
+            )
 
     def _file_dialog_parent(self):
         """Parent widget for file dialogs (main window avoids Windows native crashes)."""
@@ -4101,6 +5011,9 @@ class MonitoringNetworksDialog(QDialog):
         results = self.variance_results[attr_name]
         selection_order = np.asarray(results['selection_order'], dtype=int)
         total_variance = resolve_total_variance_series(results)
+        adverse_total_variance = np.asarray(
+            results.get('adverse_total_variance_percent', []), dtype=float
+        )
 
         if self._is_combined_mn_parameter(attr_name):
             selected_parameters = self._selected_analysis_parameters()
@@ -4139,12 +5052,26 @@ class MonitoringNetworksDialog(QDialog):
             ):
                 adverse_rank_by_well_idx[int(well_idx)] = adverse_rank
 
+        use_well_weights = (
+            hasattr(self, 'mn_use_well_weights')
+            and self.mn_use_well_weights.isEnabled()
+            and self.mn_use_well_weights.isChecked()
+        )
+        use_grid_weights = (
+            hasattr(self, 'mn_use_grid_weights')
+            and self.mn_use_grid_weights.isEnabled()
+            and self.mn_use_grid_weights.isChecked()
+        )
+
         # Layer attributes first; prioritization metrics appended .
         prioritization_suffix_columns = [
             'Priority',
             'Parameter',
             'Variance',
             'Adverse_Order',
+            'Adverse_Variance',
+            'Use_Well_Weight',
+            'Use_Grid_Weight',
         ]
         prioritization_columns = field_names + prioritization_suffix_columns
 
@@ -4173,14 +5100,34 @@ class MonitoringNetworksDialog(QDialog):
             row['Adverse_Order'] = (
                 adverse_rank if adverse_rank is not None else ''
             )
+            if (
+                adverse_rank is not None
+                and adverse_rank < adverse_total_variance.size
+            ):
+                row['Adverse_Variance'] = float(
+                    adverse_total_variance[adverse_rank]
+                )
+            else:
+                row['Adverse_Variance'] = ''
+            row['Use_Well_Weight'] = bool(use_well_weights)
+            row['Use_Grid_Weight'] = bool(use_grid_weights)
             prioritization_rows.append(row)
 
+        cv_summary_export_columns = {
+            'min': 'CV_Min_Error',
+            'max': 'CV_Max_Error',
+            'mean': 'CV_Mean_Error',
+            'mae': 'CV_MAE',
+            'rmse': 'CV_RMSE',
+            'ase': 'CV_ASE',
+            'rmsse': 'CV_RMSSE',
+        }
         variogram_rows = []
         for param_name in sorted(self.variogram_models_by_attribute.keys()):
             state = self._get_variogram_state(param_name)
             if not state:
                 continue
-            variogram_rows.append({
+            row = {
                 'Parameter': param_name,
                 'Weight': float(state.get('weight', 1.0)),
                 'Transform': self._transform_display_text(
@@ -4191,7 +5138,26 @@ class MonitoringNetworksDialog(QDialog):
                 'Sill': float(state.get('sill', 0)),
                 'Range': float(state.get('range', 0)),
                 'R2': float(state.get('r2', 0)),
-            })
+            }
+            # Tab 2 leave-one-out CV over all wells (same metrics as the summary table).
+            cv_result, _point_ids, _cv_error = (
+                self._compute_parameter_cross_validation(
+                    param_name, network_indices=None
+                )
+            )
+            summary = (
+                cv_result.get('summary', {}) if cv_result is not None else {}
+            )
+            for key, column_name in cv_summary_export_columns.items():
+                value = summary.get(key, np.nan)
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    number = np.nan
+                row[column_name] = (
+                    number if np.isfinite(number) else ''
+                )
+            variogram_rows.append(row)
         variogram_columns = [
             'Parameter',
             'Weight',
@@ -4201,7 +5167,7 @@ class MonitoringNetworksDialog(QDialog):
             'Sill',
             'Range',
             'R2',
-        ]
+        ] + [cv_summary_export_columns[key] for key in CV_SUMMARY_KEYS]
 
         try:
             # XlsxWriter export avoids openpyxl style-init crashes on some QGIS builds.
@@ -4266,7 +5232,7 @@ class MonitoringNetworksDialog(QDialog):
             coords[:, 0],
             coords[:, 1],
             c='red',
-            marker='s',
+            marker='o',
             label=label,
             s=20,
             alpha=0.95,
@@ -4277,75 +5243,6 @@ class MonitoringNetworksDialog(QDialog):
 
         if annotate_ids and point_ids is not None:
             self._annotate_well_id_labels(ax, coords, point_ids)
-
-    def _disconnect_ok_interp_well_hover(self, canvas):
-        """Removes tab 5 interpolation map well-hover handlers from a canvas."""
-        if canvas is None:
-            return
-
-        cid = getattr(canvas, '_ok_interp_hover_cid', None)
-        if cid is not None:
-            canvas.mpl_disconnect(cid)
-        canvas._ok_interp_hover_cid = None
-        canvas._ok_interp_hover_ann = None
-
-    def _attach_ok_interp_well_hover(
-        self, canvas, ax, coordinates, point_ids, hover_indices
-    ):
-        """Shows well ID on hover for selected/red wells on tab 5 OK maps."""
-        self._disconnect_ok_interp_well_hover(canvas)
-        if point_ids is None or coordinates is None:
-            return
-
-        hover_indices = np.asarray(hover_indices, dtype=int)
-        if hover_indices.size == 0:
-            return
-
-        coords = np.asarray(coordinates, dtype=float)
-        hover_ann = ax.annotate(
-            '',
-            xy=(0, 0),
-            xytext=(8, 8),
-            textcoords='offset points',
-            fontsize=8,
-            ha='left',
-            va='bottom',
-            bbox=dict(boxstyle='round,pad=0.3', fc='white', ec='gray'),
-            visible=False,
-            zorder=10,
-        )
-        canvas._ok_interp_hover_ann = hover_ann
-        hover_coords = coords[hover_indices]
-
-        def on_motion(event):
-            ann = canvas._ok_interp_hover_ann
-            if ann is None:
-                return
-            if event.inaxes != ax or event.x is None or event.y is None:
-                if ann.get_visible():
-                    ann.set_visible(False)
-                    canvas.draw_idle()
-                return
-
-            pts = ax.transData.transform(hover_coords)
-            mouse = np.array([event.x, event.y])
-            dist = np.hypot(pts[:, 0] - mouse[0], pts[:, 1] - mouse[1])
-            nearest = int(np.argmin(dist))
-            if dist[nearest] < 12:
-                idx = hover_indices[nearest]
-                label = str(point_ids[idx])
-                if ann.get_text() != label or not ann.get_visible():
-                    ann.xy = (coords[idx, 0], coords[idx, 1])
-                    ann.set_text(label)
-                    ann.set_visible(True)
-                    canvas.draw_idle()
-            elif ann.get_visible():
-                ann.set_visible(False)
-                canvas.draw_idle()
-
-        canvas._ok_interp_hover_cid = canvas.mpl_connect(
-            'motion_notify_event', on_motion
-        )
 
     def _annotate_well_id_labels(self, ax, coordinates, point_ids, indices=None):
         """Draws well ID text next to each point on a spatial axes."""
@@ -4540,9 +5437,10 @@ class MonitoringNetworksDialog(QDialog):
         self.variance_results[attr_name] = results
         self.prioritization_grid_points = self.current_grid_points.copy()
         self._update_variance_reduction_plot(
-            results, display_name
+            results, display_name, param_key=attr_name
         )
         self._update_prioritization_order_table(results, param_key=attr_name)
+        self._update_workflow_navigation_state()
 
         n_wells = int(results['n_points'][-1])
         grid_nodes = results['grid_node_count']
@@ -5236,6 +6134,7 @@ class MonitoringNetworksDialog(QDialog):
         stored = self.stats_by_attribute.get(attr_name)
         if not stored:
             self.variogram_widget.clear()
+            self._clear_variogram_autofit_status()
             return
 
         log_transform = stored.get('log_transform', False)
@@ -5248,6 +6147,7 @@ class MonitoringNetworksDialog(QDialog):
         )
         if self._get_variogram_state(attr_name):
             self._apply_store_to_widget(attr_name)
+        self._refresh_variogram_autofit_status(attr_name)
 
     def _calculate_all_attribute_statistics(self, force_reextract=False):
         """
@@ -5440,7 +6340,10 @@ class MonitoringNetworksDialog(QDialog):
             return
 
         self._update_stats_plots(
-            stored['coordinates'], stored['values'], attr_name
+            stored['coordinates'],
+            stored['values'],
+            attr_name,
+            point_ids=stored.get('point_ids'),
         )
         self._display_stored_variogram(attr_name)
         self._refresh_tab2_cross_validation(attr_name)
@@ -5450,6 +6353,26 @@ class MonitoringNetworksDialog(QDialog):
     def _sync_stats_table_structure(self):
         """Resize stats table rows when Tab-1 parameter selection changes."""
         parameters = self._selected_analysis_parameters()
+        new_param_set = frozenset(parameters)
+        previous_param_set = getattr(
+            self, '_tab1_params_for_optimization', frozenset()
+        )
+        # Any change to Tab 1 selection invalidates all Optimize caches.
+        if previous_param_set != new_param_set and getattr(
+            self, 'variance_results', None
+        ):
+            self._clear_all_optimization_results(
+                tab5_message=QCoreApplication.translate(
+                    "Tab 5",
+                    "Selected parameters changed. Run Optimize on tab 4 again.",
+                ),
+                tab4_message=QCoreApplication.translate(
+                    "Tab 4",
+                    "Selected parameters changed. Click Optimize again.",
+                ),
+            )
+        self._tab1_params_for_optimization = new_param_set
+
         self._sync_attr_name_combo()
 
         if not parameters:
@@ -5711,7 +6634,6 @@ class MonitoringNetworksDialog(QDialog):
         set_cell(VAR_COL_NUGGET, f"{state.get('nugget', 0):.3f}", editable)
         set_cell(VAR_COL_SILL, f"{state.get('sill', 0):.3f}", editable)
         set_cell(VAR_COL_RANGE, f"{state.get('range', 0):.3f}", editable)
-        set_cell(VAR_COL_R2, f"{state.get('r2', 0):.3f}")
 
     def _sync_var_params_table_from_store(self, attributes=None):
         """Refresh var_params_table for the active tab-2 parameter only."""
@@ -5734,7 +6656,7 @@ class MonitoringNetworksDialog(QDialog):
         finally:
             self.var_params_table.blockSignals(False)
             self._syncing_variogram = False
-
+        self._refresh_variogram_autofit_status(attr_name)
     def _on_variogram_widget_params_changed(self, params):
         """Save fitted/adjusted widget parameters and sync the params table."""
         if self._syncing_variogram:
@@ -5766,6 +6688,9 @@ class MonitoringNetworksDialog(QDialog):
             'weight': float(existing.get('weight', self._equal_parameter_weight())),
             'log_transform': log_transform,
             'data_fingerprint': fingerprint,
+            'autofit_ok': params.get(
+                'autofit_ok', existing.get('autofit_ok')
+            ),
         }
         self._set_variogram_state(attr, state)
 
@@ -5775,6 +6700,7 @@ class MonitoringNetworksDialog(QDialog):
             return
 
         self._sync_var_params_table_from_store()
+        self._refresh_variogram_autofit_status(attr)
         self._refresh_tab2_cross_validation(attr)
         # Auto-fit / widget edits change the covariance model used by Optimize.
         self._invalidate_optimization_after_variogram_change(attr)
@@ -5803,7 +6729,6 @@ class MonitoringNetworksDialog(QDialog):
             VAR_COL_PARAM,
             VAR_COL_TRANSFORM,
             VAR_COL_MODEL,
-            VAR_COL_R2,
         ):
             return
 
@@ -5825,13 +6750,6 @@ class MonitoringNetworksDialog(QDialog):
                 state = dict(state or {})
                 state['r2'] = float(r2)
                 self._set_variogram_state(attribute, state)
-                r2_item = self.var_params_table.item(row, VAR_COL_R2)
-                if r2_item is None:
-                    r2_item = QTableWidgetItem(f"{r2:.3f}")
-                    r2_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
-                    self.var_params_table.setItem(row, VAR_COL_R2, r2_item)
-                else:
-                    r2_item.setText(f"{r2:.3f}")
                 if col in (VAR_COL_NUGGET, VAR_COL_SILL, VAR_COL_RANGE):
                     self._refresh_tab2_cross_validation(attribute)
             if col in (VAR_COL_NUGGET, VAR_COL_SILL, VAR_COL_RANGE):
@@ -5845,6 +6763,7 @@ class MonitoringNetworksDialog(QDialog):
         """Handles the selection of attributes in the data selection tab (supports multi-selection)."""
         self._sync_stats_table_structure()
         self._clear_variogram_widget()
+        self._update_tab1_progress_hint()
         if not self.selected_data_parameters.selectedItems():
             self.clear_stats_table()
             return
@@ -5933,6 +6852,7 @@ class MonitoringNetworksDialog(QDialog):
         )
         self.cv_info_label.setStyleSheet("color: gray; font-style: italic;")
 
+        self._disconnect_point_hover(getattr(self, 'cv_canvas', None))
         self.cv_ax.clear()
         self.cv_ax.text(
             0.5,
@@ -5947,10 +6867,13 @@ class MonitoringNetworksDialog(QDialog):
         self.cv_ax.set_yticks([])
         self.cv_canvas.draw()
 
-    def _update_cross_validation_plot(self, measured, predicted, attr_name):
-        """Measured vs predicted scatter with a 1:1 reference line."""
+    def _update_cross_validation_plot(
+        self, measured, predicted, attr_name, point_ids=None
+    ):
+        """Measured vs predicted scatter with 1:1 and linear-regression lines."""
         measured = np.asarray(measured, dtype=float)
         predicted = np.asarray(predicted, dtype=float)
+        self._disconnect_point_hover(getattr(self, 'cv_canvas', None))
         ax = self.cv_ax
         ax.clear()
 
@@ -5964,6 +6887,7 @@ class MonitoringNetworksDialog(QDialog):
             label=QCoreApplication.translate("Tab 2", "Parameter values"),
         )
 
+        # 1:1 line
         if measured.size > 0:
             lo = float(min(measured.min(), predicted.min()))
             hi = float(max(measured.max(), predicted.max()))
@@ -5973,11 +6897,46 @@ class MonitoringNetworksDialog(QDialog):
             ax.plot(
                 [lo, hi],
                 [lo, hi],
-                linestyle='--',
-                color='#c0392b',
-                linewidth=1.5,
+                linestyle='-',
+                color='gray',
+                linewidth=0.5,
                 label=QCoreApplication.translate("Tab 2", "1:1 line"),
             )
+
+            # Ordinary least-squares fit: predicted ≈ slope * measured + intercept.
+            finite = np.isfinite(measured) & np.isfinite(predicted)
+            if np.count_nonzero(finite) >= 2:
+                slope, intercept = np.polyfit(
+                    measured[finite], predicted[finite], 1
+                )
+                x_fit = np.array([lo, hi], dtype=float)
+                ax.plot(
+                    x_fit,
+                    slope * x_fit + intercept,
+                    color='gray',
+                    linewidth=1.5,
+                    solid_capstyle='round',
+                    zorder=1,
+                    label=QCoreApplication.translate("Tab 2", "Linear-regression line"),
+                )
+                # Equation text 
+                if intercept >= 0:
+                    eq_text = "y = {:.4g}x + {:.4g}".format(slope, intercept)
+                else:
+                    eq_text = "y = {:.4g}x - {:.4g}".format(
+                        slope, abs(intercept)
+                    )
+                ax.text(
+                    0.98,
+                    0.02,
+                    eq_text,
+                    transform=ax.transAxes,
+                    ha='right',
+                    va='bottom',
+                    fontsize=9,
+                    fontweight='bold',
+                    color='gray',
+                )
 
         ax.set_xlabel(
             QCoreApplication.translate("Tab 2", "Measured Value")
@@ -5992,6 +6951,14 @@ class MonitoringNetworksDialog(QDialog):
         )
         ax.grid(True, alpha=0.3)
         ax.legend(loc='upper left', fontsize=8)
+
+        if point_ids is not None and len(point_ids) == measured.size:
+            hover_xy = np.column_stack([measured, predicted])
+            id_labels = [str(pid) for pid in point_ids]
+            self._attach_point_hover(
+                self.cv_canvas, ax, hover_xy, id_labels
+            )
+
         self.cv_canvas.draw()
 
     def _reset_stats_map_axes(self):
@@ -6002,6 +6969,7 @@ class MonitoringNetworksDialog(QDialog):
 
     def _clear_stats_plots(self):
         """Clears histogram and spatial map placeholders."""
+        self._disconnect_point_hover(getattr(self, 'stats_hist_canvas', None))
         self.stats_hist_ax.clear()
         no_data = QCoreApplication.translate("Tab 2", "No data")
         self.stats_hist_ax.text(
@@ -6013,6 +6981,7 @@ class MonitoringNetworksDialog(QDialog):
         self.stats_hist_ax.set_yticks([])
         self.stats_hist_canvas.draw()
 
+        self._disconnect_point_hover(getattr(self, 'stats_map_canvas', None))
         self._reset_stats_map_axes()
         self.stats_map_ax.text(
             0.5, 0.5, no_data,
@@ -6023,9 +6992,15 @@ class MonitoringNetworksDialog(QDialog):
         self.stats_map_ax.set_yticks([])
         self.stats_map_canvas.draw()
 
-    def _update_stats_plots(self, coordinates, values, attr_name):
+    def _update_stats_plots(self, coordinates, values, attr_name, point_ids=None):
         """Updates histogram and spatial scatter for the statistics data."""
         values = np.asarray(values, dtype=float)
+        coordinates = np.asarray(coordinates, dtype=float)
+        id_labels = None
+        if point_ids is not None and len(point_ids) == values.size:
+            id_labels = [str(pid) for pid in point_ids]
+
+        self._disconnect_point_hover(getattr(self, 'stats_hist_canvas', None))
         ax = self.stats_hist_ax
         ax.clear()
 
@@ -6035,27 +7010,69 @@ class MonitoringNetworksDialog(QDialog):
 
         mean_val = float(np.mean(values))
         median_val = float(np.median(values))
+        # Sample std (ddof=1) matches Tab 2 descriptive statistics.
+        std_val = (
+            float(np.std(values, ddof=1)) if values.size >= 2 else float('nan')
+        )
+
         ax.axvline(
             mean_val, color='#c0392b', linestyle='--', linewidth=1.5,
             label=QCoreApplication.translate(
-                "Tab 2", "Mean: {value:.4f}"
+                "Tab 2", "Mean"
             ).format(value=mean_val),
         )
         ax.axvline(
             median_val, color='#d35400', linestyle='-', linewidth=1.5,
             label=QCoreApplication.translate(
-                "Tab 2", "Median: {value:.4f}"
+                "Tab 2", "Median"
             ).format(value=median_val),
         )
+
+        # Vertical guides at mean ± 1σ and mean ± 2σ (skip if std is invalid).
+        if np.isfinite(std_val) and std_val > 0.0:
+            std_styles = (
+                (
+                    1,
+                    '#27ae60',
+                    ':',
+                    QCoreApplication.translate(
+                        "Tab 2", "±1σ"
+                    ).format(std=std_val),
+                ),
+                (
+                    2,
+                    '#8e44ad',
+                    '-.',
+                    QCoreApplication.translate(
+                        "Tab 2", "±2σ"
+                    ).format(std=2.0 * std_val),
+                ),
+            )
+            for k, color, linestyle, label in std_styles:
+                # Label only the +kσ line so the legend lists each band once.
+                ax.axvline(
+                    mean_val - k * std_val,
+                    color=color,
+                    linestyle=linestyle,
+                    linewidth=1.2,
+                )
+                ax.axvline(
+                    mean_val + k * std_val,
+                    color=color,
+                    linestyle=linestyle,
+                    linewidth=1.2,
+                    label=label,
+                )
 
         ymin, ymax = ax.get_ylim()
         y_range = ymax - ymin if ymax > ymin else 1.0
         rug_base = ymin + y_range * 0.02
         rug_span = y_range * 0.06
         jitter = np.random.default_rng(0).uniform(0, rug_span, size=values.size)
+        rug_y = rug_base + jitter
         ax.scatter(
             values,
-            rug_base + jitter,
+            rug_y,
             s=14,
             c='#2c3e50',
             alpha=0.55,
@@ -6072,8 +7089,16 @@ class MonitoringNetworksDialog(QDialog):
         )
         ax.set_xlabel(QCoreApplication.translate("Tab 2", "Value"))
         ax.set_ylabel(QCoreApplication.translate("Tab 2", "Frequency"))
+
+        # Hover only on histogram data points (rug), not bars or guide lines.
+        if id_labels is not None:
+            rug_xy = np.column_stack([values, rug_y])
+            self._attach_point_hover(
+                self.stats_hist_canvas, ax, rug_xy, id_labels
+            )
         self.stats_hist_canvas.draw()
 
+        self._disconnect_point_hover(getattr(self, 'stats_map_canvas', None))
         self._reset_stats_map_axes()
         scatter = self.stats_map_ax.scatter(
             coordinates[:, 0],
@@ -6092,6 +7117,14 @@ class MonitoringNetworksDialog(QDialog):
         )
         self.stats_map_ax.set_xlabel(QCoreApplication.translate("Tab 2", "X"))
         self.stats_map_ax.set_ylabel(QCoreApplication.translate("Tab 2", "Y"))
+
+        if id_labels is not None and id_labels and coordinates.shape[0] == len(id_labels):
+            self._attach_point_hover(
+                self.stats_map_canvas,
+                self.stats_map_ax,
+                coordinates,
+                id_labels,
+            )
         self.stats_map_canvas.draw()
 
     def _populate_stats_table(self, stats_dict):
@@ -6166,6 +7199,46 @@ class MonitoringNetworksDialog(QDialog):
             self.var_params_table.setItem(row, col, QTableWidgetItem(str(text)))
         else:
             item.setText(str(text))
+
+    def _default_node_spacing_for_layer(self, layer=None):
+        """
+        Default Tab 3 node spacing from well pairwise distances.
+
+        Formula: (max_dist / 2) / 10. Falls back to 100 when the layer has
+        fewer than two valid point geometries or distances cannot be computed.
+        """
+        if layer is None and hasattr(self, 'input_data_layer'):
+            layer = self.input_data_layer.currentLayer()
+        if layer is None:
+            return 100.0
+        try:
+            coords = []
+            for feature in layer.getFeatures():
+                geom = feature.geometry()
+                if geom is None or geom.isEmpty() or geom.isMultipart():
+                    continue
+                point = geom.asPoint()
+                coords.append([point.x(), point.y()])
+            if len(coords) < 2:
+                return 100.0
+            from scipy.spatial.distance import pdist
+            max_dist = float(np.max(pdist(np.asarray(coords))))
+            if not np.isfinite(max_dist) or max_dist <= 0:
+                return 100.0
+            return (max_dist / 2.0) / 10.0
+        except Exception:
+            return 100.0
+
+    def _apply_default_node_spacing(self, layer=None):
+        """Set Tab 3 spacing spinbox to the layer-based default."""
+        if not hasattr(self, 'spacing_spin'):
+            return
+        spacing = self._default_node_spacing_for_layer(layer)
+        self.spacing_spin.blockSignals(True)
+        try:
+            self.spacing_spin.setValue(spacing)
+        finally:
+            self.spacing_spin.blockSignals(False)
 
     def _grid_buffer_spacing_factor(self):
         """Buffer setting as a multiple of node spacing (default 1.0)."""
@@ -6402,24 +7475,16 @@ class MonitoringNetworksDialog(QDialog):
                 # Detect grid changes by comparing node counts
                 if (self.prioritization_grid_points is None or 
                     len(self.prioritization_grid_points) != len(estimation_points)):
-                    self.prioritization_grid_points = None
-                    if hasattr(self, 'variance_results'):
-                        self.variance_results = {}
-                        # Clear dependent visualizations
-                        if hasattr(self, 'variance_ax'):
-                            self._clear_variance_reduction_plot()
-                            self.variance_info_label.setText(
-                                QCoreApplication.translate(
-                                    "Tab 4",
-                                    "The estimation grid changed. Click Optimize again.",
-                                )
-                            )
-                        self._clear_ok_interpolation_plots(
-                            QCoreApplication.translate(
-                                "Tab 5",
-                                "The estimation grid changed. Re-run optimization on tab 4.",
-                            )
-                        )
+                    self._clear_all_optimization_results(
+                        tab5_message=QCoreApplication.translate(
+                            "Tab 5",
+                            "The estimation grid changed. Re-run optimization on tab 4.",
+                        ),
+                        tab4_message=QCoreApplication.translate(
+                            "Tab 4",
+                            "The estimation grid changed. Click Optimize again.",
+                        ),
+                    )
 
             ceg_values = np.ones(len(estimation_points), dtype=int)
             self.current_ceg_values = ceg_values
@@ -6481,6 +7546,7 @@ class MonitoringNetworksDialog(QDialog):
                 QCoreApplication.translate("Tab 3", "State: Completed"),
             )
             QTimer.singleShot(1500, self._reset_progress)
+            self._update_workflow_navigation_state()
 
         except Exception as e:
             import traceback
@@ -6871,6 +7937,7 @@ class MonitoringNetworksDialog(QDialog):
                 QCoreApplication.translate("Tab 3", "State: Completed"),
             )
             QTimer.singleShot(1500, self._reset_progress)
+            self._update_workflow_navigation_state()
             QMessageBox.information(
                 self,
                 QCoreApplication.translate("Tab 3", "Success"),
@@ -6908,9 +7975,10 @@ class VariogramWidget(QWidget):
 
     def init_ui(self):
         layout = QVBoxLayout()
-        self.figure = Figure(figsize=(8, 6))
+        self.figure = Figure(figsize=(8, 3.5), constrained_layout=True)
         self.canvas = FigureCanvas(self.figure)
-        self.canvas.setMinimumHeight(250)
+        self.canvas.setMaximumHeight(250)
+        self.canvas.setMinimumHeight(150)
         layout.addWidget(self.canvas)
         self.setLayout(layout)
 
@@ -6972,7 +8040,15 @@ class VariogramWidget(QWidget):
         )
 
     def auto_fit(self):
-        """Automatically fits the variogram model and emits params including R²."""
+        """
+        Automatically fits the variogram model and emits params including R².
+
+        After GSTools convergence, rejects unstable fits when:
+          - len_scale > domain max_dist, or
+          - total sill > sample variance.
+        On rejection or fit exception, applies stable fallback parameters
+        (first-bin nugget, sample-variance sill, max_dist/2 range).
+        """
         if self.current_data is None:
             return
 
@@ -7006,11 +8082,21 @@ class VariogramWidget(QWidget):
             if set_progress is not None:
                 set_progress(30, "State: Computing initial values...")
 
+            max_dist = float(self.current_data.get('max_dist', 1.0))
+            values = np.asarray(self.current_data['values'], dtype=float).ravel()
+            if values.size >= 2:
+                data_variance = float(np.var(values, ddof=1))
+            else:
+                data_variance = 0.0
+            if not np.isfinite(data_variance) or data_variance < 0.0:
+                data_variance = 0.0
+
             max_gamma = float(np.max(gamma))
             max_dist_used = float(np.max(bin_center))
             estimated_nugget = float(gamma[0])
             estimated_sill = max_gamma
             estimated_range = max_dist_used / 3.0
+            first_bin_value = estimated_nugget
 
             if set_progress is not None:
                 set_progress(50, "State: Creating variogram model...")
@@ -7044,7 +8130,9 @@ class VariogramWidget(QWidget):
             if set_progress is not None:
                 set_progress(80, "State: Fitting variogram model...")
 
-            fit_ok = False
+            # True only when fit_variogram returns and validation passes.
+            autofit_ok = False
+            use_fallback = False
             try:
                 try:
                     model.fit_variogram(
@@ -7052,53 +8140,45 @@ class VariogramWidget(QWidget):
                     )
                 except TypeError:
                     model.fit_variogram(bin_center, gamma, return_r2=True)
-                fit_ok = True
+
+                fitted_sill = float(max(0.0, model.var + model.nugget))
+                fitted_range = float(max(0.01, model.len_scale))
+                ok, _reasons = validate_variogram_autofit(
+                    fitted_range,
+                    fitted_sill,
+                    max_dist,
+                    data_variance,
+                )
+                if ok:
+                    autofit_ok = True
+                else:
+                    # Converged but physically implausible — discard fit.
+                    use_fallback = True
             except Exception:
+                # Optimizer failed; same stable fallback as validation reject.
+                use_fallback = True
+
+            if use_fallback:
+                fallback = variogram_autofit_fallback_params(
+                    first_bin_value,
+                    data_variance,
+                    max_dist,
+                )
                 try:
-                    try:
-                        model.set_arg(nugget=estimated_nugget)
-                        model.len_scale = estimated_range
-                        model.var = max(0.01, estimated_sill - estimated_nugget)
-                    except Exception:
-                        model.nugget = max(0.0, estimated_nugget)
-                        model.len_scale = max(0.01, estimated_range)
-                        model.var = max(0.01, estimated_sill - estimated_nugget)
-                    model.fit_variogram(bin_center, gamma, return_r2=True)
-                    fit_ok = True
-                except Exception as fit_error2:
-                    try:
-                        model.nugget = max(0.0, estimated_nugget)
-                        model.len_scale = max(0.01, estimated_range)
-                        model.var = max(0.01, estimated_sill - estimated_nugget)
-                    except Exception:
-                        pass
-                    QMessageBox.information(
-                        self,
-                        QCoreApplication.translate("Tab 2", "Notice"),
-                        QCoreApplication.translate(
-                            "Tab 2",
-                            "Automatic fitting could not be completed. Estimated "
-                            "values were used instead.\n"
-                            "Error: {error}\n"
-                            "You can adjust the parameters manually.",
-                        ).format(error=str(fit_error2)),
+                    model.nugget = float(fallback['nugget'])
+                    model.len_scale = float(fallback['range'])
+                    model.var = max(
+                        1e-6,
+                        float(fallback['sill']) - float(fallback['nugget']),
                     )
-                    if set_progress is not None:
-                        set_progress(
-                            100, "State: Completed with estimated values"
-                        )
-                        if not getattr(
-                            main_dialog, '_suppress_variogram_progress', False
-                        ):
-                            from qgis.PyQt.QtCore import QTimer
-                            QTimer.singleShot(
-                                3000, lambda: self._hide_progress_elements()
-                            )
+                except Exception:
+                    pass
+                autofit_ok = False
 
             if set_progress is not None:
                 set_progress(95, "State: Updating controls...")
 
-            # Lag-bin R² against the fitted/estimated model (not gstools return_r2).
+            # Lag-bin R² against the fitted or fallback model (not gstools R²).
             r2 = compute_variogram_lag_r2(bin_center, gamma, model)
             self.current_model = model
 
@@ -7108,12 +8188,19 @@ class VariogramWidget(QWidget):
                 'sill': float(max(0.0, model.var + model.nugget)),
                 'range': float(max(0.01, model.len_scale)),
                 'r2': float(r2),
+                'autofit_ok': bool(autofit_ok),
             }
             self.params_changed.emit(params)
             self.update_plot(emit_signal=False, params=params)
 
-            if set_progress is not None and fit_ok:
-                set_progress(100, "State: Completed successfully")
+            if set_progress is not None:
+                if autofit_ok:
+                    set_progress(100, "State: Completed successfully")
+                else:
+                    set_progress(
+                        100,
+                        "State: Auto-fit rejected; using fallback parameters",
+                    )
                 if not getattr(
                     main_dialog, '_suppress_variogram_progress', False
                 ):
@@ -7213,10 +8300,12 @@ class VariogramWidget(QWidget):
                 bin_center, gamma = self._experimental_variogram()
                 if bin_center is None:
                     raise ValueError("insufficient experimental variogram bins")
-                #Plot the experimental variogram curve
+                #Plot the experimental variogram
                 ax.scatter(
                     bin_center,
                     gamma,
+                    marker='+',
+                    color='black',
                     label=QCoreApplication.translate("Tab 2", "Experimental Variogram"),
                     alpha=0.7,
                 )
@@ -7244,13 +8333,26 @@ class VariogramWidget(QWidget):
                     x_model,
                     y_model,
                     'r-',
+                    color='#3944d7',
+                    linewidth=0.5,
                     label=QCoreApplication.translate(
                         "Tab 2", "Theoretical Model: {model}"
                     ).format(model=resolved['model']),
                 )
-
+                # R² lives in the store/export; show it at lower-right of the model curve.
+                ax.annotate(
+                    f"R² = {r2:.3f}",
+                    xy=(float(np.max(x_model)), float(np.min(y_model))),
+                    ha='right',
+                    va='bottom',
+                    fontsize=9,
+                    fontweight='bold',
+                    color='#3944d7',
+                )
+           
                 ax.set_xlabel(QCoreApplication.translate("Tab 2", "Distance"))
                 ax.set_ylabel(QCoreApplication.translate("Tab 2", "Semivariance"))
+                ax.set_ylim(bottom=0) # Set the y-axis to start at 0
                 title = QCoreApplication.translate(
                     "Tab 2", "Variogram – {param}"
                 ).format(param=self.current_data["attribute"])

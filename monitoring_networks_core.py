@@ -25,7 +25,7 @@
 import os
 from PyQt5.QtWidgets import QAction
 from PyQt5.QtGui import QIcon
-from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication
+from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, Qt
 from qgis.core import QgsMessageLog
 
 
@@ -33,7 +33,8 @@ class MonitoringNetworks:
     def __init__(self, iface):
         self.iface = iface
         self.plugin_dir = os.path.dirname(__file__)
-        self.dlg = None
+        # Strong refs so multiple open windows are not garbage-collected.
+        self.dialogs = []
         self.actions = []
         self.menu = "&MonitoringNetworks"
         self.toolbar = self.iface.addToolBar("MonitoringNetworks")
@@ -75,15 +76,31 @@ class MonitoringNetworks:
             parent=self.iface.mainWindow()
         )
 
+    def _forget_dialog(self, dialog):
+        """Drop a closed dialog from the live-window list."""
+        try:
+            self.dialogs.remove(dialog)
+        except ValueError:
+            pass
+
     def unload(self):
+        for dialog in list(self.dialogs):
+            dialog.close()
+        self.dialogs.clear()
+
         for action in self.actions:
             self.iface.removePluginMenu(self.menu, action)
             self.iface.removeToolBarIcon(action)
         del self.toolbar
 
     def run(self):
-        # Crea una nueva instancia del diálogo cada vez que se ejecute el plugin.
+        """Open a fresh independent dialog window (one per toolbar click)."""
         from .monitoring_networks_dialog import MonitoringNetworksDialog
 
-        self.dlg = MonitoringNetworksDialog(self.iface)
-        self.dlg.show()
+        dialog = MonitoringNetworksDialog(self.iface)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        dialog.finished.connect(lambda _result, d=dialog: self._forget_dialog(d))
+        self.dialogs.append(dialog)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()

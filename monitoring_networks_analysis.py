@@ -576,6 +576,85 @@ def build_covariance_model(model_type, nugget, sill, range_val):
 VARIOGRAM_N_BINS = 15
 
 
+def validate_variogram_autofit(len_scale, sill, max_dist, data_variance):
+    """
+    Decide whether an auto-fitted variogram is physically plausible.
+
+    Rejection rules (either one fails the fit):
+      - len_scale > max_dist: range larger than the data domain
+      - sill > data_variance: total sill exceeds sample variance
+
+    Returns:
+        (ok, reasons): ok is True when both checks pass; reasons lists
+        short English codes for each failed check (for logging/debug).
+    """
+    reasons = []
+    try:
+        len_scale = float(len_scale)
+        sill = float(sill)
+        max_dist = float(max_dist)
+        data_variance = float(data_variance)
+    except (TypeError, ValueError):
+        return False, ['invalid_numeric_inputs']
+
+    if not np.isfinite(len_scale) or not np.isfinite(sill):
+        return False, ['non_finite_fit_params']
+    if not np.isfinite(max_dist) or max_dist <= 0:
+        return False, ['invalid_max_dist']
+    if not np.isfinite(data_variance) or data_variance < 0:
+        return False, ['invalid_data_variance']
+
+    if len_scale > max_dist:
+        reasons.append('len_scale_gt_max_dist')
+    if sill > data_variance:
+        reasons.append('sill_gt_data_variance')
+
+    return (len(reasons) == 0), reasons
+
+
+def variogram_autofit_fallback_params(first_bin_gamma, sample_variance, max_dist):
+    """
+    Stable manual-style parameters used when auto-fit is rejected or errors.
+
+    Assigns:
+      - nugget = first experimental lag-bin γ
+      - sill = sample variance (clamped so sill >= nugget)
+      - range = max_dist / 2
+
+    Returns:
+        dict with keys nugget, sill, range (all finite floats >= 0).
+    """
+    try:
+        nugget = float(first_bin_gamma)
+    except (TypeError, ValueError):
+        nugget = 0.0
+    if not np.isfinite(nugget) or nugget < 0.0:
+        nugget = 0.0
+
+    try:
+        sill = float(sample_variance)
+    except (TypeError, ValueError):
+        sill = 0.0
+    if not np.isfinite(sill) or sill < 0.0:
+        sill = 0.0
+    # Keep partial sill non-negative for GSTools (var = sill - nugget).
+    sill = max(sill, nugget)
+
+    try:
+        max_dist = float(max_dist)
+    except (TypeError, ValueError):
+        max_dist = 1.0
+    if not np.isfinite(max_dist) or max_dist <= 0.0:
+        max_dist = 1.0
+    range_val = max(max_dist / 2.0, 1e-6)
+
+    return {
+        'nugget': float(nugget),
+        'sill': float(sill),
+        'range': float(range_val),
+    }
+
+
 def compute_variogram_lag_r2(bin_center, gamma, model):
     """
     Coefficient of determination for experimental vs model variogram at lag bins.
@@ -619,34 +698,76 @@ def compute_variogram_lag_r2(bin_center, gamma, model):
     return float(1.0 - ss_res / ss_tot)
 
 
-def compute_cross_validation_summary(errors):
+def compute_cross_validation_summary(errors, standard_errors=None):
     """
-    Builds cross-validation summary metrics from prediction errors.
+    Builds cross-validation summary metrics from prediction errors and SEs.
 
     Signed-error stats (min, max, mean), MAE and RMSE use finite values of
     ``error = predicted - measured``.
 
+    ArcGIS Geostatistical Analyst summary metrics (same subset of points):
+      - RMSE: sqrt(mean(e_i^2)) — prediction accuracy (data units).
+      - ASE:  sqrt(mean(sigma_i^2)) — quadratic average of kriging SEs
+        (average variances, then square root). Ideally ASE ≈ RMSE.
+      - RMSSE: sqrt(mean((e_i / sigma_i)^2)) — SE calibration; ideally ≈ 1.
+        Only pairs with finite error and sigma_i > 0 are used.
+
+    Args:
+        errors: Prediction errors (predicted - measured), 1-D.
+        standard_errors: Optional kriging SEs aligned with ``errors``.
+            Required for ASE and RMSSE; otherwise those keys are NaN.
+
     Returns:
-        dict with keys min, max, mean, mae, rmse.
+        dict with keys min, max, mean, mae, rmse, ase, rmsse.
     """
     errors = np.asarray(errors, dtype=float).ravel()
+    empty = {
+        'min': np.nan,
+        'max': np.nan,
+        'mean': np.nan,
+        'mae': np.nan,
+        'rmse': np.nan,
+        'ase': np.nan,
+        'rmsse': np.nan,
+    }
     valid_errors = errors[np.isfinite(errors)]
     if valid_errors.size == 0:
-        return {
-            'min': np.nan,
-            'max': np.nan,
-            'mean': np.nan,
-            'mae': np.nan,
-            'rmse': np.nan,
-        }
+        return empty
 
-    return {
+    summary = {
         'min': float(np.min(valid_errors)),
         'max': float(np.max(valid_errors)),
         'mean': float(np.mean(valid_errors)),
         'mae': float(np.mean(np.abs(valid_errors))),
         'rmse': float(np.sqrt(np.mean(valid_errors ** 2))),
+        'ase': np.nan,
+        'rmsse': np.nan,
     }
+
+    if standard_errors is None:
+        return summary
+
+    se = np.asarray(standard_errors, dtype=float).ravel()
+    if se.size != errors.size:
+        return summary
+
+    # ASE: RMS of SEs via mean of variances (ArcGIS Average Standard Error).
+    valid_se = se[np.isfinite(se) & (se >= 0.0)]
+    if valid_se.size > 0:
+        summary['ase'] = float(np.sqrt(np.mean(valid_se ** 2)))
+
+    # RMSSE: RMS of standardized errors (error / SE).
+    with np.errstate(divide='ignore', invalid='ignore'):
+        usable = (
+            np.isfinite(errors)
+            & np.isfinite(se)
+            & (se > 0.0)
+        )
+        if np.any(usable):
+            standardized = errors[usable] / se[usable]
+            summary['rmsse'] = float(np.sqrt(np.mean(standardized ** 2)))
+
+    return summary
 
 
 def run_ordinary_kriging_cross_validation(
@@ -669,7 +790,7 @@ def run_ordinary_kriging_cross_validation(
     network as conditioning data only.
 
     Returns:
-        dict with summary (error min/max/mean, MAE, RMSE) and rows
+        dict with summary (min/max/mean, MAE, RMSE, ASE, RMSSE) and rows
         (measured, predicted, error, SE, standardized error, included).
         None when there are fewer than three points or fewer than three
         successful predictions.
@@ -724,17 +845,22 @@ def run_ordinary_kriging_cross_validation(
     if np.sum(np.isfinite(predicted)) < 3:
         return None
 
-    errors = predicted - values # predicted - measureds
+    errors = predicted - values  # predicted - measured
     se = np.sqrt(kriging_var)
     with np.errstate(divide='ignore', invalid='ignore'):
         standardized = np.where(se > 0, errors / se, np.nan)
 
+    # Summary uses the same point subset for errors and SEs.
     if network_indices is not None:
-        summary_errors = errors[included_flags]
+        summary = compute_cross_validation_summary(
+            errors[included_flags],
+            standard_errors=se[included_flags],
+        )
     else:
-        summary_errors = errors
-
-    summary = compute_cross_validation_summary(summary_errors)
+        summary = compute_cross_validation_summary(
+            errors,
+            standard_errors=se,
+        )
 
     rows = []
     for i in range(n):
