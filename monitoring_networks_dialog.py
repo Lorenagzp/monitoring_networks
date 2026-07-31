@@ -3816,7 +3816,7 @@ class MonitoringNetworksDialog(QDialog):
                 QCoreApplication.translate(
                     "Tab 2",
                     "Auto-fit was not successful; adjust the model and "
-                    "parameters manually.",
+                    "parameters manually to fit experimental vs theoretical variogram.",
                 )
             )
             label.setStyleSheet("color: #a04000; font-style: italic;")
@@ -6917,6 +6917,7 @@ class MonitoringNetworksDialog(QDialog):
                     linewidth=1.5,
                     solid_capstyle='round',
                     zorder=1,
+                    linestyle='dotted',
                     label=QCoreApplication.translate("Tab 2", "Linear-regression line"),
                 )
                 # Equation text 
@@ -7033,16 +7034,16 @@ class MonitoringNetworksDialog(QDialog):
             std_styles = (
                 (
                     1,
-                    '#27ae60',
-                    ':',
+                    'gray',
+                    (0, (1, 1)),
                     QCoreApplication.translate(
                         "Tab 2", "±1σ"
                     ).format(std=std_val),
                 ),
                 (
                     2,
-                    '#8e44ad',
-                    '-.',
+                    'gray',
+                    'dotted',
                     QCoreApplication.translate(
                         "Tab 2", "±2σ"
                     ).format(std=2.0 * std_val),
@@ -7983,7 +7984,10 @@ class VariogramWidget(QWidget):
         self.setLayout(layout)
 
     def _resolve_params(self, params=None):
-        """Normalize model parameters from an explicit dict or the dialog store."""
+        """Gets the variogram parameters from the current attribute.
+        Normalizes model parameters from an explicit dict or the dialog store.
+        Returns a dictionary with the model type, nugget, sill, and range."""
+
         if params is None and self.dialog is not None and self.current_data:
             attr = self.current_data.get('attribute')
             if attr:
@@ -8018,7 +8022,7 @@ class VariogramWidget(QWidget):
         coordinates = self.current_data['coordinates']
         values = self.current_data['values']
         max_dist = self.current_data['max_dist']
-        bin_edges = np.linspace(0, max_dist / 2.0, VARIOGRAM_N_BINS)
+        bin_edges = np.linspace(0, max_dist / 3.0, VARIOGRAM_N_BINS) # Changed from 2.0 to 3.0
         print("bin_edges: ", bin_edges) #debug
         bin_center, gamma = gs.vario_estimate(
             coordinates.T, values, bin_edges=bin_edges
@@ -8259,7 +8263,7 @@ class VariogramWidget(QWidget):
             self.clear()
             return
 
-        # Approximate max distance for large point sets (same as previous behavior).
+        # Approximate max distance for large point sets(same as previous behavior).
         if len(coordinates) > 100:
             x_range = np.max(coordinates[:, 0]) - np.min(coordinates[:, 0])
             y_range = np.max(coordinates[:, 1]) - np.min(coordinates[:, 1])
@@ -8310,7 +8314,10 @@ class VariogramWidget(QWidget):
                     alpha=0.7,
                 )
 
-                resolved = self._resolve_params(params)
+                ##Build the theoretical variogram model from the variogram parameters for the current attribute
+                #Get variogram parameters for the current attribute
+                resolved = self._resolve_params(params) 
+                #Build the theoretical variogram model from the variogram parameters
                 model = self._build_model_from_params(resolved)
                 self.current_model = model
 
@@ -8327,7 +8334,7 @@ class VariogramWidget(QWidget):
                     })
 
                 #Plot the theoretical variogram curve
-                x_model = np.linspace(0, max_dist / 2.0, 100)
+                x_model = np.linspace(0, max_dist / 3.0, 100) #changed from 2.0 to 3.0
                 y_model = model.variogram(x_model)
                 ax.plot(
                     x_model,

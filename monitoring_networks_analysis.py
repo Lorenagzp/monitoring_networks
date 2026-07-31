@@ -573,7 +573,7 @@ def build_covariance_model(model_type, nugget, sill, range_val):
 
 
 # Number of lag-bin edges for experimental variogram (shared by fit and plot).
-VARIOGRAM_N_BINS = 15
+VARIOGRAM_N_BINS = 12
 
 
 def validate_variogram_autofit(len_scale, sill, max_dist, data_variance):
@@ -646,7 +646,7 @@ def variogram_autofit_fallback_params(first_bin_gamma, sample_variance, max_dist
         max_dist = 1.0
     if not np.isfinite(max_dist) or max_dist <= 0.0:
         max_dist = 1.0
-    range_val = max(max_dist / 2.0, 1e-6)
+    range_val = max(max_dist / 3.0, 1e-6) # Changed from 2.0 to 3.0
 
     return {
         'nugget': float(nugget),
