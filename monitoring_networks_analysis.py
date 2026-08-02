@@ -572,8 +572,225 @@ def build_covariance_model(model_type, nugget, sill, range_val):
     return gs.Matern(dim=2, var=var, len_scale=len_scale, nugget=nugget)
 
 
-# Number of lag-bin edges for experimental variogram (shared by fit and plot).
+# Legacy default alias; runtime n_bins is derived from lag_size and cutoff.
 VARIOGRAM_N_BINS = 12
+
+# Experimental variogram session settings (Tab 2).
+VARIOGRAM_FACTOR_MAX_DIST_MIN = 1.5
+VARIOGRAM_FACTOR_MAX_DIST_MAX = 5.0
+VARIOGRAM_FACTOR_MAX_DIST_DEFAULT = 3.0
+VARIOGRAM_FACTOR_MAX_DIST_STEP = 0.5
+
+# Lag size as multipliers of observed mean nearest-neighbor distance D_o.
+VARIOGRAM_LAG_SIZE_MULTIPLIERS = (1.0 / 3.0, 0.5, 1.0, 1.5, 2.0)
+
+
+@dataclass
+class NearestNeighborStats:
+    """QGIS-compatible average nearest-neighbor summary for point coordinates."""
+
+    observed_mean_distance: float  # D_o
+    expected_mean_distance: float  # D_e
+    nn_index: float
+    n_points: int
+    bbox_area: float
+
+
+@dataclass
+class ExperimentalVariogramSettings:
+    """
+    Session settings for the experimental lag window and binning.
+
+    Bin edges use lag spacing: 0, lag, 2*lag, ... while < cutoff,
+    with at most ``n_bins`` intervals. cutoff = max_dist / factor_max_dist.
+    """
+
+    factor_max_dist: float = VARIOGRAM_FACTOR_MAX_DIST_DEFAULT
+    lag_size: float = 1.0
+    n_bins: int = 1  # max lag intervals (derived)
+
+
+def clamp_variogram_factor_max_dist(factor_max_dist):
+    """Clamp and snap factor to [1.5, 5.0] with step 0.5."""
+    try:
+        value = float(factor_max_dist)
+    except (TypeError, ValueError):
+        value = VARIOGRAM_FACTOR_MAX_DIST_DEFAULT
+    if not np.isfinite(value):
+        value = VARIOGRAM_FACTOR_MAX_DIST_DEFAULT
+    value = max(
+        VARIOGRAM_FACTOR_MAX_DIST_MIN,
+        min(VARIOGRAM_FACTOR_MAX_DIST_MAX, value),
+    )
+    steps = round(
+        (value - VARIOGRAM_FACTOR_MAX_DIST_MIN)
+        / VARIOGRAM_FACTOR_MAX_DIST_STEP
+    )
+    snapped = (
+        VARIOGRAM_FACTOR_MAX_DIST_MIN
+        + steps * VARIOGRAM_FACTOR_MAX_DIST_STEP
+    )
+    return float(
+        max(
+            VARIOGRAM_FACTOR_MAX_DIST_MIN,
+            min(VARIOGRAM_FACTOR_MAX_DIST_MAX, snapped),
+        )
+    )
+
+
+def experimental_variogram_cutoff(max_dist, factor_max_dist):
+    """Maximum lag for the experimental variogram: max_dist / factor."""
+    try:
+        max_dist = float(max_dist)
+    except (TypeError, ValueError):
+        max_dist = 1.0
+    if not np.isfinite(max_dist) or max_dist <= 0.0:
+        max_dist = 1.0
+    factor = clamp_variogram_factor_max_dist(factor_max_dist)
+    return float(max_dist / factor)
+
+
+def compute_nearest_neighbor_stats(coordinates):
+    """
+    Average nearest-neighbor stats (QGIS nearestneighbouranalysis formulas).
+
+    Uses ``scipy.spatial.cKDTree`` for observed mean distance D_o.
+    A = bounding-box area; D_e = 0.5 / sqrt(n/A); NNI = D_o / D_e.
+
+    Returns:
+        NearestNeighborStats, or None if fewer than 2 valid points.
+    """
+    from scipy.spatial import cKDTree
+
+    coordinates = np.asarray(coordinates, dtype=float)
+    if coordinates.ndim != 2 or coordinates.shape[0] < 2 or coordinates.shape[1] < 2:
+        return None
+    coords = coordinates[:, :2]
+    finite = np.isfinite(coords).all(axis=1)
+    coords = coords[finite]
+    n = int(coords.shape[0])
+    if n < 2:
+        return None
+
+    xmin, ymin = coords.min(axis=0)
+    xmax, ymax = coords.max(axis=0)
+    width = float(xmax - xmin)
+    height = float(ymax - ymin)
+    area = width * height
+    if not np.isfinite(area) or area <= 0.0:
+        span = max(width, height, 1.0)
+        area = span * span
+
+    tree = cKDTree(coords)
+    distances, _indices = tree.query(coords, k=2)
+    nn = np.asarray(distances[:, 1], dtype=float)
+    nn = nn[np.isfinite(nn)]
+    if nn.size == 0:
+        return None
+    d_o = float(np.mean(nn))
+    if not np.isfinite(d_o) or d_o < 0.0:
+        d_o = 0.0
+
+    d_e = float(0.5 / np.sqrt(n / area))
+    if not np.isfinite(d_e) or d_e <= 0.0:
+        d_e = 1.0
+    nn_index = float(d_o / d_e) if d_e > 0.0 else 1.0
+
+    return NearestNeighborStats(
+        observed_mean_distance=d_o,
+        expected_mean_distance=d_e,
+        nn_index=nn_index,
+        n_points=n,
+        bbox_area=float(area),
+    )
+
+
+def lag_size_choices(observed_mean_distance):
+    """Return (D_o/3, D_o/2, D_o, 1.5*D_o, 2*D_o) with a positive floor."""
+    try:
+        d_o = float(observed_mean_distance)
+    except (TypeError, ValueError):
+        d_o = 1.0
+    if not np.isfinite(d_o) or d_o <= 0.0:
+        d_o = 1.0
+    return tuple(float(d_o * mult) for mult in VARIOGRAM_LAG_SIZE_MULTIPLIERS)
+
+
+def default_lag_size(nn_stats):
+    """Default lag: D_o if NNI >= 1, else D_o/2."""
+    if nn_stats is None:
+        return 1.0
+    d_o = float(nn_stats.observed_mean_distance)
+    if not np.isfinite(d_o) or d_o <= 0.0:
+        d_o = 1.0
+    if float(nn_stats.nn_index) >= 1.0:
+        return float(d_o)
+    return float(d_o * 0.5)
+
+
+def compute_n_bins(lag_size, cutoff):
+    """
+    Largest integer n_bins with lag_size * n_bins < cutoff.
+
+    Falls back to 1 if no positive integer satisfies the inequality.
+    """
+    try:
+        lag_size = float(lag_size)
+        cutoff = float(cutoff)
+    except (TypeError, ValueError):
+        return 1
+    if not np.isfinite(lag_size) or lag_size <= 0.0:
+        return 1
+    if not np.isfinite(cutoff) or cutoff <= 0.0:
+        return 1
+    n = int(np.floor((cutoff / lag_size) - 1e-12))
+    return max(1, n)
+
+
+def build_default_experimental_variogram_settings(max_dist, nn_stats):
+    """Session defaults: factor=3.0, lag from NNI, n_bins from lag and cutoff."""
+    factor = VARIOGRAM_FACTOR_MAX_DIST_DEFAULT
+    cutoff = experimental_variogram_cutoff(max_dist, factor)
+    lag = default_lag_size(nn_stats)
+    if nn_stats is not None:
+        # Snap lag to the nearest choice built from D_o.
+        choices = lag_size_choices(nn_stats.observed_mean_distance)
+        lag = min(choices, key=lambda value: abs(value - lag))
+    n_bins = compute_n_bins(lag, cutoff)
+    return ExperimentalVariogramSettings(
+        factor_max_dist=factor,
+        lag_size=float(lag),
+        n_bins=int(n_bins),
+    )
+
+
+def experimental_variogram_bin_edges(max_dist, settings):
+    """
+    Bin edges with lag spacing (lag_size is authoritative).
+
+    Edges: 0, lag, 2*lag, ... while < cutoff, at most n_bins intervals.
+    """
+    if not isinstance(settings, ExperimentalVariogramSettings):
+        settings = ExperimentalVariogramSettings()
+    cutoff = experimental_variogram_cutoff(
+        max_dist, settings.factor_max_dist
+    )
+    lag = float(settings.lag_size)
+    if not np.isfinite(lag) or lag <= 0.0:
+        lag = 1.0
+    n_bins = int(settings.n_bins) if settings.n_bins else compute_n_bins(lag, cutoff)
+    n_bins = max(1, n_bins)
+
+    edges = [0.0]
+    for i in range(1, n_bins + 1):
+        edge = lag * float(i)
+        if edge >= cutoff:
+            break
+        edges.append(edge)
+    if len(edges) < 2:
+        # Ensure at least one interval for gstools.
+        edges = [0.0, min(lag, cutoff * 0.99) if cutoff > 0 else lag]
+    return np.asarray(edges, dtype=float)
 
 
 def validate_variogram_autofit(len_scale, sill, max_dist, data_variance):
@@ -709,16 +926,17 @@ def compute_cross_validation_summary(errors, standard_errors=None):
       - RMSE: sqrt(mean(e_i^2)) — prediction accuracy (data units).
       - ASE:  sqrt(mean(sigma_i^2)) — quadratic average of kriging SEs
         (average variances, then square root). Ideally ASE ≈ RMSE.
+      - MSE:  mean(e_i / sigma_i) — Mean Standardized Error; ideally ≈ 0.
       - RMSSE: sqrt(mean((e_i / sigma_i)^2)) — SE calibration; ideally ≈ 1.
         Only pairs with finite error and sigma_i > 0 are used.
 
     Args:
         errors: Prediction errors (predicted - measured), 1-D.
         standard_errors: Optional kriging SEs aligned with ``errors``.
-            Required for ASE and RMSSE; otherwise those keys are NaN.
+            Required for ASE, MSE and RMSSE; otherwise those keys are NaN.
 
     Returns:
-        dict with keys min, max, mean, mae, rmse, ase, rmsse.
+        dict with keys min, max, mean, mae, rmse, ase, mse, rmsse.
     """
     errors = np.asarray(errors, dtype=float).ravel()
     empty = {
@@ -728,6 +946,7 @@ def compute_cross_validation_summary(errors, standard_errors=None):
         'mae': np.nan,
         'rmse': np.nan,
         'ase': np.nan,
+        'mse': np.nan,
         'rmsse': np.nan,
     }
     valid_errors = errors[np.isfinite(errors)]
@@ -741,6 +960,7 @@ def compute_cross_validation_summary(errors, standard_errors=None):
         'mae': float(np.mean(np.abs(valid_errors))),
         'rmse': float(np.sqrt(np.mean(valid_errors ** 2))),
         'ase': np.nan,
+        'mse': np.nan,
         'rmsse': np.nan,
     }
 
@@ -756,7 +976,7 @@ def compute_cross_validation_summary(errors, standard_errors=None):
     if valid_se.size > 0:
         summary['ase'] = float(np.sqrt(np.mean(valid_se ** 2)))
 
-    # RMSSE: RMS of standardized errors (error / SE).
+    # MSE / RMSSE from standardized errors (error / SE).
     with np.errstate(divide='ignore', invalid='ignore'):
         usable = (
             np.isfinite(errors)
@@ -765,6 +985,7 @@ def compute_cross_validation_summary(errors, standard_errors=None):
         )
         if np.any(usable):
             standardized = errors[usable] / se[usable]
+            summary['mse'] = float(np.mean(standardized))
             summary['rmsse'] = float(np.sqrt(np.mean(standardized ** 2)))
 
     return summary

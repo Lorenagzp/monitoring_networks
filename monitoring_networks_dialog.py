@@ -85,7 +85,16 @@ from .monitoring_networks_analysis import (
     compute_variogram_lag_r2,
     validate_variogram_autofit,
     variogram_autofit_fallback_params,
-    VARIOGRAM_N_BINS,
+    compute_nearest_neighbor_stats,
+    build_default_experimental_variogram_settings,
+    experimental_variogram_bin_edges,
+    experimental_variogram_cutoff,
+    clamp_variogram_factor_max_dist,
+    compute_n_bins,
+    lag_size_choices,
+    ExperimentalVariogramSettings,
+    VARIOGRAM_FACTOR_MAX_DIST_MIN,
+    VARIOGRAM_FACTOR_MAX_DIST_MAX,
     OptimizationInput,
     ParameterInput,
     ordinary_kriging_interpolation,
@@ -127,16 +136,17 @@ VARIOGRAM_MODEL_TYPES = [
     'spherical', 'exponential', 'gaussian', 'stable', 'matern',
 ]
 
-CV_SUMMARY_KEYS = ('min', 'max', 'mean', 'mae', 'rmse', 'ase', 'rmsse')
+CV_SUMMARY_KEYS = ('min', 'max', 'mean', 'mae', 'rmse', 'ase', 'mse', 'rmsse')
 
 CV_SUMMARY_FORMATS = {
-    'min': '{:.3f}',
-    'max': '{:.3f}',
-    'mean': '{:.3f}',
-    'mae': '{:.3f}',
-    'rmse': '{:.3f}',
-    'ase': '{:.3f}',
-    'rmsse': '{:.3f}',
+    'min': '{:.4f}',
+    'max': '{:.4f}',
+    'mean': '{:.4f}',
+    'mae': '{:.4f}',
+    'rmse': '{:.4f}',
+    'ase': '{:.4f}',
+    'mse': '{:.4f}',
+    'rmsse': '{:.4f}',
 }
 
 CV_COL_ID = 0
@@ -232,6 +242,7 @@ def cv_summary_header_labels(context_name):
         QCoreApplication.translate(context_name, "MAE"),
         QCoreApplication.translate(context_name, "RMSE"),
         QCoreApplication.translate(context_name, "ASE"),
+        QCoreApplication.translate(context_name, "MSE"),
         QCoreApplication.translate(context_name, "RMSSE"),
     ]
 
@@ -244,6 +255,11 @@ def cv_summary_header_tooltips(context_name):
             "Average Standard Error (ASE): root mean square of the kriging "
             "standard errors. Ideally close to RMSE.",
         ),
+        'mse': QCoreApplication.translate(
+            context_name,
+            "Mean Standardized Error (MSE): mean of error/SE. Ideally close "
+            "to 0 (unbiased standardized residuals).",
+        ),
         'rmsse': QCoreApplication.translate(
             context_name,
             "Root-Mean-Square Standardized Error (RMSSE): root mean square of "
@@ -253,7 +269,7 @@ def cv_summary_header_tooltips(context_name):
 
 
 def apply_cv_summary_header_tooltips(summary_table, context_name):
-    """Attach ASE/RMSSE tooltips to an existing CV summary header row."""
+    """Attach ASE/MSE/RMSSE tooltips to an existing CV summary header row."""
     tooltips = cv_summary_header_tooltips(context_name)
     for col, key in enumerate(CV_SUMMARY_KEYS):
         tip = tooltips.get(key)
@@ -342,6 +358,12 @@ class MonitoringNetworksDialog(QDialog):
         self._suppress_variogram_progress = False
         # Tab 2 active parameter for plots/variogram (row selection in stats_table).
         self._active_analysis_attribute = None
+        # Experimental variogram session settings + ANN cache (layer select).
+        self._nn_stats = None
+        self._experimental_variogram_settings_store = (
+            ExperimentalVariogramSettings()
+        )
+        self._syncing_experimental_variogram_controls = False
         self.init_ui()
         self.current_grid_points = None  # Store grid generated in tab 3 (array of points)
         self.variogram_models_by_attribute = {}  # Dictionary to store models by attribute
@@ -694,6 +716,32 @@ class MonitoringNetworksDialog(QDialog):
             self._on_variogram_widget_params_changed
         )
         variogram_layout.addWidget(self.variogram_widget)
+
+        # Experimental lag controls: hint (Avg D, max_dist) + lag size combo.
+        exp_controls_row = QHBoxLayout()
+        self.var_exp_hint_label = QLabel("")
+        self.var_exp_hint_label.setStyleSheet("color: gray; font-style: italic;")
+        self.var_exp_hint_label.setWordWrap(True)
+        exp_controls_row.addWidget(self.var_exp_hint_label, stretch=1)
+
+        lag_label = QLabel(
+            QCoreApplication.translate("Tab 2", "Lag size:")
+        )
+        exp_controls_row.addWidget(lag_label)
+        self.var_lag_size_combo = WheelIgnoringComboBox()
+        self.var_lag_size_combo.setToolTip(
+            QCoreApplication.translate(
+                "Tab 2",
+                "Lag spacing for the experimental variogram, based on the "
+                "observed mean nearest-neighbor distance (Avg D).",
+            )
+        )
+        self.var_lag_size_combo.currentIndexChanged.connect(
+            self._on_variogram_lag_size_changed
+        )
+        exp_controls_row.addWidget(self.var_lag_size_combo)
+        variogram_layout.addLayout(exp_controls_row)
+
         variogram_group.setLayout(variogram_layout)
         layout.addWidget(variogram_group)
 
@@ -797,7 +845,7 @@ class MonitoringNetworksDialog(QDialog):
         self.spacing_spin.setRange(10, 10000)
         self.spacing_spin.setDecimals(0)
         self.spacing_spin.setSingleStep(1)
-        # Default: (max pairwise distance / 2) / 10; refreshed when Tab 1 layer changes.
+        # Default Tab 3 spacing = ANN D_o (set on layer change).
         self._apply_default_node_spacing()
         self.spacing_spin.valueChanged.connect(self.on_spacing_changed)
         gen_grid_layout.addWidget(self.spacing_spin, 0, 1)
@@ -3806,8 +3854,8 @@ class MonitoringNetworksDialog(QDialog):
             label.setText(
                 QCoreApplication.translate(
                     "Tab 2",
-                    "Variogram parameters auto-fit succeeded. "
-                    "You can compare different models.",
+                    "Variogram parameters auto-fit converged. "
+                    "You can compare different models type.",
                 )
             )
             label.setStyleSheet("color: #1e8449; font-style: italic;")
@@ -3815,8 +3863,8 @@ class MonitoringNetworksDialog(QDialog):
             label.setText(
                 QCoreApplication.translate(
                     "Tab 2",
-                    "Auto-fit was not successful; adjust the model and "
-                    "parameters manually to fit experimental vs theoretical variogram.",
+                    "Auto-fit did not converge; check outliers, variogram limit, lag size and adjust the model "
+                    "parameters manually to fit to the experimental variogram.",
                 )
             )
             label.setStyleSheet("color: #a04000; font-style: italic;")
@@ -3917,6 +3965,11 @@ class MonitoringNetworksDialog(QDialog):
         self._update_mn_grid_weight_info()
 
         if not layer:
+            self._nn_stats = None
+            self._set_experimental_variogram_settings_store(
+                ExperimentalVariogramSettings()
+            )
+            self._sync_experimental_variogram_controls_from_settings()
             self.layer_info.clear()
             self._refresh_layer_fields_table(None)
             self._apply_default_node_spacing(None)
@@ -3928,6 +3981,8 @@ class MonitoringNetworksDialog(QDialog):
             return
 
         self._refresh_layer_fields_table(layer)
+        # ANN once per layer selection; drives lag defaults and Tab 3 spacing.
+        self._refresh_ann_for_layer(layer)
         # Recalculate Tab 3 default spacing and node estimate for the new layer.
         self._apply_default_node_spacing(layer)
         if hasattr(self, 'update_estimated_points'):
@@ -5120,6 +5175,7 @@ class MonitoringNetworksDialog(QDialog):
             'mae': 'CV_MAE',
             'rmse': 'CV_RMSE',
             'ase': 'CV_ASE',
+            'mse': 'CV_MSE',
             'rmsse': 'CV_RMSSE',
         }
         variogram_rows = []
@@ -6450,7 +6506,7 @@ class MonitoringNetworksDialog(QDialog):
                 elif np.isnan(value):
                     text = "—"
                 else:
-                    text = f"{value:.3f}"
+                    text = f"{value:.3g}"
                 item = self.stats_table.item(row, table_col)
                 if item is None:
                     item = QTableWidgetItem(text)
@@ -6538,9 +6594,240 @@ class MonitoringNetworksDialog(QDialog):
             return
 
         # Model type is already in the store; auto_fit reads it and writes R² back.
+        # Experimental settings (factor/lag) are session-level and are not reset here.
         self.variogram_widget.auto_fit()
         self._refresh_tab2_cross_validation(attribute)
         self._invalidate_optimization_after_variogram_change(attribute)
+
+    def _experimental_variogram_settings(self):
+        """Return clamped session experimental variogram settings."""
+        settings = getattr(
+            self, '_experimental_variogram_settings_store', None
+        )
+        if not isinstance(settings, ExperimentalVariogramSettings):
+            settings = ExperimentalVariogramSettings()
+        return ExperimentalVariogramSettings(
+            factor_max_dist=clamp_variogram_factor_max_dist(
+                settings.factor_max_dist
+            ),
+            lag_size=float(settings.lag_size),
+            n_bins=max(1, int(settings.n_bins)),
+        )
+
+    def _set_experimental_variogram_settings_store(self, settings):
+        """Persist session experimental settings (clamped copy)."""
+        if not isinstance(settings, ExperimentalVariogramSettings):
+            settings = ExperimentalVariogramSettings()
+        self._experimental_variogram_settings_store = (
+            ExperimentalVariogramSettings(
+                factor_max_dist=clamp_variogram_factor_max_dist(
+                    settings.factor_max_dist
+                ),
+                lag_size=float(settings.lag_size),
+                n_bins=max(1, int(settings.n_bins)),
+            )
+        )
+
+    def _layer_coordinates_for_ann(self, layer=None):
+        """Extract point coordinates from the input layer for ANN."""
+        if layer is None and hasattr(self, 'input_data_layer'):
+            layer = self.input_data_layer.currentLayer()
+        if layer is None:
+            return None
+        coords = []
+        for feature in layer.getFeatures():
+            geom = feature.geometry()
+            if geom is None or geom.isEmpty() or geom.isMultipart():
+                continue
+            point = geom.asPoint()
+            coords.append([point.x(), point.y()])
+        if len(coords) < 2:
+            return None
+        return np.asarray(coords, dtype=float)
+
+    @staticmethod
+    def _max_dist_from_coordinates(coordinates):
+        """Domain diameter used for variogram lag cutoff."""
+        from scipy.spatial import distance as scipy_distance
+
+        coordinates = np.asarray(coordinates, dtype=float)
+        if coordinates.ndim != 2 or coordinates.shape[0] < 2:
+            return 1.0
+        if len(coordinates) > 100:
+            x_range = float(
+                np.max(coordinates[:, 0]) - np.min(coordinates[:, 0])
+            )
+            y_range = float(
+                np.max(coordinates[:, 1]) - np.min(coordinates[:, 1])
+            )
+            max_dist = float(np.sqrt(x_range ** 2 + y_range ** 2))
+        else:
+            max_dist = float(np.max(scipy_distance.pdist(coordinates)))
+        if not np.isfinite(max_dist) or max_dist <= 0.0:
+            return 1.0
+        return max_dist
+
+    def _refresh_ann_for_layer(self, layer=None):
+        """Compute ANN once on layer select and reset experimental defaults."""
+        coordinates = self._layer_coordinates_for_ann(layer)
+        if coordinates is None:
+            self._nn_stats = None
+            self._set_experimental_variogram_settings_store(
+                ExperimentalVariogramSettings()
+            )
+            self._sync_experimental_variogram_controls_from_settings()
+            return
+        self._nn_stats = compute_nearest_neighbor_stats(coordinates)
+        max_dist = self._max_dist_from_coordinates(coordinates)
+        self._set_experimental_variogram_settings_store(
+            build_default_experimental_variogram_settings(
+                max_dist, self._nn_stats
+            )
+        )
+        self._sync_experimental_variogram_controls_from_settings()
+
+    def _sync_experimental_variogram_controls_from_settings(self):
+        """Refresh lag combo and hint from session settings."""
+        if not hasattr(self, 'var_lag_size_combo'):
+            return
+        settings = self._experimental_variogram_settings()
+        self._syncing_experimental_variogram_controls = True
+        try:
+            self._rebuild_lag_size_combo(select_lag=settings.lag_size)
+        finally:
+            self._syncing_experimental_variogram_controls = False
+        self._update_experimental_variogram_hint()
+
+    def _rebuild_lag_size_combo(self, select_lag=None):
+        """Fill lag combo from current D_o choices (static labels only)."""
+        combo = self.var_lag_size_combo
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            d_o = 1.0
+            if self._nn_stats is not None:
+                d_o = float(self._nn_stats.observed_mean_distance)
+            if not np.isfinite(d_o) or d_o <= 0.0:
+                d_o = 1.0
+            choices = lag_size_choices(d_o)
+            labels = (
+                QCoreApplication.translate("Tab 2", "Avg D / 3"),
+                QCoreApplication.translate("Tab 2", "Avg D / 2"),
+                QCoreApplication.translate("Tab 2", "Avg D"),
+                QCoreApplication.translate("Tab 2", "1.5 × Avg D"),
+                QCoreApplication.translate("Tab 2", "2 × Avg D"),
+            )
+            for label, value in zip(labels, choices):
+                combo.addItem(label, float(value))
+            if select_lag is not None:
+                best = min(
+                    range(combo.count()),
+                    key=lambda i: abs(
+                        float(combo.itemData(i)) - float(select_lag)
+                    ),
+                )
+                combo.setCurrentIndex(best)
+        finally:
+            combo.blockSignals(False)
+
+    def _update_experimental_variogram_hint(self):
+        """Show Avg D, lag size and max_dist under the variogram plot."""
+        if not hasattr(self, 'var_exp_hint_label'):
+            return
+        d_o = None
+        if self._nn_stats is not None:
+            d_o = float(self._nn_stats.observed_mean_distance)
+        settings = self._experimental_variogram_settings()
+        lag_size = float(settings.lag_size)
+        max_dist = None
+        widget = getattr(self, 'variogram_widget', None)
+        if widget is not None and getattr(widget, 'current_data', None):
+            max_dist = widget.current_data.get('max_dist')
+        if max_dist is None:
+            coords = self._layer_coordinates_for_ann()
+            if coords is not None:
+                max_dist = self._max_dist_from_coordinates(coords)
+        if d_o is None and max_dist is None and not np.isfinite(lag_size):
+            self.var_exp_hint_label.setText("")
+            return
+        parts = []
+        if d_o is not None and np.isfinite(d_o):
+            parts.append(
+                QCoreApplication.translate(
+                    "Tab 2",
+                    "Average distance between neighbor points (Avg D) = {d_o:.4g}",
+                ).format(d_o=d_o)
+            )
+        if np.isfinite(lag_size) and lag_size > 0.0:
+            parts.append(
+                QCoreApplication.translate(
+                    "Tab 2",
+                    "Lag size = {lag_size:.4g}",
+                ).format(lag_size=lag_size)
+            )
+        if max_dist is not None and np.isfinite(max_dist):
+            parts.append(
+                QCoreApplication.translate(
+                    "Tab 2",
+                    "Max distance in the data = {max_dist:,.0f}",
+                ).format(max_dist=max_dist)
+            )
+        self.var_exp_hint_label.setText("  |  ".join(parts))
+
+    def _recompute_n_bins_for_current_cutoff(self):
+        """Derive n_bins from lag_size * n < cutoff."""
+        settings = self._experimental_variogram_settings()
+        widget = getattr(self, 'variogram_widget', None)
+        max_dist = 1.0
+        if widget is not None and getattr(widget, 'current_data', None):
+            max_dist = float(widget.current_data.get('max_dist', 1.0))
+        else:
+            coords = self._layer_coordinates_for_ann()
+            if coords is not None:
+                max_dist = self._max_dist_from_coordinates(coords)
+        cutoff = experimental_variogram_cutoff(
+            max_dist, settings.factor_max_dist
+        )
+        settings.n_bins = compute_n_bins(settings.lag_size, cutoff)
+        self._set_experimental_variogram_settings_store(settings)
+        return settings
+
+    def _on_variogram_lag_size_changed(self, _index=None):
+        if getattr(self, '_syncing_experimental_variogram_controls', False):
+            return
+        lag = self.var_lag_size_combo.currentData()
+        if lag is None:
+            return
+        settings = self._experimental_variogram_settings()
+        if abs(float(settings.lag_size) - float(lag)) < 1e-12:
+            return
+        settings.lag_size = float(lag)
+        self._set_experimental_variogram_settings_store(settings)
+        self._recompute_n_bins_for_current_cutoff()
+        self._update_experimental_variogram_hint()
+        self._on_experimental_variogram_settings_committed()
+
+    def _on_experimental_variogram_settings_committed(self):
+        """Re-autofit after experimental lag window / binning changes."""
+        widget = getattr(self, 'variogram_widget', None)
+        if widget is None or getattr(widget, 'current_data', None) is None:
+            self._update_experimental_variogram_hint()
+            return
+        widget.auto_fit()
+        self._update_experimental_variogram_hint()
+
+    def _set_experimental_factor_max_dist(self, factor_max_dist):
+        """Update cutoff factor from the on-graph handle; skip if unchanged."""
+        settings = self._experimental_variogram_settings()
+        new_factor = clamp_variogram_factor_max_dist(factor_max_dist)
+        if abs(float(settings.factor_max_dist) - float(new_factor)) < 1e-12:
+            return False
+        settings.factor_max_dist = new_factor
+        self._set_experimental_variogram_settings_store(settings)
+        self._recompute_n_bins_for_current_cutoff()
+        self._sync_experimental_variogram_controls_from_settings()
+        self._on_experimental_variogram_settings_committed()
+        return True
 
     def _get_coordinates_and_transformed_values_for_analysis(self):
         """
@@ -6631,9 +6918,9 @@ class MonitoringNetworksDialog(QDialog):
             row=row,
         )
         self.var_params_table.setCellWidget(row, VAR_COL_MODEL, model_combo)
-        set_cell(VAR_COL_NUGGET, f"{state.get('nugget', 0):.3f}", editable)
-        set_cell(VAR_COL_SILL, f"{state.get('sill', 0):.3f}", editable)
-        set_cell(VAR_COL_RANGE, f"{state.get('range', 0):.3f}", editable)
+        set_cell(VAR_COL_NUGGET, f"{state.get('nugget', 0):.3g}", editable)
+        set_cell(VAR_COL_SILL, f"{state.get('sill', 0):.3g}", editable)
+        set_cell(VAR_COL_RANGE, f"{state.get('range', 0):.2g}", editable)
 
     def _sync_var_params_table_from_store(self, attributes=None):
         """Refresh var_params_table for the active tab-2 parameter only."""
@@ -7144,7 +7431,7 @@ class MonitoringNetworksDialog(QDialog):
             elif np.isnan(value):
                 text = "—"
             else:
-                text = f"{value:.3f}"
+                text = f"{value:.3g}"
             item = self.stats_table.item(row, table_col)
             if item is None:
                 item = QTableWidgetItem(text)
@@ -7203,35 +7490,55 @@ class MonitoringNetworksDialog(QDialog):
 
     def _default_node_spacing_for_layer(self, layer=None):
         """
-        Default Tab 3 node spacing from well pairwise distances.
+        Default Tab 3 node spacing from ANN observed mean distance (D_o).
 
-        Formula: (max_dist / 2) / 10. Falls back to 100 when the layer has
-        fewer than two valid point geometries or distances cannot be computed.
+        Previously used (max_dist / 2) / 10 from pairwise distances; that
+        formula is kept commented below for reference. Falls back to 100 when
+        ANN is unavailable.
         """
+        if self._nn_stats is not None:
+            d_o = float(self._nn_stats.observed_mean_distance)
+            if np.isfinite(d_o) and d_o > 0.0:
+                return d_o
+
+        # Fallback: try ANN from the layer if cache is empty.
         if layer is None and hasattr(self, 'input_data_layer'):
             layer = self.input_data_layer.currentLayer()
-        if layer is None:
-            return 100.0
-        try:
-            coords = []
-            for feature in layer.getFeatures():
-                geom = feature.geometry()
-                if geom is None or geom.isEmpty() or geom.isMultipart():
-                    continue
-                point = geom.asPoint()
-                coords.append([point.x(), point.y()])
-            if len(coords) < 2:
-                return 100.0
-            from scipy.spatial.distance import pdist
-            max_dist = float(np.max(pdist(np.asarray(coords))))
-            if not np.isfinite(max_dist) or max_dist <= 0:
-                return 100.0
-            return (max_dist / 2.0) / 10.0
-        except Exception:
-            return 100.0
+        if layer is not None:
+            coords = self._layer_coordinates_for_ann(layer)
+            if coords is not None:
+                nn_stats = compute_nearest_neighbor_stats(coords)
+                if nn_stats is not None:
+                    d_o = float(nn_stats.observed_mean_distance)
+                    if np.isfinite(d_o) and d_o > 0.0:
+                        return d_o
+
+        # Previous default (commented out):
+        # if layer is None and hasattr(self, 'input_data_layer'):
+        #     layer = self.input_data_layer.currentLayer()
+        # if layer is None:
+        #     return 100.0
+        # try:
+        #     coords = []
+        #     for feature in layer.getFeatures():
+        #         geom = feature.geometry()
+        #         if geom is None or geom.isEmpty() or geom.isMultipart():
+        #             continue
+        #         point = geom.asPoint()
+        #         coords.append([point.x(), point.y()])
+        #     if len(coords) < 2:
+        #         return 100.0
+        #     from scipy.spatial.distance import pdist
+        #     max_dist = float(np.max(pdist(np.asarray(coords))))
+        #     if not np.isfinite(max_dist) or max_dist <= 0:
+        #         return 100.0
+        #     return (max_dist / 2.0) / 10.0
+        # except Exception:
+        #     return 100.0
+        return 100.0
 
     def _apply_default_node_spacing(self, layer=None):
-        """Set Tab 3 spacing spinbox to the layer-based default."""
+        """Set Tab 3 spacing spinbox to D_o (ANN) silently."""
         if not hasattr(self, 'spacing_spin'):
             return
         spacing = self._default_node_spacing_for_layer(layer)
@@ -7961,33 +8268,46 @@ class MonitoringNetworksDialog(QDialog):
 class VariogramWidget(QWidget):
     """Variogram plot and auto-fit; parameters live in the dialog store / table.
 
-    Editable nugget, sill, range and model type are owned by ``var_params_table``
-    and ``variogram_models_by_attribute``. This widget only plots and fits.
+    Model params are owned by ``var_params_table`` / store. Experimental lag
+    settings come from the dialog session. A red dashed cutoff handle adjusts
+    ``factor_max_dist`` interactively.
     """
 
     params_changed = pyqtSignal(dict)
 
     def __init__(self, parent=None, dialog=None):
         super().__init__(parent)
-        self.dialog = dialog  # Reference to the main dialog (store access)
-        self.init_ui()
+        self.dialog = dialog
         self.current_data = None
         self.current_model = None
+        self._drag_cids = []
+        self._drag_mode = None  # 'cutoff' only
+        self._drag_max_dist = None
+        self._drag_cutoff = None
+        self._drag_factor_before = None
+        self._vario_ax = None
+        self._cutoff_line = None
+        self.init_ui()
 
     def init_ui(self):
         layout = QVBoxLayout()
-        self.figure = Figure(figsize=(8, 3.5), constrained_layout=True)
+        # Bottom margin reserved for legend outside the axes.
+        self.figure = Figure(figsize=(8, 4.0))
         self.canvas = FigureCanvas(self.figure)
-        self.canvas.setMaximumHeight(250)
-        self.canvas.setMinimumHeight(150)
+        self.canvas.setMaximumHeight(300)
+        self.canvas.setMinimumHeight(180)
         layout.addWidget(self.canvas)
         self.setLayout(layout)
 
-    def _resolve_params(self, params=None):
-        """Gets the variogram parameters from the current attribute.
-        Normalizes model parameters from an explicit dict or the dialog store.
-        Returns a dictionary with the model type, nugget, sill, and range."""
+    def _session_settings(self):
+        if self.dialog is not None and hasattr(
+            self.dialog, '_experimental_variogram_settings'
+        ):
+            return self.dialog._experimental_variogram_settings()
+        return ExperimentalVariogramSettings()
 
+    def _resolve_params(self, params=None):
+        """Normalize model parameters from an explicit dict or the dialog store."""
         if params is None and self.dialog is not None and self.current_data:
             attr = self.current_data.get('attribute')
             if attr:
@@ -8010,20 +8330,15 @@ class VariogramWidget(QWidget):
         }
 
     def _experimental_variogram(self):
-        """
-        Experimental lag bins shared by auto-fit, plot, and experimental-theoretical R².
-
-        Returns:
-            (bin_center, gamma) or (None, None) when data are insufficient.
-        """
+        """Experimental lag bins from session settings (lag_size spacing)."""
         if self.current_data is None:
             return None, None
 
+        settings = self._session_settings()
         coordinates = self.current_data['coordinates']
         values = self.current_data['values']
         max_dist = self.current_data['max_dist']
-        bin_edges = np.linspace(0, max_dist / 3.0, VARIOGRAM_N_BINS) # Changed from 2.0 to 3.0
-        print("bin_edges: ", bin_edges) #debug
+        bin_edges = experimental_variogram_bin_edges(max_dist, settings)
         bin_center, gamma = gs.vario_estimate(
             coordinates.T, values, bin_edges=bin_edges
         )
@@ -8043,6 +8358,132 @@ class VariogramWidget(QWidget):
             params['range'],
         )
 
+    def _disconnect_drag(self):
+        for cid in self._drag_cids:
+            try:
+                self.canvas.mpl_disconnect(cid)
+            except Exception:
+                pass
+        self._drag_cids = []
+        self._drag_mode = None
+        self._cutoff_line = None
+        self._vario_ax = None
+        self._drag_max_dist = None
+        self._drag_cutoff = None
+        self._drag_factor_before = None
+
+    def _cutoff_display_point(self):
+        if self._vario_ax is None or self._drag_cutoff is None:
+            return None
+        ylim = self._vario_ax.get_ylim()
+        y_mid = 0.5 * (float(ylim[0]) + float(ylim[1]))
+        return self._vario_ax.transData.transform(
+            (float(self._drag_cutoff), y_mid)
+        )
+
+    def _hit_test_cutoff(self, event, pixel_tol=12.0):
+        if event.x is None or event.y is None:
+            return False
+        point = self._cutoff_display_point()
+        if point is None:
+            return False
+        dx = float(event.x) - float(point[0])
+        dy = float(event.y) - float(point[1])
+        return (dx * dx + dy * dy) <= (pixel_tol * pixel_tol)
+
+    def _on_drag_press(self, event):
+        if event.button != 1 or event.inaxes is not self._vario_ax:
+            return
+        if not self._hit_test_cutoff(event):
+            return
+        self._drag_mode = 'cutoff'
+        if self.dialog is not None:
+            settings = self.dialog._experimental_variogram_settings()
+            self._drag_factor_before = float(settings.factor_max_dist)
+
+    def _on_drag_motion(self, event):
+        if self._drag_mode is None:
+            if self._hit_test_cutoff(event):
+                self.canvas.setCursor(Qt.SizeHorCursor)
+            else:
+                self.canvas.unsetCursor()
+            return
+
+        if self._drag_max_dist is None or event.xdata is None:
+            return
+
+        max_dist = float(self._drag_max_dist)
+        # factor in [1.5, 5] → cutoff x in [max_dist/5, max_dist/1.5]
+        x_min = max_dist / VARIOGRAM_FACTOR_MAX_DIST_MAX
+        x_max = max_dist / VARIOGRAM_FACTOR_MAX_DIST_MIN
+        x = max(x_min, min(float(event.xdata), x_max))
+        self._drag_cutoff = x
+        if self._cutoff_line is not None:
+            self._cutoff_line.set_xdata([x, x])
+        self.canvas.draw_idle()
+
+    def _on_drag_release(self, event):
+        if self._drag_mode is None:
+            return
+        self._drag_mode = None
+        self.canvas.unsetCursor()
+
+        if self._drag_max_dist is None or self._drag_cutoff is None:
+            return
+        max_dist = float(self._drag_max_dist)
+        cutoff = float(self._drag_cutoff)
+        if cutoff <= 0:
+            return
+        factor = clamp_variogram_factor_max_dist(max_dist / cutoff)
+        if (
+            self._drag_factor_before is not None
+            and abs(factor - float(self._drag_factor_before)) < 1e-12
+        ):
+            # Snap visual line back if user released without a real change.
+            if self.dialog is not None:
+                settings = self.dialog._experimental_variogram_settings()
+                snapped_cutoff = experimental_variogram_cutoff(
+                    max_dist, settings.factor_max_dist
+                )
+                self._drag_cutoff = snapped_cutoff
+                if self._cutoff_line is not None:
+                    self._cutoff_line.set_xdata(
+                        [snapped_cutoff, snapped_cutoff]
+                    )
+                self.canvas.draw_idle()
+            return
+
+        if self.dialog is not None:
+            self.dialog._set_experimental_factor_max_dist(factor)
+
+    def _install_cutoff_handle(self, ax, max_dist, cutoff):
+        """Install red dashed cutoff line and mouse callbacks."""
+        self._disconnect_drag()
+        self._cutoff_line = ax.axvline(
+            cutoff,
+            color='red',
+            linestyle='--',
+            linewidth=1.2,
+            alpha=0.95,
+            zorder=4,
+            label=QCoreApplication.translate("Tab 2", "Variogram limit (editable)"),
+        )
+
+        self._vario_ax = ax
+        self._drag_max_dist = float(max_dist)
+        self._drag_cutoff = float(cutoff)
+        if self.dialog is not None:
+            settings = self.dialog._experimental_variogram_settings()
+            self._drag_factor_before = float(settings.factor_max_dist)
+
+        self._drag_cids = [
+            self.canvas.mpl_connect('button_press_event', self._on_drag_press),
+            self.canvas.mpl_connect('motion_notify_event', self._on_drag_motion),
+            self.canvas.mpl_connect(
+                'button_release_event', self._on_drag_release
+            ),
+        ]
+
     def auto_fit(self):
         """
         Automatically fits the variogram model and emits params including R².
@@ -8051,7 +8492,7 @@ class VariogramWidget(QWidget):
           - len_scale > domain max_dist, or
           - total sill > sample variance.
         On rejection or fit exception, applies stable fallback parameters
-        (first-bin nugget, sample-variance sill, max_dist/2 range).
+        (first-bin nugget, sample-variance sill, max_dist/3 range).
         """
         if self.current_data is None:
             return
@@ -8078,7 +8519,7 @@ class VariogramWidget(QWidget):
                     QCoreApplication.translate(
                         "Tab 2",
                         "Not enough valid points in the experimental variogram "
-                        "to fit the model.",
+                        "to fit the model. Select different lag size or max distance.",
                     ),
                 )
                 return
@@ -8099,7 +8540,7 @@ class VariogramWidget(QWidget):
             max_dist_used = float(np.max(bin_center))
             estimated_nugget = float(gamma[0])
             estimated_sill = max_gamma
-            estimated_range = max_dist_used / 3.0
+            estimated_range = max_dist_used
             first_bin_value = estimated_nugget
 
             if set_progress is not None:
@@ -8134,7 +8575,6 @@ class VariogramWidget(QWidget):
             if set_progress is not None:
                 set_progress(80, "State: Fitting variogram model...")
 
-            # True only when fit_variogram returns and validation passes.
             autofit_ok = False
             use_fallback = False
             try:
@@ -8156,10 +8596,8 @@ class VariogramWidget(QWidget):
                 if ok:
                     autofit_ok = True
                 else:
-                    # Converged but physically implausible — discard fit.
                     use_fallback = True
             except Exception:
-                # Optimizer failed; same stable fallback as validation reject.
                 use_fallback = True
 
             if use_fallback:
@@ -8182,7 +8620,6 @@ class VariogramWidget(QWidget):
             if set_progress is not None:
                 set_progress(95, "State: Updating controls...")
 
-            # Lag-bin R² against the fitted or fallback model (not gstools R²).
             r2 = compute_variogram_lag_r2(bin_center, gamma, model)
             self.current_model = model
 
@@ -8196,6 +8633,12 @@ class VariogramWidget(QWidget):
             }
             self.params_changed.emit(params)
             self.update_plot(emit_signal=False, params=params)
+            if self.dialog is not None:
+                hint = getattr(
+                    self.dialog, '_update_experimental_variogram_hint', None
+                )
+                if hint is not None:
+                    hint()
 
             if set_progress is not None:
                 if autofit_ok:
@@ -8236,6 +8679,7 @@ class VariogramWidget(QWidget):
 
     def clear(self):
         """Clears data and plot when input layer/attributes change."""
+        self._disconnect_drag()
         self.current_data = None
         self.current_model = None
         self.figure.clear()
@@ -8253,7 +8697,9 @@ class VariogramWidget(QWidget):
         ax.set_yticks([])
         self.canvas.draw()
 
-    def set_data(self, coordinates, values, attribute_name, log_transform=False, auto_fit=False):
+    def set_data(
+        self, coordinates, values, attribute_name, log_transform=False, auto_fit=False
+    ):
         """Loads point data for the experimental variogram; optionally auto-fits."""
         from scipy.spatial import distance
 
@@ -8263,7 +8709,6 @@ class VariogramWidget(QWidget):
             self.clear()
             return
 
-        # Approximate max distance for large point sets(same as previous behavior).
         if len(coordinates) > 100:
             x_range = np.max(coordinates[:, 0]) - np.min(coordinates[:, 0])
             y_range = np.max(coordinates[:, 1]) - np.min(coordinates[:, 1])
@@ -8280,48 +8725,67 @@ class VariogramWidget(QWidget):
             'max_dist': max_dist,
             'log_transform': log_transform,
         }
+        # Ensure n_bins matches current lag/factor and this max_dist.
+        if self.dialog is not None:
+            recompute = getattr(
+                self.dialog, '_recompute_n_bins_for_current_cutoff', None
+            )
+            if recompute is not None:
+                recompute()
+            hint = getattr(
+                self.dialog, '_update_experimental_variogram_hint', None
+            )
+            if hint is not None:
+                hint()
 
         if auto_fit:
             self.auto_fit()
 
     def update_plot(self, emit_signal=True, params=None):
-        """Redraw experimental + model curves; recompute experimental-theoretical R².
+        """Redraw experimental + theoretical curves and cutoff handle.
 
-        Args:
-            emit_signal: When True, emit ``params_changed`` including ``r2``.
-            params: Optional parameter dict; otherwise read from the dialog store.
-
-        Returns:
-            float experimental-theoretical R², or 0.0 when plotting is not possible.
+        X-axis is fixed to ``[0, max_dist/1.5 + max_dist*0.05]``. Experimental
+        bins and the theoretical curve use cutoff = max_dist / factor_max_dist.
         """
+        self._disconnect_drag()
         self.figure.clear()
         ax = self.figure.add_subplot(111)
         r2 = 0.0
 
         if self.current_data is not None:
             try:
-                max_dist = self.current_data['max_dist']
+                max_dist = float(self.current_data['max_dist'])
+                settings = self._session_settings()
+                cutoff = experimental_variogram_cutoff(
+                    max_dist, settings.factor_max_dist
+                )
+                values = np.asarray(
+                    self.current_data['values'], dtype=float
+                ).ravel()
+                if values.size >= 2:
+                    data_variance = float(np.var(values, ddof=1))
+                else:
+                    data_variance = 0.0
+
                 bin_center, gamma = self._experimental_variogram()
                 if bin_center is None:
                     raise ValueError("insufficient experimental variogram bins")
-                #Plot the experimental variogram
+
                 ax.scatter(
                     bin_center,
                     gamma,
                     marker='+',
                     color='black',
-                    label=QCoreApplication.translate("Tab 2", "Experimental Variogram"),
+                    label=QCoreApplication.translate(
+                        "Tab 2", "Experimental Variogram"
+                    ),
                     alpha=0.7,
+                    zorder=2,
                 )
 
-                ##Build the theoretical variogram model from the variogram parameters for the current attribute
-                #Get variogram parameters for the current attribute
-                resolved = self._resolve_params(params) 
-                #Build the theoretical variogram model from the variogram parameters
+                resolved = self._resolve_params(params)
                 model = self._build_model_from_params(resolved)
                 self.current_model = model
-
-                # Lag-bin R² so the metric matches the plotted model curve.
                 r2 = compute_variogram_lag_r2(bin_center, gamma, model)
 
                 if emit_signal:
@@ -8333,20 +8797,33 @@ class VariogramWidget(QWidget):
                         'r2': float(r2),
                     })
 
-                #Plot the theoretical variogram curve
-                x_model = np.linspace(0, max_dist / 3.0, 100) #changed from 2.0 to 3.0
+                x_axis_max = max_dist / 1.5 + max_dist * 0.05
+                x_model = np.linspace(0.0, max(cutoff, 1e-6), 100)
                 y_model = model.variogram(x_model)
                 ax.plot(
                     x_model,
                     y_model,
-                    'r-',
                     color='#3944d7',
-                    linewidth=0.5,
+                    linewidth=0.8,
                     label=QCoreApplication.translate(
-                        "Tab 2", "Theoretical Model: {model}"
+                        "Tab 2", "Model: {model}"
                     ).format(model=resolved['model']),
+                    zorder=3,
                 )
-                # R² lives in the store/export; show it at lower-right of the model curve.
+
+                if np.isfinite(data_variance) and data_variance > 0:
+                    ax.axhline(
+                        data_variance,
+                        color='#7f8c8d',
+                        linestyle=':',
+                        linewidth=1.0,
+                        alpha=0.7,
+                        zorder=1,
+                        label=QCoreApplication.translate(
+                            "Tab 2", "Data variance"
+                        ),
+                    )
+
                 ax.annotate(
                     f"R² = {r2:.3f}",
                     xy=(float(np.max(x_model)), float(np.min(y_model))),
@@ -8356,10 +8833,13 @@ class VariogramWidget(QWidget):
                     fontweight='bold',
                     color='#3944d7',
                 )
-           
+
+                ax.set_xlim(0.0, x_axis_max)
                 ax.set_xlabel(QCoreApplication.translate("Tab 2", "Distance"))
-                ax.set_ylabel(QCoreApplication.translate("Tab 2", "Semivariance"))
-                ax.set_ylim(bottom=0) # Set the y-axis to start at 0
+                ax.set_ylabel(
+                    QCoreApplication.translate("Tab 2", "Semivariance")
+                )
+                ax.set_ylim(bottom=0)
                 title = QCoreApplication.translate(
                     "Tab 2", "Variogram – {param}"
                 ).format(param=self.current_data["attribute"])
@@ -8368,8 +8848,24 @@ class VariogramWidget(QWidget):
                         "Tab 2", " (Log transform)"
                     )
                 ax.set_title(title)
-                ax.legend()
                 ax.grid(True, alpha=0.3)
+
+                self._install_cutoff_handle(ax, max_dist, cutoff)
+
+                # Legend below the axes (outside the drawn data area).
+                self.figure.subplots_adjust(
+                    left=0.12, right=0.98, top=0.88, bottom=0.28
+                )
+                handles, labels = ax.get_legend_handles_labels()
+                self.figure.legend(
+                    handles,
+                    labels,
+                    loc='lower center',
+                    ncol=3,
+                    fontsize=7,
+                    frameon=False,
+                    bbox_to_anchor=(0.5, 0.02),
+                )
 
             except Exception as e:
                 print(f"Error updating plot: {str(e)}")
