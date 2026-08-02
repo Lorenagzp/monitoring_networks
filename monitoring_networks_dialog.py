@@ -1172,6 +1172,7 @@ class MonitoringNetworksDialog(QDialog):
         interp_layout.addLayout(wells_row)
 
         # Visibility-only controls: toggle existing widgets/artists, never re-krige.
+        map_options_row = QHBoxLayout()
         self.results_show_se_maps_cb = QCheckBox(
             QCoreApplication.translate(
                 "Tab 5", "Show kriging standard error maps"
@@ -1181,7 +1182,7 @@ class MonitoringNetworksDialog(QDialog):
         self.results_show_se_maps_cb.toggled.connect(
             self._on_results_show_se_maps_toggled
         )
-        interp_layout.addWidget(self.results_show_se_maps_cb)
+        map_options_row.addWidget(self.results_show_se_maps_cb)
 
         self.results_show_wells_cb = QCheckBox(
             QCoreApplication.translate(
@@ -1192,7 +1193,28 @@ class MonitoringNetworksDialog(QDialog):
         self.results_show_wells_cb.toggled.connect(
             self._on_results_show_wells_toggled
         )
-        interp_layout.addWidget(self.results_show_wells_cb)
+        map_options_row.addWidget(self.results_show_wells_cb)
+
+        self.results_color_ok_wells_cb = QCheckBox(
+            QCoreApplication.translate(
+                "Tab 5", "Color O.K. wells by value"
+            )
+        )
+        self.results_color_ok_wells_cb.setChecked(True)
+        self.results_color_ok_wells_cb.setToolTip(
+            QCoreApplication.translate(
+                "Tab 5",
+                "When checked, well markers on O.K. interpolation maps use the "
+                "same color ramp as the surface. When unchecked, all wells are "
+                "drawn in red.",
+            )
+        )
+        self.results_color_ok_wells_cb.toggled.connect(
+            self._on_results_color_ok_wells_toggled
+        )
+        map_options_row.addWidget(self.results_color_ok_wells_cb)
+        map_options_row.addStretch()
+        interp_layout.addLayout(map_options_row)
 
         plots_row = QHBoxLayout()
         # Extra height leaves room for titles, colorbars, and legends.
@@ -1530,6 +1552,22 @@ class MonitoringNetworksDialog(QDialog):
     def _on_results_show_wells_toggled(self, checked):
         """Show or hide well markers on Tab 5 maps without recomputing kriging."""
         self._set_ok_map_wells_visible(bool(checked))
+
+    def _on_results_color_ok_wells_toggled(self, _checked):
+        """Redraw O.K. maps so well markers switch between red and value colors."""
+        # Only refresh if interpolation axes already exist (maps were drawn).
+        if not hasattr(self, 'results_all_interp_ax'):
+            return
+        self._refresh_ok_interpolation_plots(
+            refresh_all=True, refresh_selected=True
+        )
+
+    def _color_ok_wells_by_value(self):
+        """True when O.K. well markers should use the interpolation color ramp."""
+        checkbox = getattr(self, 'results_color_ok_wells_cb', None)
+        if checkbox is None:
+            return True
+        return bool(checkbox.isChecked())
 
     def _register_ok_map_well_scatter(self, canvas, scatter):
         """Remember a well-marker PathCollection for visibility toggles.
@@ -2337,21 +2375,39 @@ class MonitoringNetworksDialog(QDialog):
         all_selected = n_selected == coordinates.shape[0]
 
         sel_coords = coordinates[selected_indices]
+        well_values = np.asarray(context['values'], dtype=float)[selected_indices]
         well_label = (
             QCoreApplication.translate("Tab 5", "All wells")
             if all_selected
             else QCoreApplication.translate("Tab 5", "Selected wells")
         )
-        well_scatter = ax.scatter(
-            sel_coords[:, 0],
-            sel_coords[:, 1],
-            c='red',
-            s=30,
-            edgecolors='k',
-            linewidths=0.5,
-            label=well_label,
-            zorder=5,
-        )
+        color_by_value = self._color_ok_wells_by_value()
+        if color_by_value:
+            # Same ramp/limits as the interpolation surface.
+            well_scatter = ax.scatter(
+                sel_coords[:, 0],
+                sel_coords[:, 1],
+                c=well_values,
+                cmap='viridis',
+                vmin=vmin,
+                vmax=vmax,
+                s=30,
+                edgecolors='k',
+                linewidths=0.5,
+                zorder=5,
+            )
+            well_face = plt.cm.viridis(0.5)
+        else:
+            well_scatter = ax.scatter(
+                sel_coords[:, 0],
+                sel_coords[:, 1],
+                c='red',
+                s=30,
+                edgecolors='k',
+                linewidths=0.5,
+                zorder=5,
+            )
+            well_face = 'red'
         self._register_ok_map_well_scatter(canvas, well_scatter)
 
         # Hover targets: all wells in the network (raw IDs, never translated).
@@ -2365,7 +2421,20 @@ class MonitoringNetworksDialog(QDialog):
         ax.set_xlabel(QCoreApplication.translate("Tab 5", "X"))
         ax.set_ylabel(QCoreApplication.translate("Tab 5", "Y"))
         ax.set_title(title)
-        ax.legend(loc='best', fontsize=8)
+        # Single legend entry for wells (no color-scale legend for the dots).
+        from matplotlib.lines import Line2D
+        well_proxy = Line2D(
+            [0],
+            [0],
+            marker='o',
+            color='none',
+            markerfacecolor=well_face,
+            markeredgecolor='k',
+            markersize=7,
+            linestyle='None',
+            label=well_label,
+        )
+        ax.legend(handles=[well_proxy], loc='best', fontsize=8)
         ax.set_aspect('equal')
         self._style_ok_map_axes(ax)
         colorbar = self._add_ok_map_colorbar(
@@ -3855,7 +3924,7 @@ class MonitoringNetworksDialog(QDialog):
                 QCoreApplication.translate(
                     "Tab 2",
                     "Variogram parameters auto-fit converged. "
-                    "You can compare different models type.",
+                    "You can compare different models type or fine-tune the parameters.",
                 )
             )
             label.setStyleSheet("color: #1e8449; font-style: italic;")
@@ -6506,7 +6575,7 @@ class MonitoringNetworksDialog(QDialog):
                 elif np.isnan(value):
                     text = "—"
                 else:
-                    text = f"{value:.3g}"
+                    text = f"{value:.4g}"
                 item = self.stats_table.item(row, table_col)
                 if item is None:
                     item = QTableWidgetItem(text)
@@ -6918,9 +6987,9 @@ class MonitoringNetworksDialog(QDialog):
             row=row,
         )
         self.var_params_table.setCellWidget(row, VAR_COL_MODEL, model_combo)
-        set_cell(VAR_COL_NUGGET, f"{state.get('nugget', 0):.3g}", editable)
-        set_cell(VAR_COL_SILL, f"{state.get('sill', 0):.3g}", editable)
-        set_cell(VAR_COL_RANGE, f"{state.get('range', 0):.2g}", editable)
+        set_cell(VAR_COL_NUGGET, f"{state.get('nugget', 0):.5g}", editable)
+        set_cell(VAR_COL_SILL, f"{state.get('sill', 0):.5g}", editable)
+        set_cell(VAR_COL_RANGE, f"{state.get('range', 0):.5g}", editable)
 
     def _sync_var_params_table_from_store(self, attributes=None):
         """Refresh var_params_table for the active tab-2 parameter only."""
@@ -7431,7 +7500,7 @@ class MonitoringNetworksDialog(QDialog):
             elif np.isnan(value):
                 text = "—"
             else:
-                text = f"{value:.3g}"
+                text = f"{value:.4g}"
             item = self.stats_table.item(row, table_col)
             if item is None:
                 item = QTableWidgetItem(text)
