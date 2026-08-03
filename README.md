@@ -16,6 +16,7 @@ The tool appears on the QGIS toolbar **Monitoring networks** and opens the dialo
 ---
 
 ## Workflow overview
+* Generated automatically with IA
 
 Work through the five tabs **in order**. Tabs 2–5 stay locked until **Next →** unlocks them. Changing the point layer (or other key inputs) can clear downstream results and lock later tabs again.
 
