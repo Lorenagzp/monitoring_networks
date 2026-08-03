@@ -162,31 +162,31 @@ MN_COMBINED_PARAMETERS_KEY = '_combined_param_'
 
 def stats_value_header_labels():
     """Column headers for the tab 2 basic statistics table."""
+    # Literals required so pylupdate5 can extract each string.
     return [
-        QCoreApplication.translate("Tab 2", header)
-        for header in STATS_VALUE_HEADERS
+        QCoreApplication.translate("Tab 2", "Count"),
+        QCoreApplication.translate("Tab 2", "Min"),
+        QCoreApplication.translate("Tab 2", "Max"),
+        QCoreApplication.translate("Tab 2", "Mean"),
+        QCoreApplication.translate("Tab 2", "Median"),
+        QCoreApplication.translate("Tab 2", "Std Dev"),
+        QCoreApplication.translate("Tab 2", "Variance"),
+        QCoreApplication.translate("Tab 2", "Asymmetry"),
+        QCoreApplication.translate("Tab 2", "Kurtosis"),
     ]
 
 
 def skewness_distribution_tooltip():
     """Tooltip text for the tab 2 skewness (asymmetry) statistic."""
     return QCoreApplication.translate(
-        "Tab 2",
-        "Skewness measures the lack of symmetry in the data distribution.\n\n"
-        "Between -0.5 and 0.5: Symmetric distribution\n"
-        "From -1 to -0.5 or from 0.5 to 1: Distribution close to symmetric\n"
-        "Less than -1 or greater than 1: High skewness, significant deviation",
+        "Tab 2", "Skewness measures the lack of symmetry in the data distribution.\n\nBetween -0.5 and 0.5: Symmetric distribution\nFrom -1 to -0.5 or from 0.5 to 1: Distribution close to symmetric\nLess than -1 or greater than 1: High skewness, significant deviation"
     )
 
 
 def kurtosis_distribution_tooltip():
     """Tooltip text for the tab 2 excess kurtosis statistic."""
     return QCoreApplication.translate(
-        "Tab 2",
-        "Excess kurtosis measures how peaked or flattened a distribution is.\n\n"
-        "Between -2 and 2: Normal distribution\n"
-        "Greater than 2: Sharper peak and heavy tails (more outliers)\n"
-        "Less than -2: Flatter peak and light tails (fewer outliers)",
+        "Tab 2", "Excess kurtosis measures how peaked or flattened a distribution is.\n\nBetween -2 and 2: Normal distribution\nGreater than 2: Sharper peak and heavy tails (more outliers)\nLess than -2: Flatter peak and light tails (fewer outliers)"
     )
 
 
@@ -233,44 +233,39 @@ def apply_distribution_shape_cell_style(item, stat_key, value):
     else:
         item.setBackground(QBrush())
 
-def cv_summary_header_labels(context_name):
+def cv_summary_header_labels():
     """Column headers for CV summary tables (tabs 2 and 5)."""
+    # Fixed context "CV" so pylupdate5 can extract these literals.
     return [
-        QCoreApplication.translate(context_name, "Min error"),
-        QCoreApplication.translate(context_name, "Max error"),
-        QCoreApplication.translate(context_name, "Mean error"),
-        QCoreApplication.translate(context_name, "MAE"),
-        QCoreApplication.translate(context_name, "RMSE"),
-        QCoreApplication.translate(context_name, "ASE"),
-        QCoreApplication.translate(context_name, "MSE"),
-        QCoreApplication.translate(context_name, "RMSSE"),
+        QCoreApplication.translate("CV", "Min error"),
+        QCoreApplication.translate("CV", "Max error"),
+        QCoreApplication.translate("CV", "Mean error"),
+        QCoreApplication.translate("CV", "MAE"),
+        QCoreApplication.translate("CV", "RMSE"),
+        QCoreApplication.translate("CV", "ASE"),
+        QCoreApplication.translate("CV", "MSE"),
+        QCoreApplication.translate("CV", "RMSSE"),
     ]
 
 
-def cv_summary_header_tooltips(context_name):
+def cv_summary_header_tooltips():
     """Tooltips for CV summary headers (ArcGIS-style metric names)."""
     return {
         'ase': QCoreApplication.translate(
-            context_name,
-            "Average Standard Error (ASE): root mean square of the kriging "
-            "standard errors. Ideally close to RMSE.",
+            "CV", "Average Standard Error (ASE): root mean square of the kriging standard errors. Ideally close to RMSE."
         ),
         'mse': QCoreApplication.translate(
-            context_name,
-            "Mean Standardized Error (MSE): mean of error/SE. Ideally close "
-            "to 0 (unbiased standardized residuals).",
+            "CV", "Mean Standardized Error (MSE): mean of error/SE. Ideally close to 0 (unbiased standardized residuals)."
         ),
         'rmsse': QCoreApplication.translate(
-            context_name,
-            "Root-Mean-Square Standardized Error (RMSSE): root mean square of "
-            "error/SE. Ideally close to 1.",
+            "CV", "Root-Mean-Square Standardized Error (RMSSE): root mean square of error/SE. Ideally close to 1."
         ),
     }
 
 
-def apply_cv_summary_header_tooltips(summary_table, context_name):
+def apply_cv_summary_header_tooltips(summary_table):
     """Attach ASE/MSE/RMSSE tooltips to an existing CV summary header row."""
-    tooltips = cv_summary_header_tooltips(context_name)
+    tooltips = cv_summary_header_tooltips()
     for col, key in enumerate(CV_SUMMARY_KEYS):
         tip = tooltips.get(key)
         if not tip:
@@ -280,16 +275,16 @@ def apply_cv_summary_header_tooltips(summary_table, context_name):
             header_item.setToolTip(tip)
 
 
-def cv_results_header_labels(context_name):
+def cv_results_header_labels():
     """Column headers for per-point CV tables (tabs 2 and 5)."""
     return [
-        QCoreApplication.translate(context_name, "ID"),
-        QCoreApplication.translate(context_name, "Included?"),
-        QCoreApplication.translate(context_name, "Measured"),
-        QCoreApplication.translate(context_name, "Predicted"),
-        QCoreApplication.translate(context_name, "Error"),
-        QCoreApplication.translate(context_name, "SE"),
-        QCoreApplication.translate(context_name, "Standardized Error"),
+        QCoreApplication.translate("CV", "ID"),
+        QCoreApplication.translate("CV", "Included?"),
+        QCoreApplication.translate("CV", "Measured"),
+        QCoreApplication.translate("CV", "Predicted"),
+        QCoreApplication.translate("CV", "Error"),
+        QCoreApplication.translate("CV", "SE"),
+        QCoreApplication.translate("CV", "Standardized Error"),
     ]
 
 
@@ -332,7 +327,7 @@ class MonitoringNetworksDialog(QDialog):
         self.iface = iface
         # Independent top-level window usable alongside QGIS and other instances.
         self.setWindowModality(Qt.NonModal)
-        self.setWindowTitle(QCoreApplication.translate("Main Window", "Monitoring Networks Priorization"))
+        self.setWindowTitle(QCoreApplication.translate("Main Window", "Monitoring Networks Prioritization"))
         self.setMinimumSize(750, 750)
         self._cached_layer = None
         self._cached_attribute = None
@@ -415,7 +410,7 @@ class MonitoringNetworksDialog(QDialog):
         self.setup_prioritization_tab()
         self.tabs.addTab(
             self.tab_prioritization, 
-            "4. " + QCoreApplication.translate("Main Window", "Priorization")
+            "4. " + QCoreApplication.translate("Main Window", "Prioritization")
         )
         
         # Tab 5: Results
@@ -575,9 +570,7 @@ class MonitoringNetworksDialog(QDialog):
         if weight_header is not None:
             weight_header.setToolTip(
                 QCoreApplication.translate(
-                    "Tab 2",
-                    "Relative importance when combining parameters on tab 4. "
-                    "Default: equal share (1/N) so weights sum to 1.",
+                    "Tab 2", "Relative importance when combining parameters on tab 4. Default: equal share (1/N) so weights sum to 1."
                 )
             )
         transform_header = self.stats_table.horizontalHeaderItem(
@@ -586,9 +579,7 @@ class MonitoringNetworksDialog(QDialog):
         if transform_header is not None:
             transform_header.setToolTip(
                 QCoreApplication.translate(
-                    "Tab 2",
-                    "Data transform for this parameter. Changing it recalculates "
-                    "statistics and variogram for this parameter only.",
+                    "Tab 2", "Data transform for this parameter. Changing it recalculates statistics and variogram for this parameter only."
                 )
             )
         asymmetry_header = self.stats_table.horizontalHeaderItem(
@@ -619,9 +610,7 @@ class MonitoringNetworksDialog(QDialog):
         )
         self.stats_table.verticalHeader().setToolTip(
             QCoreApplication.translate(
-                "Tab 2",
-                "Click a parameter name to show its geostatistics, "
-                "variogram and cross-validation.",
+                "Tab 2", "Click a parameter name to show its geostatistics, variogram and cross-validation."
             )
         )
         self._stats_table_height_filter = StatsTableHeightFilter(self)
@@ -633,10 +622,7 @@ class MonitoringNetworksDialog(QDialog):
         # Informative label for statistics / active parameter views
         self.stats_info_label = QLabel(
             QCoreApplication.translate(
-                "Tab 2",
-                "Select attributes on tab 1, then click Next to calculate "
-                "geostatistics. Click a parameter name in the table to "
-                "inspect plots and the variogram.",
+                "Tab 2", "Select attributes on tab 1, then click Next to calculate geostatistics. Click a parameter name in the table to inspect plots and the variogram."
             )
         )
         self.stats_info_label.setStyleSheet("color: gray; font-style: italic;")
@@ -693,12 +679,7 @@ class MonitoringNetworksDialog(QDialog):
         if range_header is not None:
             range_header.setToolTip(
                 QCoreApplication.translate(
-                    "Tab 2",
-                    "Range shown is GSTools length scale (len_scale). It is not necessarily the"
-                    "practical range. \nFor Spherical len_scale = practical range\n"
-                    "For Exponential ≈ 3×len_scale\n"
-                    "Gaussian ≈ √3×len_scale\n"
-                    "For Matérn/Stable it depends on the shape parameter.",
+                    "Tab 2", "Range shown is GSTools length scale (len_scale). It is not necessarily the practical range.\nFor Spherical len_scale = practical range\nFor Exponential ≈ 3×len_scale\nGaussian ≈ √3×len_scale\nFor Matérn/Stable it depends on the shape parameter."
                     # TODO: Show separately the practical range and the length scale
                 )
             )
@@ -731,9 +712,7 @@ class MonitoringNetworksDialog(QDialog):
         self.var_lag_size_combo = WheelIgnoringComboBox()
         self.var_lag_size_combo.setToolTip(
             QCoreApplication.translate(
-                "Tab 2",
-                "Lag spacing for the experimental variogram, based on the "
-                "observed mean nearest-neighbor distance (Avg D).",
+                "Tab 2", "Lag spacing for the experimental variogram, based on the observed mean nearest-neighbor distance (Avg D)."
             )
         )
         self.var_lag_size_combo.currentIndexChanged.connect(
@@ -763,9 +742,9 @@ class MonitoringNetworksDialog(QDialog):
         self.cv_summary_table.setColumnCount(len(CV_SUMMARY_KEYS))
         self.cv_summary_table.setRowCount(1)
         self.cv_summary_table.setHorizontalHeaderLabels(
-            cv_summary_header_labels("Tab 2")
+            cv_summary_header_labels()
         )
-        apply_cv_summary_header_tooltips(self.cv_summary_table, "Tab 2")
+        apply_cv_summary_header_tooltips(self.cv_summary_table)
         self.cv_summary_table.verticalHeader().setVisible(False)
         self.cv_summary_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.cv_summary_table.setFixedHeight(70)
@@ -788,7 +767,7 @@ class MonitoringNetworksDialog(QDialog):
         self.cv_results_table = QTableWidget()
         self.cv_results_table.setColumnCount(7)
         self.cv_results_table.setHorizontalHeaderLabels(
-            cv_results_header_labels("Tab 2")
+            cv_results_header_labels()
         )
         self.cv_results_table.verticalHeader().setVisible(True)
         self.cv_results_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -800,8 +779,7 @@ class MonitoringNetworksDialog(QDialog):
 
         self.cv_info_label = QLabel(
             QCoreApplication.translate(
-                "Tab 2",
-                "Run geostatistics to compute leave-one-out cross-validation.",
+                "Tab 2", "Run geostatistics to compute leave-one-out cross-validation."
             )
         )
         self.cv_info_label.setStyleSheet("color: gray; font-style: italic;")
@@ -867,9 +845,7 @@ class MonitoringNetworksDialog(QDialog):
         self.buffer_spin.setSingleStep(0.5)
         self.buffer_spin.setToolTip(
             QCoreApplication.translate(
-                "Tab 3",
-                "Expands the concave hull outward by this many times the node "
-                "spacing. Default 1.0 adds one spacing interval beyond the hull.",
+                "Tab 3", "Expands the concave hull outward by this many times the node spacing. Default 1.0 adds one spacing interval beyond the hull."
             )
         )
         self.buffer_spin.valueChanged.connect(self.update_estimated_points)
@@ -886,8 +862,7 @@ class MonitoringNetworksDialog(QDialog):
         self.alpha_spin.setSingleStep(0.1)
         self.alpha_spin.setToolTip(
             QCoreApplication.translate(
-                "Tab 3",
-                "Alpha parameter for the QGIS hull around the wells. 0 = concave , 1 = convex .",
+                "Tab 3", "Alpha parameter for the QGIS hull around the wells. 0 = concave , 1 = convex ."
             )
         )
         gen_grid_layout.addWidget(self.alpha_spin, 3, 1)
@@ -912,8 +887,7 @@ class MonitoringNetworksDialog(QDialog):
         # Button to upload grid from file
         load_grid_layout.addWidget(QLabel(
             QCoreApplication.translate(
-                "Tab 3",
-                "Required columns: ID, X, Y. Optional column: weight.",
+                "Tab 3", "Required columns: ID, X, Y. Optional column: weight."
             )
         ))
         self.load_grid_btn = QPushButton(QCoreApplication.translate("Tab 3", "Select *.XLSX file"))
@@ -966,11 +940,7 @@ class MonitoringNetworksDialog(QDialog):
         )
         self.mn_use_well_weights.setToolTip(
             QCoreApplication.translate(
-                "Tab 4",
-                "Detected on the input point layer when a field name matches "
-                "(case-insensitive): peso_pozo, well_weight, w_pozo, peso_w, "
-                "well_w, weight_well, pozo_peso, or w. "
-                "The analysis attribute and ID-like fields are ignored.",
+                "Tab 4", "Detected on the input point layer when a field name matches (case-insensitive): peso_pozo, well_weight, w_pozo, peso_w, well_w, weight_well, pozo_peso, or w. The analysis attribute and ID-like fields are ignored."
             )
         )
         self.mn_use_well_weights.setEnabled(False)
@@ -993,12 +963,7 @@ class MonitoringNetworksDialog(QDialog):
         )
         self.mn_use_grid_weights.setToolTip(
             QCoreApplication.translate(
-                "Tab 4",
-                "Available after importing an estimation grid Excel on tab 3. "
-                "Required columns in order: ID, X, Y. Optional 4th column: "
-                "weight (used as per-node grid weight). "
-                "Generated grids without an imported weight column cannot use "
-                "this option.",
+                "Tab 4", "Available after importing an estimation grid Excel on tab 3. Required columns in order: ID, X, Y. Optional 4th column: weight (used as per-node grid weight). Generated grids without an imported weight column cannot use this option."
             )
         )
         self.mn_use_grid_weights.setEnabled(False)
@@ -1052,9 +1017,7 @@ class MonitoringNetworksDialog(QDialog):
         
         self.variance_info_label = QLabel(
             QCoreApplication.translate(
-                "Tab 4",
-                "Generate an estimation grid (tab 3) and fit a variogram "
-                "(tab 2), then click Optimize.",
+                "Tab 4", "Generate an estimation grid (tab 3) and fit a variogram (tab 2), then click Optimize."
             )
         )
         self.variance_info_label.setStyleSheet("color: gray; font-style: italic;")
@@ -1160,8 +1123,7 @@ class MonitoringNetworksDialog(QDialog):
         )
         self.save_interpolation_btn.setToolTip(
             QCoreApplication.translate(
-                "Tab 5",
-                "Download the krigging interpolation map as a temporary layer. The raster resolution is based on the estimation grid spacing.",
+                "Tab 5", "Download the kriging interpolation map as a temporary layer. The raster resolution is based on the estimation grid spacing."
             )
         )
         self.save_interpolation_btn.clicked.connect(
@@ -1203,10 +1165,7 @@ class MonitoringNetworksDialog(QDialog):
         self.results_color_ok_wells_cb.setChecked(True)
         self.results_color_ok_wells_cb.setToolTip(
             QCoreApplication.translate(
-                "Tab 5",
-                "When checked, well markers on O.K. interpolation maps use the "
-                "same color ramp as the surface. When unchecked, all wells are "
-                "drawn in red.",
+                "Tab 5", "When checked, well markers on O.K. interpolation maps use the same color ramp as the surface. When unchecked, all wells are drawn in red."
             )
         )
         self.results_color_ok_wells_cb.toggled.connect(
@@ -1315,9 +1274,9 @@ class MonitoringNetworksDialog(QDialog):
         summary_table.setColumnCount(len(CV_SUMMARY_KEYS))
         summary_table.setRowCount(1)
         summary_table.setHorizontalHeaderLabels(
-            cv_summary_header_labels(context_name)
+            cv_summary_header_labels()
         )
-        apply_cv_summary_header_tooltips(summary_table, context_name)
+        apply_cv_summary_header_tooltips(summary_table)
         summary_table.verticalHeader().setVisible(False)
         summary_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         summary_table.setFixedHeight(70)
@@ -1332,7 +1291,7 @@ class MonitoringNetworksDialog(QDialog):
         results_table = QTableWidget()
         results_table.setColumnCount(7)
         results_table.setHorizontalHeaderLabels(
-            cv_results_header_labels(context_name)
+            cv_results_header_labels()
         )
         results_table.verticalHeader().setVisible(True)
         results_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -1781,8 +1740,7 @@ class MonitoringNetworksDialog(QDialog):
         self._ok_map_well_scatters = {}
         default_cv_message = (
             QCoreApplication.translate(
-                "Tab 5",
-                "Run Kalman optimization on tab 4 to compute cross-validation.",
+                "Tab 5", "Run Kalman optimization on tab 4 to compute cross-validation."
             )
             if message is ...
             else message
@@ -1894,8 +1852,7 @@ class MonitoringNetworksDialog(QDialog):
         state = self._get_variogram_state(resolved_name)
         if not state:
             return None, None, QCoreApplication.translate(
-                "Tab 2",
-                "Run geostatistics to fit a variogram for this parameter first.",
+                "Tab 2", "Run geostatistics to fit a variogram for this parameter first."
             )
 
         param = parameters[0]
@@ -1916,8 +1873,7 @@ class MonitoringNetworksDialog(QDialog):
 
         if cv_result is None:
             return None, None, QCoreApplication.translate(
-                "Tab 2",
-                "At least three points are required for cross-validation.",
+                "Tab 2", "At least three points are required for cross-validation."
             )
 
         return cv_result, point_ids, None
@@ -1966,8 +1922,7 @@ class MonitoringNetworksDialog(QDialog):
 
         self.cv_info_label.setText(
             QCoreApplication.translate(
-                "Tab 2",
-                "Leave-one-out cross-validation for «{param}» ({n} points).",
+                "Tab 2", "Leave-one-out cross-validation for «{param}» ({n} points)."
             ).format(param=attr_name, n=int(np.sum(valid)))
         )
         self.cv_info_label.setStyleSheet("color: gray; font-style: italic;")
@@ -1994,8 +1949,7 @@ class MonitoringNetworksDialog(QDialog):
             tab5_message
             if tab5_message is not None
             else QCoreApplication.translate(
-                "Tab 5",
-                "Optimization cleared. Run Optimize on tab 4 again.",
+                "Tab 5", "Optimization cleared. Run Optimize on tab 4 again."
             )
         )
         self._update_workflow_navigation_state()
@@ -2022,8 +1976,7 @@ class MonitoringNetworksDialog(QDialog):
             if hasattr(self, 'variance_info_label'):
                 self.variance_info_label.setText(
                     QCoreApplication.translate(
-                        "Tab 4",
-                        "No optimization for this parameter. Click Optimize.",
+                        "Tab 4", "No optimization for this parameter. Click Optimize."
                     )
                 )
                 self.variance_info_label.setStyleSheet(
@@ -2032,8 +1985,7 @@ class MonitoringNetworksDialog(QDialog):
             self._update_results_well_spinbox()
             self._clear_ok_interpolation_plots(
                 QCoreApplication.translate(
-                    "Tab 5",
-                    "Run Optimize on tab 4 for the selected parameter.",
+                    "Tab 5", "Run Optimize on tab 4 for the selected parameter."
                 )
             )
         self._update_workflow_navigation_state()
@@ -2068,8 +2020,7 @@ class MonitoringNetworksDialog(QDialog):
             self._update_results_well_spinbox()
             self._clear_ok_interpolation_plots(
                 QCoreApplication.translate(
-                    "Tab 5",
-                    "Variogram changed. Run Optimize on tab 4 again.",
+                    "Tab 5", "Variogram changed. Run Optimize on tab 4 again."
                 )
             )
         self._update_workflow_navigation_state()
@@ -2103,8 +2054,7 @@ class MonitoringNetworksDialog(QDialog):
         param_data = self._get_mn_parameter_data(attr_name)
         if param_data is None:
             return None, QCoreApplication.translate(
-                "Tab 5",
-                "Run geostatistics on tab 2 for this parameter first.",
+                "Tab 5", "Run geostatistics on tab 2 for this parameter first."
             )
 
         # Univariate OK uses the first listed parameter (not a multivariate model).
@@ -2563,8 +2513,7 @@ class MonitoringNetworksDialog(QDialog):
         )
 
         default_message = error or QCoreApplication.translate(
-            "Tab 5",
-            "Cross-validation could not be computed.",
+            "Tab 5", "Cross-validation could not be computed."
         )
         if cv_result is None:
             self._clear_results_cv_tables(
@@ -2592,16 +2541,13 @@ class MonitoringNetworksDialog(QDialog):
         if network_indices is None:
             info_label.setText(
                 QCoreApplication.translate(
-                    "Tab 5",
-                    "Leave-one-out cross-validation for «{param}» ({n} points).",
+                    "Tab 5", "Leave-one-out cross-validation for «{param}» ({n} points)."
                 ).format(param=ok_parameter, n=n_total)
             )
         else:
             info_label.setText(
                 QCoreApplication.translate(
-                    "Tab 5",
-                    "Cross-validation for «{param}» using {n_network} network "
-                    "wells ({n_total} points).",
+                    "Tab 5", "Cross-validation for «{param}» using {n_network} network wells ({n_total} points)."
                 ).format(
                     param=ok_parameter,
                     n_network=len(network_indices),
@@ -2693,8 +2639,7 @@ class MonitoringNetworksDialog(QDialog):
         self.results_interp_color_limits = color_limits
         ok_parameter = context.get('ok_parameter') or context['attr_name']
         title = QCoreApplication.translate(
-            "Tab 5",
-            "O.K. – {param}\n(all {n} wells)",
+            "Tab 5", "O.K. – {param}\n(all {n} wells)"
         ).format(param=ok_parameter, n=n_wells)
         self._draw_ok_interpolation_map(
             self.results_all_interp_figure,
@@ -2724,8 +2669,7 @@ class MonitoringNetworksDialog(QDialog):
             se_limits = self._ok_interpolation_color_limits(std_error)
             self.results_se_color_limits = se_limits
             se_title = QCoreApplication.translate(
-                "Tab 5",
-                "S.E. – {param} \n(all {n} wells)",
+                "Tab 5", "S.E. – {param} \n(all {n} wells)"
             ).format(param=ok_parameter, n=n_wells)
             self._draw_ok_std_error_map(
                 self.results_all_se_figure,
@@ -2766,8 +2710,7 @@ class MonitoringNetworksDialog(QDialog):
             self._set_progress(
                 10,
                 QCoreApplication.translate(
-                    "Tab 5",
-                    "State: Updating selected-wells maps...",
+                    "Tab 5", "State: Updating selected-wells maps..."
                 ),
             )
 
@@ -2881,8 +2824,7 @@ class MonitoringNetworksDialog(QDialog):
             color_limits = self._ensure_ok_interpolation_color_limits(context)
             ok_parameter = context.get('ok_parameter') or context['attr_name']
             title = QCoreApplication.translate(
-                "Tab 5",
-                "O.K. – {param}\n({n} wells)",
+                "Tab 5", "O.K. – {param}\n({n} wells)"
             ).format(param=ok_parameter, n=n_use)
             self._draw_ok_interpolation_map(
                 self.results_sel_interp_figure,
@@ -2911,8 +2853,7 @@ class MonitoringNetworksDialog(QDialog):
                 self.results_sel_se_ax = self.results_sel_se_figure.axes[0]
                 se_limits = self._ensure_ok_se_color_limits(context)
                 se_title = QCoreApplication.translate(
-                    "Tab 5",
-                    "S.E. – {param} \n({n} wells)",
+                    "Tab 5", "S.E. – {param} \n({n} wells)"
                 ).format(param=ok_parameter, n=n_use)
                 self._draw_ok_std_error_map(
                     self.results_sel_se_figure,
@@ -3000,12 +2941,13 @@ class MonitoringNetworksDialog(QDialog):
 
     def save_selected_wells_as_layer(self):
         """Adds the Kalman-selected wells as a temporary point layer in QGIS."""
+        title = QCoreApplication.translate("Tab 5", "Download selected wells as layer")
         context, error = self._get_ok_interpolation_context()
         if context is None:
             QMessageBox.warning(
                 self,
-                QCoreApplication.translate("Tab 5", "Download selected wells as layer"),
-                error,
+                title,
+                QCoreApplication.translate("Tab 5", "Error: {error}").format(error=str(error))
             )
             return
 
@@ -3013,7 +2955,7 @@ class MonitoringNetworksDialog(QDialog):
         if not layer:
             QMessageBox.warning(
                 self,
-                QCoreApplication.translate("Tab 5", "Download selected wells as layer"),
+                title,
                 QCoreApplication.translate("Tab 5", "No input point layer is selected."),
             )
             return
@@ -3024,7 +2966,7 @@ class MonitoringNetworksDialog(QDialog):
         if n_use < 1:
             QMessageBox.warning(
                 self,
-                QCoreApplication.translate("Tab 5", "Download selected wells as layer"),
+                title,
                 QCoreApplication.translate(
                     "Tab 5", "No selected wells are available to export."
                 ),
@@ -3111,10 +3053,9 @@ class MonitoringNetworksDialog(QDialog):
             QTimer.singleShot(1000, self._reset_progress)
             QMessageBox.information(
                 self,
-                QCoreApplication.translate("Tab 5", "Download selected wells as layer"),
+                title,
                 QCoreApplication.translate(
-                    "Tab 5",
-                    "Saved {n} selected well(s) as a temporary layer for «{param}».",
+                    "Tab 5", "Saved {n} selected well(s) as a temporary layer for «{param}»."
                 ).format(n=len(features), param=display_name),
             )
         except Exception as exc:
@@ -3124,10 +3065,9 @@ class MonitoringNetworksDialog(QDialog):
             )
             QMessageBox.warning(
                 self,
-                QCoreApplication.translate("Tab 5", "Download selected wells as layer"),
+                title,
                 QCoreApplication.translate(
-                    "Tab 5",
-                    "Could not create the wells layer:\n{error}\n{details}",
+                    "Tab 5", "Could not create the wells layer:\n{error}\n{details}"
                 ).format(error=str(exc), details=traceback.format_exc()),
             )
 
@@ -3275,8 +3215,7 @@ class MonitoringNetworksDialog(QDialog):
                 self,
                 title,
                 QCoreApplication.translate(
-                    "Tab 5",
-                    "No selected wells are available for interpolation.",
+                    "Tab 5", "No selected wells are available for interpolation."
                 ),
             )
             return
@@ -3324,9 +3263,7 @@ class MonitoringNetworksDialog(QDialog):
                 self,
                 title,
                 QCoreApplication.translate(
-                    "Tab 5",
-                    "Could not build a regular raster from the estimation grid. "
-                    "Use a rectangular or regularly spaced grid.",
+                    "Tab 5", "Could not build a regular raster from the estimation grid. Use a rectangular or regularly spaced grid."
                 ),
             )
             return
@@ -3344,8 +3281,7 @@ class MonitoringNetworksDialog(QDialog):
                 band_description=display_name,
             )
             layer_name = QCoreApplication.translate(
-                "Tab 5",
-                "OK Interpolation - {param} ({n} wells)",
+                "Tab 5", "OK Interpolation - {param} ({n} wells)"
             ).format(param=display_name, n=n_use)
 
             raster_layer = QgsRasterLayer(tif_path, layer_name)
@@ -3357,8 +3293,7 @@ class MonitoringNetworksDialog(QDialog):
                     self,
                     title,
                     QCoreApplication.translate(
-                        "Tab 5",
-                        "The temporary raster layer could not be loaded.",
+                        "Tab 5", "The temporary raster layer could not be loaded."
                     ),
                 )
                 return
@@ -3375,9 +3310,7 @@ class MonitoringNetworksDialog(QDialog):
                 self,
                 title,
                 QCoreApplication.translate(
-                    "Tab 5",
-                    "Saved the OK interpolation for «{param}» "
-                    "({n} wells) as a temporary raster layer.",
+                    "Tab 5", "Saved the OK interpolation for «{param}» ({n} wells) as a temporary raster layer."
                 ).format(param=display_name, n=n_use),
             )
         except Exception as exc:
@@ -3389,8 +3322,7 @@ class MonitoringNetworksDialog(QDialog):
                 self,
                 title,
                 QCoreApplication.translate(
-                    "Tab 5",
-                    "Could not create the interpolation layer:\n{error}\n{details}",
+                    "Tab 5", "Could not create the interpolation layer:\n{error}\n{details}"
                 ).format(error=str(exc), details=traceback.format_exc()),
             )
 
@@ -3429,9 +3361,9 @@ class MonitoringNetworksDialog(QDialog):
         Advance the guided workflow.
 
         From Tab 1 (index 0): run calculate_geostatistics; on success unlock
-        Tab 2 and switch to it. From later tabs: unlock the next tab and move
-        there. Geostatistics runs only from Tab 1.
-        """
+        Tab 2 and switch to it. From later tabs: unlock the next tab and move there. Geostatistics runs only from Tab 1."""
+        title = QCoreApplication.translate("Main Window", "Next")
+        
         current = self.tabs.currentIndex()
         last_index = self.tabs.count() - 1
         if current >= last_index:
@@ -3441,11 +3373,9 @@ class MonitoringNetworksDialog(QDialog):
             if not self.calculate_geostatistics():
                 QMessageBox.warning(
                     self,
-                    QCoreApplication.translate("Main Window", "Next"),
+                    title,
                     QCoreApplication.translate(
-                        "Main Window",
-                        "Select a point layer and at least one parameter on "
-                        "tab 1, then try again.",
+                        "Main Window", "Select a point layer and at least one parameter on tab 1, then try again."
                     ),
                 )
                 return
@@ -3728,8 +3658,7 @@ class MonitoringNetworksDialog(QDialog):
                 "Tab 1", "Click Next to run the geostatistics"
             )
         return QCoreApplication.translate(
-            "Tab 1",
-            "Select an attribute of the layer to use as optimization param",
+            "Tab 1", "Select an attribute of the layer to use as optimization parameter"
         )
 
     def _update_tab1_progress_hint(self):
@@ -3772,8 +3701,7 @@ class MonitoringNetworksDialog(QDialog):
                 "Tab 3", "Click Next to continue to well prioritization."
             )
         return QCoreApplication.translate(
-            "Tab 3",
-            "Calculate or import an estimation grid to continue.",
+            "Tab 3", "Calculate or import an estimation grid to continue."
         )
 
     def _tab4_progress_hint(self):
@@ -3783,8 +3711,7 @@ class MonitoringNetworksDialog(QDialog):
                 "Tab 4", "Click Next to view the optimization map."
             )
         return QCoreApplication.translate(
-            "Tab 4",
-            "Run Optimize to compute well prioritization before continuing.",
+            "Tab 4", "Run Optimize to compute well prioritization before continuing."
         )
 
     def _update_tab3_progress_hint(self):
@@ -3831,9 +3758,7 @@ class MonitoringNetworksDialog(QDialog):
         if not ok_parameter:
             return None
         return QCoreApplication.translate(
-            "Tab 5",
-            "O.K. Interpolation was generated with just the first listed "
-            "parameter of the combined ones («{param}»).",
+            "Tab 5", "O.K. Interpolation was generated with just the first listed parameter of the combined ones («{param}»)."
         ).format(param=ok_parameter)
 
     def _update_tab5_progress_hint(self):
@@ -3922,18 +3847,14 @@ class MonitoringNetworksDialog(QDialog):
         if ok:
             label.setText(
                 QCoreApplication.translate(
-                    "Tab 2",
-                    "Variogram parameters auto-fit converged. "
-                    "You can compare different models type or fine-tune the parameters.",
+                    "Tab 2", "Variogram parameters auto-fit converged. You can compare different models type or fine-tune the parameters."
                 )
             )
             label.setStyleSheet("color: #1e8449; font-style: italic;")
         else:
             label.setText(
                 QCoreApplication.translate(
-                    "Tab 2",
-                    "Auto-fit did not converge; check outliers, variogram limit, lag size and adjust the model "
-                    "parameters manually to fit to the experimental variogram.",
+                    "Tab 2", "Auto-fit did not converge; check outliers, variogram limit, lag size and adjust the model parameters manually to fit to the experimental variogram."
                 )
             )
             label.setStyleSheet("color: #a04000; font-style: italic;")
@@ -4057,10 +3978,7 @@ class MonitoringNetworksDialog(QDialog):
         if hasattr(self, 'update_estimated_points'):
             self.update_estimated_points()
         info = QCoreApplication.translate(
-            "Tab 1",
-            "Name: {name}\n"
-            "Number of features: {count}\n"
-            "Coordinate system: {crs}",
+            "Tab 1", "Name: {name}\nNumber of features: {count}\nCoordinate system: {crs}"
         ).format(
             name=layer.name(),
             count=layer.featureCount(),
@@ -4229,9 +4147,7 @@ class MonitoringNetworksDialog(QDialog):
             self.mn_use_grid_weights.blockSignals(False)
             self.mn_grid_weight_info_label.setText(
                 QCoreApplication.translate(
-                    "Tab 4",
-                    "Import an estimation grid with a weight column on tab 3 "
-                    "to enable grid weighting.",
+                    "Tab 4", "Import an estimation grid with a weight column on tab 3 to enable grid weighting."
                 )
             )
             return
@@ -4239,9 +4155,7 @@ class MonitoringNetworksDialog(QDialog):
         if self.mn_use_grid_weights.isChecked():
             self.mn_grid_weight_info_label.setText(
                 QCoreApplication.translate(
-                    "Tab 4",
-                    "Using grid node weights (min={min_w:.3f}, max={max_w:.3f}, "
-                    "mean={mean_w:.3f}).",
+                    "Tab 4", "Using grid node weights (min={min_w:.3f}, max={max_w:.3f}, mean={mean_w:.3f})."
                 ).format(
                     min_w=float(np.min(weights)),
                     max_w=float(np.max(weights)),
@@ -4251,9 +4165,7 @@ class MonitoringNetworksDialog(QDialog):
         else:
             self.mn_grid_weight_info_label.setText(
                 QCoreApplication.translate(
-                    "Tab 4",
-                    "Grid weights available (min={min_w:.3f}, max={max_w:.3f}); "
-                    "not applied.",
+                    "Tab 4", "Grid weights available (min={min_w:.3f}, max={max_w:.3f}); not applied."
                 ).format(
                     min_w=float(np.min(weights)),
                     max_w=float(np.max(weights)),
@@ -4291,8 +4203,7 @@ class MonitoringNetworksDialog(QDialog):
             self.mn_use_well_weights.blockSignals(False)
             self.mn_well_weight_info_label.setText(
                 QCoreApplication.translate(
-                    "Tab 4",
-                    "No well weight field detected in the input layer.",
+                    "Tab 4", "No well weight field detected in the input layer."
                 )
             )
             return
@@ -4300,15 +4211,13 @@ class MonitoringNetworksDialog(QDialog):
         if self.mn_use_well_weights.isChecked():
             self.mn_well_weight_info_label.setText(
                 QCoreApplication.translate(
-                    "Tab 4",
-                    "Using column «{field}» as individual well weight.",
+                    "Tab 4", "Using column «{field}» as individual well weight."
                 ).format(field=weight_field)
             )
         else:
             self.mn_well_weight_info_label.setText(
                 QCoreApplication.translate(
-                    "Tab 4",
-                    "Weight column detected: «{field}» (not applied).",
+                    "Tab 4", "Weight column detected: «{field}» (not applied)."
                 ).format(field=weight_field)
             )
 
@@ -4317,12 +4226,10 @@ class MonitoringNetworksDialog(QDialog):
         if getattr(self, 'variance_results', None):
             self._clear_all_optimization_results(
                 tab5_message=QCoreApplication.translate(
-                    "Tab 5",
-                    "Weight option changed. Run Optimize on tab 4 again.",
+                    "Tab 5", "Weight option changed. Run Optimize on tab 4 again."
                 ),
                 tab4_message=QCoreApplication.translate(
-                    "Tab 4",
-                    "Well weight option changed. Click Optimize again.",
+                    "Tab 4", "Well weight option changed. Click Optimize again."
                 ),
             )
         self._update_mn_well_weight_info()
@@ -4332,12 +4239,10 @@ class MonitoringNetworksDialog(QDialog):
         if getattr(self, 'variance_results', None):
             self._clear_all_optimization_results(
                 tab5_message=QCoreApplication.translate(
-                    "Tab 5",
-                    "Weight option changed. Run Optimize on tab 4 again.",
+                    "Tab 5", "Weight option changed. Run Optimize on tab 4 again."
                 ),
                 tab4_message=QCoreApplication.translate(
-                    "Tab 4",
-                    "Grid weight option changed. Click Optimize again.",
+                    "Tab 4", "Grid weight option changed. Click Optimize again."
                 ),
             )
         self._update_mn_grid_weight_info()
@@ -4421,8 +4326,7 @@ class MonitoringNetworksDialog(QDialog):
             state = self._get_variogram_state(name)
             if not state:
                 return None, None, None, None, QCoreApplication.translate(
-                    "Tab 4",
-                    "Run geostatistics on tab 2 for «{param}» first.",
+                    "Tab 4", "Run geostatistics on tab 2 for «{param}» first."
                 ).format(param=name)
 
             (
@@ -4438,8 +4342,7 @@ class MonitoringNetworksDialog(QDialog):
             )
             if coordinates is None or raw_values is None:
                 return None, None, None, None, QCoreApplication.translate(
-                    "Tab 4",
-                    "No valid data found for «{param}».",
+                    "Tab 4", "No valid data found for «{param}»."
                 ).format(param=name)
 
             transform = 'log' if state.get('log_transform') else 'none'
@@ -4448,8 +4351,7 @@ class MonitoringNetworksDialog(QDialog):
             )
             if error or coordinates is None or values is None:
                 return None, None, None, None, error or QCoreApplication.translate(
-                    "Tab 4",
-                    "Could not align data for «{param}».",
+                    "Tab 4", "Could not align data for «{param}»."
                 ).format(param=name)
 
             aligned_point_ids = align_point_ids_with_transform(
@@ -4464,9 +4366,7 @@ class MonitoringNetworksDialog(QDialog):
                 or not np.allclose(coordinates, reference_coords)
             ):
                 return None, None, None, None, QCoreApplication.translate(
-                    "Tab 4",
-                    "Combined optimization requires the same valid wells for "
-                    "every parameter (check null values and log transforms).",
+                    "Tab 4", "Combined optimization requires the same valid wells for every parameter (check null values and log transforms)."
                 )
 
             if raw_well_weights is not None:
@@ -4477,8 +4377,7 @@ class MonitoringNetworksDialog(QDialog):
                     well_weights = aligned_well_weights
                 elif not np.allclose(aligned_well_weights, well_weights):
                     return None, None, None, None, QCoreApplication.translate(
-                        "Tab 4",
-                        "Well weight values must align for every parameter.",
+                        "Tab 4", "Well weight values must align for every parameter."
                     )
 
             parameters.append(
@@ -4528,8 +4427,7 @@ class MonitoringNetworksDialog(QDialog):
         if apply_well_weights:
             if well_weights is None:
                 return None, QCoreApplication.translate(
-                    "Tab 4",
-                    "No well weight field is available for this layer.",
+                    "Tab 4", "No well weight field is available for this layer."
                 )
         else:
             well_weights = None
@@ -4545,8 +4443,7 @@ class MonitoringNetworksDialog(QDialog):
             )
         except ValueError:
             return None, QCoreApplication.translate(
-                "Tab 4",
-                "Optimization input data are inconsistent.",
+                "Tab 4", "Optimization input data are inconsistent."
             )
 
         return optimization_input, None
@@ -4576,8 +4473,7 @@ class MonitoringNetworksDialog(QDialog):
             )
         elif message == "selecting_adverse":
             status = QCoreApplication.translate(
-                "Tab 4",
-                "State: Selecting adverse order ({current}/{total})...",
+                "Tab 4", "State: Selecting adverse order ({current}/{total})..."
             ).format(
                 current=kwargs.get("current", 0),
                 total=kwargs.get("total", 0),
@@ -4591,8 +4487,7 @@ class MonitoringNetworksDialog(QDialog):
             )
         elif message == "evaluating_adverse":
             status = QCoreApplication.translate(
-                "Tab 4",
-                "State: Evaluating adverse variance ({current}/{total})...",
+                "Tab 4", "State: Evaluating adverse variance ({current}/{total})..."
             ).format(
                 current=kwargs.get("current", 0),
                 total=kwargs.get("total", 0),
@@ -4629,9 +4524,7 @@ class MonitoringNetworksDialog(QDialog):
         if hasattr(self, 'variance_info_label'):
             self.variance_info_label.setText(
                 QCoreApplication.translate(
-                    "Tab 4",
-                    "Generate an estimation grid (tab 3) and fit a variogram "
-                    "(tab 2), then click Optimize.",
+                    "Tab 4", "Generate an estimation grid (tab 3) and fit a variogram (tab 2), then click Optimize."
                 )
             )
             self.variance_info_label.setStyleSheet(
@@ -4972,9 +4865,9 @@ class MonitoringNetworksDialog(QDialog):
                 color='deepskyblue',
                 linewidth=1,
                 label=QCoreApplication.translate(
-                    "Tab 4", "90% of max reduction ({:.2f}%)".format(level_90)
+                    "Tab 4", "90% of max reduction ({:.2f}%)"
                
-                ),
+                ).format(level_90),
             )
             ax.axhline(
                 level_95,
@@ -4982,8 +4875,8 @@ class MonitoringNetworksDialog(QDialog):
                 color='mediumblue',
                 linewidth=1,
                 label=QCoreApplication.translate(
-                    "Tab 4", "95% of max reduction ({:.2f}%)".format(level_95)
-                ),
+                    "Tab 4", "95% of max reduction ({:.2f}%)"
+                ).format(level_95),
             )
 
         ax.set_xlabel(
@@ -4994,7 +4887,7 @@ class MonitoringNetworksDialog(QDialog):
         )
         ax.set_title(
             QCoreApplication.translate(
-                "Tab 4", "Priorization order of wells– {param}"
+                "Tab 4", "Prioritization order of wells – {param}"
             ).format(param=display_name)
         )
         ax.set_xlim(left=0)
@@ -5098,11 +4991,14 @@ class MonitoringNetworksDialog(QDialog):
 
     def download_prioritization(self):
         """Export prioritization (layer attributes + results) and variogram settings."""
+
+        title = QCoreApplication.translate("Tab 4", "Download prioritization")
+
         attr_name = self._current_mn_parameter()
         if not attr_name:
             QMessageBox.warning(
                 self,
-                QCoreApplication.translate("Tab 4", "Download prioritization"),
+                title,
                 QCoreApplication.translate(
                     "Tab 4", "Select a parameter to optimize."
                 ),
@@ -5112,10 +5008,9 @@ class MonitoringNetworksDialog(QDialog):
         if attr_name not in self.variance_results:
             QMessageBox.warning(
                 self,
-                QCoreApplication.translate("Tab 4", "Download prioritization"),
+                title,
                 QCoreApplication.translate(
-                    "Tab 4",
-                    "Run Optimize first to generate prioritization results.",
+                    "Tab 4", "Run Optimize first to generate prioritization results."
                 ),
             )
             return
@@ -5305,31 +5200,26 @@ class MonitoringNetworksDialog(QDialog):
             )
             QMessageBox.information(
                 self,
-                QCoreApplication.translate("Tab 4", "Download prioritization"),
+                title,
                 QCoreApplication.translate(
-                    "Tab 4",
-                    "Prioritization saved to:\n{path}",
+                    "Tab 4", "Prioritization saved to:\n{path}"
                 ).format(path=file_path),
             )
         except ImportError:
             QMessageBox.warning(
                 self,
-                QCoreApplication.translate("Tab 4", "Download prioritization"),
+                title,
                 QCoreApplication.translate(
-                    "Tab 4",
-                    "XlsxWriter is required to export Excel files. "
-                    "Install it in the QGIS Python environment "
-                    "(pip install XlsxWriter).",
+                    "Tab 4", "XlsxWriter is required to export Excel files. Install it in the QGIS Python environment (pip install XlsxWriter)."
                 ),
             )
         except Exception as exc:
             import traceback
             QMessageBox.warning(
                 self,
-                QCoreApplication.translate("Tab 4", "Download prioritization"),
+                title,
                 QCoreApplication.translate(
-                    "Tab 4",
-                    "Could not save the Excel file:\n{error}\n{details}",
+                    "Tab 4", "Could not save the Excel file:\n{error}\n{details}"
                 ).format(error=str(exc), details=traceback.format_exc()),
             )
 
@@ -5436,11 +5326,13 @@ class MonitoringNetworksDialog(QDialog):
         The full estimation grid from tab 3 is used.
         Single- and multi-parameter runs both use compute_variance_reduction_curve.
         """
+        title = QCoreApplication.translate("Tab 4", "Optimize")
+
         attr_name = self._current_mn_parameter()
         if not attr_name:
             QMessageBox.warning(
                 self,
-                QCoreApplication.translate("Tab 4", "Optimize"),
+                title,
                 QCoreApplication.translate(
                     "Tab 4", "Select a parameter to optimize."
                 ),
@@ -5454,10 +5346,9 @@ class MonitoringNetworksDialog(QDialog):
         ):
             QMessageBox.warning(
                 self,
-                QCoreApplication.translate("Tab 4", "Optimize"),
+                title,
                 QCoreApplication.translate(
-                    "Tab 4",
-                    "Generate an estimation grid on tab 3 before optimizing.",
+                    "Tab 4", "Generate an estimation grid on tab 3 before optimizing."
                 ),
             )
             return
@@ -5480,8 +5371,7 @@ class MonitoringNetworksDialog(QDialog):
                 self,
                 QCoreApplication.translate("Tab 4", "Optimize"),
                 QCoreApplication.translate(
-                    "Tab 4",
-                    "Grid weights are not available for the current estimation grid.",
+                    "Tab 4", "Grid weights are not available for the current estimation grid."
                 ),
             )
             return
@@ -5499,11 +5389,9 @@ class MonitoringNetworksDialog(QDialog):
                 if len(param_names) < 2:
                     QMessageBox.warning(
                         self,
-                        QCoreApplication.translate("Tab 4", "Optimize"),
+                        title,
                         QCoreApplication.translate(
-                            "Tab 4",
-                            "Select at least two parameters on tab 1 "
-                            "for combined optimization.",
+                            "Tab 4", "Select at least two parameters on tab 1 for combined optimization."
                         ),
                     )
                     self._reset_mn_progress()
@@ -5523,7 +5411,7 @@ class MonitoringNetworksDialog(QDialog):
             if optimization_input is None:
                 QMessageBox.warning(
                     self,
-                    QCoreApplication.translate("Tab 4", "Optimize"),
+                    title,
                     input_error,
                 )
                 self._reset_mn_progress()
@@ -5537,10 +5425,9 @@ class MonitoringNetworksDialog(QDialog):
             self._optimization_progress_callback(0.0, "error")
             QMessageBox.warning(
                 self,
-                QCoreApplication.translate("Tab 4", "Optimize"),
+                title,
                 QCoreApplication.translate(
-                    "Tab 4",
-                    "Variance reduction could not be computed:\n{error}",
+                    "Tab 4", "Variance reduction could not be computed:\n{error}"
                 ).format(error=str(exc)),
             )
             return
@@ -5551,10 +5438,9 @@ class MonitoringNetworksDialog(QDialog):
             self._optimization_progress_callback(0.0, "error")
             QMessageBox.warning(
                 self,
-                QCoreApplication.translate("Tab 4", "Optimize"),
+                title,
                 QCoreApplication.translate(
-                    "Tab 4",
-                    "At least one well and one grid node are required.",
+                    "Tab 4", "At least one well and one grid node are required."
                 ),
             )
             return
@@ -5586,15 +5472,12 @@ class MonitoringNetworksDialog(QDialog):
                 for name, weight in sorted(param_weights.items())
             ]
             weight_note += " " + QCoreApplication.translate(
-                "Tab 4",
-                "(parameter weights: {weights})",
+                "Tab 4", "(parameter weights: {weights})"
             ).format(weights=", ".join(weight_parts))
 
         self.variance_info_label.setText(
             QCoreApplication.translate(
-                "Tab 4",
-                "Kalman ordering for «{param}»: {n} wells, "
-                "{grid} grid nodes, {red:.1f}% variance reduction.{weights}",
+                "Tab 4", "Kalman ordering for «{param}»: {n} wells, {grid} grid nodes, {red:.1f}% variance reduction.{weights}"
             ).format(
                 param=display_name,
                 n=n_wells,
@@ -5662,9 +5545,7 @@ class MonitoringNetworksDialog(QDialog):
         ])
         combo.setToolTip(
             QCoreApplication.translate(
-                "Tab 2",
-                "Data transform for this parameter. Changing it recalculates "
-                "statistics and variogram for this parameter only.",
+                "Tab 2", "Data transform for this parameter. Changing it recalculates statistics and variogram for this parameter only."
             )
         )
         combo.blockSignals(True)
@@ -6199,8 +6080,7 @@ class MonitoringNetworksDialog(QDialog):
         stats_dict = compute_descriptive_stats(transformed)
         if stats_dict is None:
             return False, QCoreApplication.translate(
-                "Tab 2",
-                "No valid data after applying the transformation for «{param}».",
+                "Tab 2", "No valid data after applying the transformation for «{param}»."
             ).format(param=attr_name)
 
         aligned_point_ids = align_point_ids_with_transform(
@@ -6310,9 +6190,7 @@ class MonitoringNetworksDialog(QDialog):
                 self._set_progress(
                     percent,
                     QCoreApplication.translate(
-                        "Tab 1",
-                        "State: Calculating statistics for «{param}» "
-                        "({current}/{total})...",
+                        "Tab 1", "State: Calculating statistics for «{param}» ({current}/{total})..."
                     ).format(
                         param=attr_name,
                         current=index + 1,
@@ -6346,9 +6224,7 @@ class MonitoringNetworksDialog(QDialog):
                     self._set_progress(
                         percent,
                         QCoreApplication.translate(
-                            "Tab 1",
-                            "State: Estimating variogram for «{param}» "
-                            "({current}/{total})...",
+                            "Tab 1", "State: Estimating variogram for «{param}» ({current}/{total})..."
                         ).format(
                             param=attr_name,
                             current=index + 1,
@@ -6377,10 +6253,7 @@ class MonitoringNetworksDialog(QDialog):
             if success_count:
                 self.stats_info_label.setText(
                     QCoreApplication.translate(
-                        "Tab 2",
-                        "Statistics and variograms calculated for {n} "
-                        "parameter(s). Click a parameter name to inspect "
-                        "plots and the stored variogram.",
+                        "Tab 2", "Statistics and variograms calculated for {n} parameter(s). Click a parameter name to inspect plots and the stored variogram."
                     ).format(n=success_count)
                 )
                 self.stats_info_label.setStyleSheet(
@@ -6488,12 +6361,10 @@ class MonitoringNetworksDialog(QDialog):
         ):
             self._clear_all_optimization_results(
                 tab5_message=QCoreApplication.translate(
-                    "Tab 5",
-                    "Selected parameters changed. Run Optimize on tab 4 again.",
+                    "Tab 5", "Selected parameters changed. Run Optimize on tab 4 again."
                 ),
                 tab4_message=QCoreApplication.translate(
-                    "Tab 4",
-                    "Selected parameters changed. Click Optimize again.",
+                    "Tab 4", "Selected parameters changed. Click Optimize again."
                 ),
             )
         self._tab1_params_for_optimization = new_param_set
@@ -6507,10 +6378,7 @@ class MonitoringNetworksDialog(QDialog):
             self._layer_data_by_attribute.clear()
             self.stats_info_label.setText(
                 QCoreApplication.translate(
-                    "Tab 2",
-                    "Select attributes on tab 1, then click Next to calculate "
-                    "geostatistics. Click a parameter name in the table to "
-                    "inspect plots and the variogram.",
+                    "Tab 2", "Select attributes on tab 1, then click Next to calculate geostatistics. Click a parameter name in the table to inspect plots and the variogram."
                 )
             )
             self.stats_info_label.setStyleSheet(
@@ -6823,22 +6691,19 @@ class MonitoringNetworksDialog(QDialog):
         if d_o is not None and np.isfinite(d_o):
             parts.append(
                 QCoreApplication.translate(
-                    "Tab 2",
-                    "Average distance between neighbor points (Avg D) = {d_o:.4g}",
+                    "Tab 2", "Average distance between neighbor points (Avg D) = {d_o:.4g}"
                 ).format(d_o=d_o)
             )
         if np.isfinite(lag_size) and lag_size > 0.0:
             parts.append(
                 QCoreApplication.translate(
-                    "Tab 2",
-                    "Lag size = {lag_size:.4g}",
+                    "Tab 2", "Lag size = {lag_size:.4g}"
                 ).format(lag_size=lag_size)
             )
         if max_dist is not None and np.isfinite(max_dist):
             parts.append(
                 QCoreApplication.translate(
-                    "Tab 2",
-                    "Max distance in the data = {max_dist:,.0f}",
+                    "Tab 2", "Max distance in the data = {max_dist:,.0f}"
                 ).format(max_dist=max_dist)
             )
         self.var_exp_hint_label.setText("  |  ".join(parts))
@@ -7175,8 +7040,7 @@ class MonitoringNetworksDialog(QDialog):
                 item.setBackground(QBrush())
         self.stats_info_label.setText(
             QCoreApplication.translate(
-                "Tab 2",
-                "Select attributes on tab 1, then click Calculate geostatistics.",
+                "Tab 2", "Select attributes on tab 1, then click Calculate geostatistics."
             )
         )
         self.stats_info_label.setStyleSheet("color: gray; font-style: italic;")
@@ -7202,8 +7066,7 @@ class MonitoringNetworksDialog(QDialog):
         self.cv_results_table.setRowCount(0)
         self.cv_info_label.setText(
             QCoreApplication.translate(
-                "Tab 2",
-                "Run geostatistics to compute leave-one-out cross-validation.",
+                "Tab 2", "Run geostatistics to compute leave-one-out cross-validation."
             )
         )
         self.cv_info_label.setStyleSheet("color: gray; font-style: italic;")
@@ -7663,8 +7526,7 @@ class MonitoringNetworksDialog(QDialog):
                 
                 self.estimated_points_label.setText(
                     QCoreApplication.translate(
-                        "Tab 3",
-                        "{count} points ({n_x} × {n_y})",
+                        "Tab 3", "{count} points ({n_x} × {n_y})"
                     ).format(count=n_nodes, n_x=n_x, n_y=n_y)
                 )
             else:
@@ -7686,7 +7548,7 @@ class MonitoringNetworksDialog(QDialog):
         if not layer:
             QMessageBox.warning(
                 self,
-                QCoreApplication.translate("Tab 3", "Error"),
+                "Error",
                 QCoreApplication.translate("Tab 3", "Select a layer first."),
             )
             return
@@ -7719,7 +7581,7 @@ class MonitoringNetworksDialog(QDialog):
             if data_points is None or len(data_points) == 0:
                 QMessageBox.warning(
                     self,
-                    QCoreApplication.translate("Tab 3", "Error"),
+                    "Error",
                     QCoreApplication.translate(
                         "Tab 3", "The selected layer has no points."
                     ),
@@ -7797,15 +7659,13 @@ class MonitoringNetworksDialog(QDialog):
                             # Fallback when QGIS-to-Shapely conversion fails
                             raise Exception(
                                 QCoreApplication.translate(
-                                    "Tab 3",
-                                    "Could not convert the QGIS hull to a Shapely polygon.",
+                                    "Tab 3", "Could not convert the QGIS hull to a Shapely polygon."
                                 )
                             )
                 else:
                     raise Exception(
                         QCoreApplication.translate(
-                            "Tab 3",
-                            "Could not create the concave hull with QGIS.",
+                            "Tab 3", "Could not create the concave hull with QGIS."
                         )
                     )
 
@@ -7854,12 +7714,10 @@ class MonitoringNetworksDialog(QDialog):
                     len(self.prioritization_grid_points) != len(estimation_points)):
                     self._clear_all_optimization_results(
                         tab5_message=QCoreApplication.translate(
-                            "Tab 5",
-                            "The estimation grid changed. Re-run optimization on tab 4.",
+                            "Tab 5", "The estimation grid changed. Re-run optimization on tab 4."
                         ),
                         tab4_message=QCoreApplication.translate(
-                            "Tab 4",
-                            "The estimation grid changed. Click Optimize again.",
+                            "Tab 4", "The estimation grid changed. Click Optimize again."
                         ),
                     )
 
@@ -7932,22 +7790,24 @@ class MonitoringNetworksDialog(QDialog):
             )
             QMessageBox.warning(
                 self,
-                QCoreApplication.translate("Tab 3", "Error"),
+                "Error",
                 QCoreApplication.translate(
-                    "Tab 3",
-                    "Could not create the estimation grid:\n{error}\n{details}",
+                    "Tab 3", "Could not create the estimation grid:\n{error}\n{details}"
                 ).format(error=str(e), details=traceback.format_exc()),
             )
 
     def save_grid_as_layer(self):
         """Saves the generated grid as a temporary QGIS point layer."""
+
+
+        title = QCoreApplication.translate("Tab 3", "Save grid as layer")
+
         if not hasattr(self, 'current_grid_points') or self.current_grid_points is None:
             QMessageBox.warning(
                 self,
-                QCoreApplication.translate("Tab 3", "Error"),
+                title,
                 QCoreApplication.translate(
-                    "Tab 3",
-                    "No generated grid is available. Preview the grid first.",
+                    "Tab 3", "No generated grid is available. Preview the grid first."
                 ),
             )
             return
@@ -7956,7 +7816,7 @@ class MonitoringNetworksDialog(QDialog):
         if not layer:
             QMessageBox.warning(
                 self,
-                QCoreApplication.translate("Tab 3", "Error"),
+                title,
                 QCoreApplication.translate("Tab 3", "No layer is selected."),
             )
             return
@@ -8049,11 +7909,9 @@ class MonitoringNetworksDialog(QDialog):
             
             QMessageBox.information(
                 self,
-                QCoreApplication.translate("Tab 3", "Success"),
+                title,
                 QCoreApplication.translate(
-                    "Tab 3",
-                    "Saved the estimation grid as a temporary layer with "
-                    "{count} points.",
+                    "Tab 3", "Saved the estimation grid as a temporary layer with {count} points."
                 ).format(count=len(features)),
             )
             
@@ -8061,10 +7919,9 @@ class MonitoringNetworksDialog(QDialog):
             import traceback
             QMessageBox.warning(
                 self,
-                QCoreApplication.translate("Tab 3", "Error"),
+                title,
                 QCoreApplication.translate(
-                    "Tab 3",
-                    "Could not save the estimation grid:\n{error}\n{details}",
+                    "Tab 3", "Could not save the estimation grid:\n{error}\n{details}"
                 ).format(error=str(e), details=traceback.format_exc()),
             )
     
@@ -8149,6 +8006,8 @@ class MonitoringNetworksDialog(QDialog):
         Rows with invalid ID or coordinates are skipped. Weight is optional;
         when absent or empty for all rows, the grid is imported as unweighted.
         """
+        title = QCoreApplication.translate("Tab 3", "Load grid as layer")
+        
         try:
             file_path = self._prompt_open_xlsx(
                 QCoreApplication.translate(
@@ -8170,7 +8029,7 @@ class MonitoringNetworksDialog(QDialog):
                 self._reset_progress()
                 QMessageBox.warning(
                     self,
-                    QCoreApplication.translate("Tab 3", "Error"),
+                    title,
                     str(exc),
                 )
                 return
@@ -8180,7 +8039,7 @@ class MonitoringNetworksDialog(QDialog):
                 )
                 QMessageBox.warning(
                     self,
-                    QCoreApplication.translate("Tab 3", "Error"),
+                    title,
                     QCoreApplication.translate(
                         "Tab 3", "Could not read Excel file:\n{error}"
                     ).format(error=str(e)),
@@ -8191,7 +8050,7 @@ class MonitoringNetworksDialog(QDialog):
                 self._reset_progress()
                 QMessageBox.warning(
                     self,
-                    QCoreApplication.translate("Tab 3", "Error"),
+                    title,
                     QCoreApplication.translate(
                         "Tab 3", "The selected Excel file is empty."
                     ),
@@ -8202,11 +8061,9 @@ class MonitoringNetworksDialog(QDialog):
                 self._reset_progress()
                 QMessageBox.warning(
                     self,
-                    QCoreApplication.translate("Tab 3", "Invalid File"),
+                    title,
                     QCoreApplication.translate(
-                        "Tab 3",
-                        "The selected file must have at least 3 columns for "
-                        "ID, X, and Y (in that order). Weight is optional.",
+                        "Tab 3", "The selected file must have at least 3 columns for ID, X, and Y (in that order). Weight is optional."
                     ),
                 )
                 return
@@ -8252,10 +8109,9 @@ class MonitoringNetworksDialog(QDialog):
             if not ids:
                 QMessageBox.warning(
                     self,
-                    QCoreApplication.translate("Tab 3", "Error"),
+                    title,
                     QCoreApplication.translate(
-                        "Tab 3",
-                        "No valid records with ID, X, and Y found in the file.",
+                        "Tab 3", "No valid records with ID, X, and Y found in the file."
                     ),
                 )
                 return
@@ -8298,15 +8154,11 @@ class MonitoringNetworksDialog(QDialog):
 
             if has_weights:
                 success_message = QCoreApplication.translate(
-                    "Tab 3",
-                    "Grid loaded successfully with {count} points "
-                    "(columns: ID, X, Y, weight).",
+                    "Tab 3", "Grid loaded successfully with {count} points (columns: ID, X, Y, weight)."
                 ).format(count=n_nodes)
             else:
                 success_message = QCoreApplication.translate(
-                    "Tab 3",
-                    "Grid loaded successfully with {count} points "
-                    "(columns: ID, X, Y; no node weights).",
+                    "Tab 3", "Grid loaded successfully with {count} points (columns: ID, X, Y; no node weights)."
                 ).format(count=n_nodes)
 
             self._set_progress(
@@ -8317,7 +8169,7 @@ class MonitoringNetworksDialog(QDialog):
             self._update_workflow_navigation_state()
             QMessageBox.information(
                 self,
-                QCoreApplication.translate("Tab 3", "Success"),
+                title,
                 success_message,
             )
         except Exception as e:
@@ -8327,10 +8179,9 @@ class MonitoringNetworksDialog(QDialog):
             )
             QMessageBox.warning(
                 self,
-                QCoreApplication.translate("Tab 3", "Error"),
+                title,
                 QCoreApplication.translate(
-                    "Tab 3",
-                    "Failed to load grid:\n{error}\n{details}",
+                    "Tab 3", "Failed to load grid:\n{error}\n{details}"
                 ).format(error=str(e), details=traceback.format_exc()),
             )
 
@@ -8584,11 +8435,9 @@ class VariogramWidget(QWidget):
             if bin_center is None:
                 QMessageBox.warning(
                     self,
-                    QCoreApplication.translate("Tab 2", "Error"),
+                    "Auto-fit",
                     QCoreApplication.translate(
-                        "Tab 2",
-                        "Not enough valid points in the experimental variogram "
-                        "to fit the model. Select different lag size or max distance.",
+                        "Tab 2", "Not enough valid points in the experimental variogram to fit the model. Select different lag size or max distance."
                     ),
                 )
                 return
@@ -8729,7 +8578,7 @@ class VariogramWidget(QWidget):
                 set_progress(0, "State: Error")
             QMessageBox.warning(
                 self,
-                QCoreApplication.translate("Tab 2", "Error"),
+                "Auto-fit",
                 QCoreApplication.translate(
                     "Tab 2", "Automatic fitting failed: {error}"
                 ).format(error=str(e)),
