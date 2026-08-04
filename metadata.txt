@@ -6,7 +6,7 @@
 name=Monitoring Networks
 qgisMinimumVersion=3.44
 description=Optimize the selection of monitoring wells to maximize information and mininize costs
-version=0.1
+version=1.0
 author=Lorena Gonzalez
 
 about=The Monitoring Networks plugin allows you to optimize the selection of wells in a monitoring network by maximizing information gathered, spatial coverage and mininizing the number of samplings needed.
