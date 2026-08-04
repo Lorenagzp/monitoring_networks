@@ -37,12 +37,49 @@ Shared footer on every tab: progress bar (**State: …**), **← Previous**, **N
 
 ---
 
+## Installation
+
+### 1. Install the plugin (ZIP)
+
+1. Download the plugin ZIP folder which the archive contains `monitoring_networks/`.
+2. In QGIS: **Plugins → Manage and Install Plugins → Install from ZIP**.
+3. Enable **Monitoring Networks** and open it from the **Monitoring networks** toolbar.
+
+The ZIP only installs the plugin code. Python dependencies must be installed separately (step 2).
+
+### 2. Install Python dependencies
+
+Extra packages are listed in [`requirements.txt`](requirements.txt):
+
+| Package | Needed for |
+|---------|------------|
+| **gstools** | Variograms and kriging |
+| **shapely** | Estimation-grid hull / node filtering |
+| **openpyxl** | Import estimation grid from Excel |
+| **XlsxWriter** | Export prioritization to Excel |
+
+**NumPy**, **SciPy**, and **Matplotlib** are normally already included with QGIS.
+
+Install into the **QGIS Python environment** (not a separate system Python):
+
+**Windows (OSGeo4W Shell)** — open *OSGeo4W Shell* from the Start menu, then:
+
+```bat
+python -m pip install gstools shapely openpyxl XlsxWriter
+```
+
+After installing, restart QGIS if the plugin was already loaded.
+
+**Alternative:** use a QGIS plugin such as **qpip** to install the same packages from inside QGIS.
+
+---
+
 ## Requirements & input specifications
 
 ### Software
 
 - **QGIS** ≥ 3.44 (see `metadata.txt`)
-- Python packages typically used by the plugin: NumPy, SciPy, GSTools, Matplotlib, Shapely, openpyxl (Excel import), XlsxWriter (Excel export)
+- Extra Python packages: see **Installation** and `requirements.txt` above
 
 ### Point layer (wells)
 

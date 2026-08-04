@@ -1,0 +1,6 @@
+# Extra Python packages required by Monitoring Networks (install into the QGIS Python environment).
+# NumPy, SciPy, and Matplotlib usually ship with QGIS and are not listed here.
+gstools
+shapely
+openpyxl
+XlsxWriter
