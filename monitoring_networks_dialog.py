@@ -5191,13 +5191,21 @@ class MonitoringNetworksDialog(QDialog):
 
         try:
             # XlsxWriter export avoids openpyxl style-init crashes on some QGIS builds.
-            write_excel_sheets(
-                file_path,
-                [
-                    ('Prioritization', prioritization_columns, prioritization_rows),
-                    ('Variogram_Settings', variogram_columns, variogram_rows),
-                ],
-            )
+            # write_excel_sheets attempts a one-time automatic "pip install
+            # XlsxWriter" into the QGIS Python environment when the package is
+            # missing, so most users never see the ImportError below. Show a
+            # wait cursor while that (rare, first-run only) install can happen.
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                write_excel_sheets(
+                    file_path,
+                    [
+                        ('Prioritization', prioritization_columns, prioritization_rows),
+                        ('Variogram_Settings', variogram_columns, variogram_rows),
+                    ],
+                )
+            finally:
+                QApplication.restoreOverrideCursor()
             QMessageBox.information(
                 self,
                 title,
@@ -5210,7 +5218,12 @@ class MonitoringNetworksDialog(QDialog):
                 self,
                 title,
                 QCoreApplication.translate(
-                    "Tab 4", "XlsxWriter is required to export Excel files. Install it in the QGIS Python environment (pip install XlsxWriter)."
+                    "Tab 4",
+                    "XlsxWriter is required to export Excel files. Automatic "
+                    "installation was attempted and did not succeed (see the "
+                    "QGIS Log Messages panel, 'Monitoring Networks' tab, for "
+                    "details). Install it manually in the QGIS Python "
+                    "environment (pip install XlsxWriter) and try again."
                 ),
             )
         except Exception as exc:

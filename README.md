@@ -61,6 +61,8 @@ Extra packages are listed in [`requirements.txt`](requirements.txt):
 
 **NumPy**, **SciPy**, and **Matplotlib** are normally already included with QGIS.
 
+**gstools** and **shapely** are imported when the plugin loads, so they must be installed before you open the dialog. **openpyxl** and **XlsxWriter** are only needed when you actually import or export an `*.xlsx` file (Tab 3 grid import, Tab 4 **Download prioritization**); if either is missing, the plugin tries to install it automatically into the QGIS Python environment the first time it is needed, so most users never have to do this by hand. If that automatic install doesn't succeed, you'll see a warning asking you to install it manually, using the same command below — check the QGIS **Log Messages** panel, **"Monitoring Networks"** tab, for the specific reason (pip output, missing permissions, etc.) if you want to understand why.
+
 Install into the **QGIS Python environment** (not a separate system Python):
 
 **Windows (OSGeo4W Shell)** — open *OSGeo4W Shell* from the Start menu, then:
@@ -72,6 +74,14 @@ python -m pip install gstools shapely openpyxl XlsxWriter
 After installing, restart QGIS if the plugin was already loaded.
 
 **Alternative:** use a QGIS plugin such as **qpip** to install the same packages from inside QGIS.
+
+<details>
+<summary>Note for developers: why the automatic install locates its own python.exe on Windows</summary>
+
+On the Windows standalone QGIS installer, the embedded Python interpreter runs inside the QGIS application executable itself (`qgis-bin.exe` / `qgis-ltr-bin.exe`), so `sys.executable` resolves to that launcher rather than to a real `python.exe`. Running `qgis-ltr-bin.exe -m pip install ...` doesn't invoke pip — it starts another instance of QGIS, which never exits on its own, so a naive auto-install hangs until a subprocess timeout kills it.
+
+`_find_python_executable()` in `monitoring_networks_analysis.py` works around this by looking for `python.exe` inside `sys.exec_prefix` (and related `sys.*_prefix` values) first — that directory is the real bundled Python install (e.g. `...\QGIS 3.40.4\apps\Python312\`) and does contain a standalone `python.exe`. `sys.executable` is used only as a last resort, and only if its filename doesn't look like the QGIS application itself.
+</details>
 
 ---
 
@@ -122,7 +132,7 @@ After installing, restart QGIS if the plugin was already loaded.
 **Typical failures**
 
 - Empty file, fewer than 3 columns, or no valid ID/X/Y rows
-- Missing openpyxl / XlsxWriter in the QGIS Python environment
+- openpyxl / XlsxWriter missing in the QGIS Python environment and the automatic install (see **Installation**) could not complete — install the package manually and try again
 - **Next →** on Tab 3 disabled until a grid exists
 
 ### Optional well-weight field (Tab 4)
@@ -335,7 +345,7 @@ Toggling either weight checkbox **clears** the current Optimize result — click
 **Next →** requires Optimize results for the **currently selected** parameter.  
 Hints: *Run Optimize to compute well prioritization before continuing.* / *Click Next to view the optimization map.*
 
-**Download prioritization** writes sheets such as prioritization order + variogram/CV settings (`prioritization_{param}.xlsx` or `prioritization_combined.xlsx`). Needs **XlsxWriter**.
+**Download prioritization** writes sheets such as prioritization order + variogram/CV settings (`prioritization_{param}.xlsx` or `prioritization_combined.xlsx`). Needs **XlsxWriter**, which the plugin tries to install automatically the first time you use this button if it isn't already present (see **Installation**).
 
 ---
 

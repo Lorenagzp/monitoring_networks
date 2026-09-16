@@ -135,24 +135,24 @@ def extract_coordinates_and_values_from_layer(layer, attribute):
     try:
         from qgis.core import QgsVectorLayer
         from PyQt5.QtCore import QVariant
-        
+
         if not isinstance(layer, QgsVectorLayer):
             return None, None, 0
-        
+
         field_index = layer.fields().indexOf(attribute)
         if field_index == -1:
             return None, None, 0
-        
+
         coordinates = []
         values = []
         null_count = 0
-        
+
         for feature in layer.getFeatures():
             geom = feature.geometry()
             if geom:
                 point = geom.asPoint()
                 value = feature[attribute]
-                
+
                 # Check if the value is NULL
                 if value is None or (isinstance(value, QVariant) and value.isNull()):
                     null_count += 1
@@ -166,12 +166,12 @@ def extract_coordinates_and_values_from_layer(layer, attribute):
                             null_count += 1
                     except (ValueError, TypeError):
                         null_count += 1
-        
+
         if len(coordinates) == 0 or len(values) == 0:
             return None, None, null_count
-        
+
         return np.array(coordinates), np.array(values), null_count
-    
+
     except Exception:
         return None, None, 0
 
@@ -314,7 +314,7 @@ def resolve_point_id_field(layer, attribute):
         QgsMessageLog.logMessage("Attribute header to evaluate as ID for the wells: " + field.name(), "ID Field") #Debugging
 
         #If the attribute header is the same as the attribute to evaluate as ID, skip it
-        if name.lower() == attr_lower: 
+        if name.lower() == attr_lower:
             continue
 
         lower = name.lower() #Convert the name of the attribute header to lowercase
@@ -1725,6 +1725,202 @@ def _sanitize_excel_sheet_name(sheet_name):
     return safe[:31]
 
 
+def _pip_install_target():
+    """
+    Returns whether pip should install with ``--user`` for auto-installing
+    missing optional dependencies inside the QGIS Python environment.
+
+    QGIS's bundled Python is sometimes installed in a location the running
+    user cannot write to (Program Files on Windows, /Applications on macOS).
+    Installing to the per-user site-packages directory (equivalent to
+    ``pip install --user``) avoids requiring admin/root privileges. When a
+    virtual/conda environment is active, ``site.ENABLE_USER_SITE`` is False
+    and a plain install (writable env) is used instead.
+    """
+    try:
+        import site
+        return bool(getattr(site, 'ENABLE_USER_SITE', False))
+    except Exception:
+        return False
+
+
+def _find_python_executable():
+    """
+    Locates a real Python interpreter executable to run "-m pip" with.
+
+    On Windows, QGIS's standalone installer runs a fully embedded Python
+    inside the application executable (``qgis-bin.exe`` /
+    ``qgis-ltr-bin.exe``), so ``sys.executable`` resolves to that QGIS
+    launcher, not to a usable ``python.exe``. Running
+    "qgis-ltr-bin.exe -m pip install ..." does not invoke pip at all: it
+    just starts another instance of QGIS, which never exits on its own, so
+    the install silently hangs until the subprocess timeout kills it. (This
+    is exactly what was observed: a 180s timeout with no pip output at all.)
+
+    ``sys.exec_prefix`` (and related ``sys.*_prefix`` attributes) still
+    point at the real Python installation directory bundled alongside QGIS
+    in that case (e.g. ``...\\QGIS 3.40.4\\apps\\Python312``), which
+    contains an actual ``python.exe``. Look there first; only fall back to
+    ``sys.executable`` when it does not look like the QGIS application
+    itself.
+
+    Returns:
+        Path to a usable python executable, or None if none could be found
+        (in which case the caller should not attempt to run a subprocess,
+        since the only candidate would be the QGIS launcher itself).
+    """
+    import os
+    import sys
+
+    candidates = []
+    prefixes = [
+        getattr(sys, 'exec_prefix', None),
+        getattr(sys, 'base_exec_prefix', None),
+        getattr(sys, 'prefix', None),
+        getattr(sys, 'base_prefix', None),
+    ]
+    if os.name == 'nt':
+        names = ('python.exe', 'python3.exe')
+        for prefix in prefixes:
+            if not prefix:
+                continue
+            for name in names:
+                candidates.append(os.path.join(prefix, name))
+    else:
+        names = ('python3', 'python')
+        for prefix in prefixes:
+            if not prefix:
+                continue
+            for name in names:
+                candidates.append(os.path.join(prefix, 'bin', name))
+
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        if os.path.isfile(candidate):
+            return candidate
+
+    # sys.executable is correct on most non-Windows setups, and on Windows
+    # setups where QGIS is not a fully self-contained embedded build. Never
+    # use it if it looks like the QGIS application itself: launching that
+    # with "-m pip install ..." starts another QGIS instance instead of
+    # running pip, and hangs until the subprocess timeout.
+    executable = sys.executable or ''
+    basename = os.path.basename(executable).lower()
+    if executable and 'qgis' not in basename:
+        return executable
+
+    return None
+
+
+def _pip_install(package_name):
+    """
+    Attempts a best-effort ``pip install`` of ``package_name`` into the
+    QGIS Python environment, using a real Python interpreter executable
+    located via ``_find_python_executable`` (never the QGIS application
+    executable itself — see that function's docstring for why).
+
+    Returns True if the subprocess reports success, False otherwise. Never
+    raises: any failure (offline, no permissions, pip missing, no usable
+    python executable found, etc.) is reported back as a plain False so the
+    caller can fall back to the manual-install message.
+    """
+    import subprocess
+
+    python_exe = _find_python_executable()
+    if not python_exe:
+        QgsMessageLog.logMessage(
+            f"Could not locate a Python executable to install {package_name} "
+            "with (only the QGIS application executable was found). Install "
+            "the package manually in the QGIS Python environment.",
+            "Monitoring Networks",
+        )
+        return False
+
+    args = [
+        python_exe, "-m", "pip", "install",
+        "--quiet", "--disable-pip-version-check",
+    ]
+    if _pip_install_target():
+        args.append("--user")
+    args.append(package_name)
+
+    QgsMessageLog.logMessage(
+        f"Installing {package_name} using Python executable: {python_exe}",
+        "Monitoring Networks",
+    )
+
+    try:
+        completed = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=120,
+        )
+    except Exception as exc:
+        QgsMessageLog.logMessage(
+            f"Automatic install of {package_name} failed to start: {exc}",
+            "Monitoring Networks",
+        )
+        return False
+
+    if completed.returncode != 0:
+        output = completed.stdout.decode('utf-8', errors='replace') if completed.stdout else ''
+        QgsMessageLog.logMessage(
+            f"Automatic install of {package_name} exited with code "
+            f"{completed.returncode}:\n{output}",
+            "Monitoring Networks",
+        )
+        return False
+
+    return True
+
+
+def _ensure_xlsxwriter():
+    """
+    Imports and returns the ``xlsxwriter`` module, attempting a one-time
+    automatic ``pip install`` into the QGIS Python environment when it is
+    missing, so users are not required to open an OSGeo4W/terminal shell
+    themselves just to export prioritization results to Excel.
+
+    Returns:
+        The imported ``xlsxwriter`` module.
+
+    Raises:
+        ImportError: if the module is missing and the automatic install
+            attempt also fails (no network access, no write permission,
+            pip unavailable, etc.). The caller shows the manual
+            "pip install XlsxWriter" instructions in that case.
+    """
+    try:
+        import xlsxwriter
+        return xlsxwriter
+    except ImportError:
+        pass
+
+    QgsMessageLog.logMessage(
+        "xlsxwriter not found; attempting automatic installation "
+        "(pip install XlsxWriter) into the QGIS Python environment.",
+        "Monitoring Networks",
+    )
+
+    if not _pip_install("XlsxWriter"):
+        raise ImportError(
+            "xlsxwriter is required to export Excel files and could not be "
+            "installed automatically."
+        )
+
+    try:
+        import xlsxwriter
+        return xlsxwriter
+    except ImportError as exc:
+        raise ImportError(
+            "xlsxwriter is required to export Excel files."
+        ) from exc
+
+
 def write_excel_sheets(file_path, sheet_specs):
     """
     Write a multi-sheet .xlsx file using XlsxWriter (export path only).
@@ -1734,6 +1930,11 @@ def write_excel_sheets(file_path, sheet_specs):
     workbook styles (NamedStyle copy / libxml2). XlsxWriter writes data-only
     workbooks without that style bootstrap.
 
+    If XlsxWriter is not installed in the current QGIS Python environment,
+    a one-time automatic ``pip install`` is attempted first (see
+    ``_ensure_xlsxwriter``); only if that also fails is an ImportError
+    raised to the caller.
+
     Grid import continues to use openpyxl read-only mode in
     ``read_excel_table_rows`` because XlsxWriter is write-only.
 
@@ -1742,12 +1943,7 @@ def write_excel_sheets(file_path, sheet_specs):
         sheet_specs: Iterable of (sheet_name, column_names, row_dicts).
             Each row_dict maps column name -> cell value.
     """
-    try:
-        import xlsxwriter
-    except ImportError as exc:
-        raise ImportError(
-            "xlsxwriter is required to export Excel files."
-        ) from exc
+    xlsxwriter = _ensure_xlsxwriter()
 
     if not sheet_specs:
         raise ValueError("At least one worksheet specification is required.")
@@ -1781,6 +1977,42 @@ def write_excel_sheets(file_path, sheet_specs):
         workbook.close()
 
 
+def _ensure_openpyxl():
+    """
+    Imports and returns ``openpyxl.load_workbook``, attempting a one-time
+    automatic ``pip install`` into the QGIS Python environment when the
+    package is missing (mirrors ``_ensure_xlsxwriter``).
+
+    Raises:
+        ImportError: if openpyxl is missing and the automatic install
+            attempt also fails.
+    """
+    try:
+        from openpyxl import load_workbook
+        return load_workbook
+    except ImportError:
+        pass
+
+    QgsMessageLog.logMessage(
+        "openpyxl not found; attempting automatic installation "
+        "(pip install openpyxl) into the QGIS Python environment.",
+        "Monitoring Networks",
+    )
+
+    if not _pip_install("openpyxl"):
+        raise ImportError(
+            "openpyxl is required to read Excel files and could not be "
+            "installed automatically. Install it manually in the QGIS "
+            "Python environment (pip install openpyxl) and try again."
+        )
+
+    try:
+        from openpyxl import load_workbook
+        return load_workbook
+    except ImportError as exc:
+        raise ImportError("openpyxl is required to read Excel files.") from exc
+
+
 def read_excel_table_rows(file_path):
     """
     Read the first worksheet as a list of row tuples (openpyxl read-only).
@@ -1788,13 +2020,15 @@ def read_excel_table_rows(file_path):
     Import uses openpyxl because XlsxWriter is write-only. Read-only mode avoids
     the style initialization path that crashes during export on some systems.
 
+    If openpyxl is not installed in the current QGIS Python environment, a
+    one-time automatic ``pip install`` is attempted first (see
+    ``_ensure_openpyxl``); only if that also fails is an ImportError raised
+    to the caller.
+
     Returns:
         list[tuple]: all rows including the header row, if present.
     """
-    try:
-        from openpyxl import load_workbook
-    except ImportError as exc:
-        raise ImportError("openpyxl is required to read Excel files.") from exc
+    load_workbook = _ensure_openpyxl()
 
     wb = load_workbook(file_path, read_only=True, data_only=True)
     try:
