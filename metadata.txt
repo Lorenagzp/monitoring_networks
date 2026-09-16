@@ -4,7 +4,7 @@
 
 [general]
 name=Monitoring Networks
-qgisMinimumVersion=3.44
+qgisMinimumVersion=3.22
 description=Optimize the selection of monitoring wells to maximize information and mininize costs
 version=1.0
 author=Lorena Gonzalez
@@ -43,4 +43,3 @@ Category of the plugin: Raster, Vector, Database or Web
 
 # If the plugin can run on QGIS Server.
 server=False
-

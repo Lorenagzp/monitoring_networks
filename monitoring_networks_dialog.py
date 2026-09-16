@@ -82,6 +82,7 @@ from .monitoring_networks_analysis import (
     compute_total_variance_percent,
     wells_at_fraction_of_max_reduction,
     build_covariance_model,
+    model_practical_range,
     compute_variogram_lag_r2,
     validate_variogram_autofit,
     variogram_autofit_fallback_params,
@@ -365,6 +366,8 @@ class MonitoringNetworksDialog(QDialog):
         self.stats_by_attribute = {}  # Per-parameter descriptive stats and plot inputs
         self._layer_data_by_attribute = {}  # Per-parameter raw layer extraction cache
         self.variance_results = {}  # Variance reduction curves keyed by parameter
+        # User's tab 5 pick of which combined-mode parameter drives OK maps/CV.
+        self._tab5_selected_parameter = None
         # Last Tab 1 parameter selection used to invalidate optimization cache.
         self._tab1_params_for_optimization = frozenset()
         # Feature IDs included in analysis (Tab 1 checkboxes); None when no layer.
@@ -1096,6 +1099,29 @@ class MonitoringNetworksDialog(QDialog):
         )
         interp_layout = QVBoxLayout()
 
+        # Lets the user pick, among the analyzed parameters, which one the OK/SE
+        # maps and CV on this tab are built from (the well ranking itself does
+        # not change — only the interpolated values and variogram do).
+        param_select_layout = QVBoxLayout()
+        param_select_layout.addWidget(QLabel(
+            QCoreApplication.translate("Tab 5", "Parameter shown on maps:")
+        ))
+        self.results_param_combo = QComboBox()
+        self.results_param_combo.addItem(
+            QCoreApplication.translate("Tab 5", "No parameter selected")
+        )
+        self.results_param_combo.setEnabled(False)
+        self.results_param_combo.setToolTip(
+            QCoreApplication.translate(
+                "Tab 5", "Choose which analyzed parameter drives the O.K./S.E. maps and cross-validation below. The well ranking stays the same; only the interpolated values and variogram change."
+            )
+        )
+        self.results_param_combo.currentIndexChanged.connect(
+            self._on_results_param_changed
+        )
+        param_select_layout.addWidget(self.results_param_combo)
+        interp_layout.addLayout(param_select_layout)
+
         wells_row = QHBoxLayout()
         wells_row.addWidget(QLabel(
             QCoreApplication.translate("Tab 5", "Number of monitoring wells:")
@@ -1811,11 +1837,25 @@ class MonitoringNetworksDialog(QDialog):
             default_cv_message,
         )
 
+    def _tab5_combined_reference_choice(self, selected_parameters):
+        """
+        Reference parameter (from ``selected_parameters``) whose values and
+        variogram drive tab 5 OK/SE maps and CV in combined mode.
+
+        Honors the user's tab 5 parameter-selector pick when it is still one
+        of the combined parameters; otherwise falls back to the first one
+        (previous behavior, and the default before a pick is made).
+        """
+        wanted = getattr(self, '_tab5_selected_parameter', None)
+        if wanted and selected_parameters and wanted in selected_parameters:
+            return wanted
+        return selected_parameters[0] if selected_parameters else None
+
     def _resolve_cv_parameter_name(self, attr_name):
         """Map tab 4 combined mode key to the reference parameter used for CV."""
         if self._is_combined_mn_parameter(attr_name):
             selected = self._selected_analysis_parameters()
-            return selected[0] if selected else None
+            return self._tab5_combined_reference_choice(selected)
         return attr_name
 
     def _tab5_reference_parameter(self):
@@ -3751,14 +3791,14 @@ class MonitoringNetworksDialog(QDialog):
             self._update_tab5_progress_hint()
 
     def _tab5_combined_ok_progress_hint(self):
-        """Idle note for Tab 5 when OK maps use the first combined parameter."""
+        """Idle note for Tab 5 when OK maps show one parameter of a combined set."""
         if not self._is_combined_mn_parameter(self._current_mn_parameter()):
             return None
         ok_parameter = self._tab5_reference_parameter()
         if not ok_parameter:
             return None
         return QCoreApplication.translate(
-            "Tab 5", "O.K. Interpolation was generated with just the first listed parameter of the combined ones («{param}»)."
+            "Tab 5", "O.K. Interpolation shown for «{param}» — pick a different analyzed parameter above to switch."
         ).format(param=ok_parameter)
 
     def _update_tab5_progress_hint(self):
@@ -4110,6 +4150,57 @@ class MonitoringNetworksDialog(QDialog):
         self._update_results_well_spinbox()
         self._update_mn_well_weight_info()
         self._update_mn_grid_weight_info()
+        self._sync_results_param_combo()
+        self._refresh_ok_interpolation_plot()
+
+    def _sync_results_param_combo(self):
+        """
+        Refreshes tab 5's parameter selector from whatever tab 4 is currently
+        optimizing: the single selected parameter, or every parameter in the
+        combined-weighted set. Lets the user pick which analyzed parameter
+        drives the O.K./S.E. maps and cross-validation shown on tab 5.
+        """
+        if not hasattr(self, 'results_param_combo'):
+            return
+
+        attr_name = self._current_mn_parameter()
+        if self._is_combined_mn_parameter(attr_name):
+            options = self._selected_analysis_parameters()
+        elif attr_name:
+            options = [attr_name]
+        else:
+            options = []
+
+        previous = self._tab5_selected_parameter
+
+        self.results_param_combo.blockSignals(True)
+        self.results_param_combo.clear()
+        if not options:
+            self.results_param_combo.addItem(
+                QCoreApplication.translate("Tab 5", "No parameter selected")
+            )
+            self.results_param_combo.setEnabled(False)
+            self._tab5_selected_parameter = None
+        else:
+            for name in options:
+                self.results_param_combo.addItem(name, name)
+            self.results_param_combo.setEnabled(True)
+            restore_idx = (
+                self.results_param_combo.findData(previous)
+                if previous else -1
+            )
+            if restore_idx < 0:
+                restore_idx = 0
+            self.results_param_combo.setCurrentIndex(restore_idx)
+            self._tab5_selected_parameter = options[restore_idx]
+        self.results_param_combo.blockSignals(False)
+
+    def _on_results_param_changed(self, _index):
+        """User picked a different analyzed parameter for tab 5 maps/CV."""
+        if not hasattr(self, 'results_param_combo'):
+            return
+        data = self.results_param_combo.currentData()
+        self._tab5_selected_parameter = str(data) if data else None
         self._refresh_ok_interpolation_plot()
 
     def _get_current_grid_weights(self):
@@ -4252,6 +4343,7 @@ class MonitoringNetworksDialog(QDialog):
         self._update_results_well_spinbox()
         self._update_mn_well_weight_info()
         self._update_mn_grid_weight_info()
+        self._sync_results_param_combo()
         self._load_optimization_views_for_current_parameter()
 
     def _mn_combined_parameters_label(self):
@@ -5296,8 +5388,10 @@ class MonitoringNetworksDialog(QDialog):
         """
         Loads aligned coordinates, values and variogram state for tab 4/5.
 
-        For combined mode, returns the first selected parameter as the spatial
-        reference (same well geometry); OK maps on tab 5 use its variogram.
+        For combined mode, the reference parameter (same well geometry; OK
+        maps and CV on tab 5 use its variogram) is the one chosen in the tab 5
+        parameter selector, falling back to the first selected parameter when
+        none has been chosen yet.
         """
         if self._is_combined_mn_parameter(attr_name):
             param_names = self._selected_analysis_parameters()
@@ -5316,18 +5410,28 @@ class MonitoringNetworksDialog(QDialog):
         if error or not parameters:
             return None
 
-        first_param = parameters[0]
-        state = self._get_variogram_state(first_param.name)
+        if self._is_combined_mn_parameter(attr_name):
+            reference_name = self._tab5_combined_reference_choice(
+                [param.name for param in parameters]
+            )
+            reference_param = next(
+                (p for p in parameters if p.name == reference_name),
+                parameters[0],
+            )
+        else:
+            reference_param = parameters[0]
+
+        state = self._get_variogram_state(reference_param.name)
         if not state:
             return None
 
         return {
             'coordinates': coordinates,
-            'values': first_param.values,
+            'values': reference_param.values,
             'point_ids': point_ids,
             'well_weights': well_weights,
             'state': state,
-            'reference_parameter': first_param.name,
+            'reference_parameter': reference_param.name,
         }
 
     def optimize_monitoring_network(self):
@@ -8675,8 +8779,13 @@ class VariogramWidget(QWidget):
     def update_plot(self, emit_signal=True, params=None):
         """Redraw experimental + theoretical curves and cutoff handle.
 
-        X-axis is fixed to ``[0, max_dist/1.5 + max_dist*0.05]``. Experimental
-        bins and the theoretical curve use cutoff = max_dist / factor_max_dist.
+        X-axis is fixed to ``[0, max_dist/1.5 + max_dist*0.05]`` (extended if
+        needed so the practical-range line below stays visible). Experimental
+        bins and the theoretical curve use cutoff = max_dist / factor_max_dist
+        — a lag/binning setting, independent of the fitted model. The
+        practical-range line, by contrast, is recomputed from the current
+        model here on every redraw, so it moves whenever Range, Sill, Nugget,
+        or Model type change.
         """
         self._disconnect_drag()
         self.figure.clear()
@@ -8754,6 +8863,27 @@ class VariogramWidget(QWidget):
                             "Tab 2", "Data variance"
                         ),
                     )
+
+                # Practical range of the fitted model (distance where the
+                # variogram reaches 95% of the total sill). Unlike the red
+                # lag/binning cutoff handle, this is a property of the model
+                # itself, so it moves whenever Range, Sill, Nugget, or Model
+                # type change.
+                practical_range = model_practical_range(model)
+                if practical_range is not None:
+                    ax.axvline(
+                        practical_range,
+                        color='#16a085',
+                        linestyle='-.',
+                        linewidth=1.3,
+                        alpha=0.9,
+                        zorder=3,
+                        label=QCoreApplication.translate(
+                            "Tab 2", "Practical range (95% of sill): {value:.2f}"
+                        ).format(value=practical_range),
+                    )
+                    if practical_range * 1.05 > x_axis_max:
+                        x_axis_max = practical_range * 1.05
 
                 ax.annotate(
                     f"R² = {r2:.3f}",

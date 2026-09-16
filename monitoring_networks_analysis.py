@@ -572,6 +572,31 @@ def build_covariance_model(model_type, nugget, sill, range_val):
     return gs.Matern(dim=2, var=var, len_scale=len_scale, nugget=nugget)
 
 
+def model_practical_range(model, per=0.95):
+    """
+    Distance at which a fitted variogram model reaches ``per`` of its total
+    sill (nugget + partial sill).
+
+    Unlike the experimental-variogram lag/binning cutoff (which only depends
+    on the data's max distance and the lag-size factor), this is a property
+    of the fitted model itself, so it changes whenever Range, Sill, Nugget,
+    or the Model type change. Uses GSTools' own ``percentile_scale``, which
+    solves for the distance directly from each model's actual variogram
+    shape rather than a per-model approximate multiplier of ``len_scale`` —
+    so spherical, exponential, gaussian, stable, and matern are all handled
+    consistently at the same percentile.
+
+    Returns None when it cannot be computed (e.g. a degenerate model).
+    """
+    try:
+        value = float(model.percentile_scale(per=per))
+    except Exception:
+        return None
+    if not np.isfinite(value) or value <= 0:
+        return None
+    return value
+
+
 # Legacy default alias; runtime n_bins is derived from lag_size and cutoff.
 VARIOGRAM_N_BINS = 12
 
@@ -1008,7 +1033,11 @@ def run_ordinary_kriging_cross_validation(
 
     When network_indices is provided, network wells are cross-validated with
     leave-one-out among the network; other wells are predicted using the full
-    network as conditioning data only.
+    network as conditioning data only. Either way, the summary statistics
+    (min/max/mean error, MAE, RMSE, ASE, MSE, RMSSE) are computed over every
+    well with a valid prediction, not only the network subset — this matches
+    the CV Details table, which always lists all wells with an "included"
+    flag rather than only the network wells.
 
     Returns:
         dict with summary (min/max/mean, MAE, RMSE, ASE, RMSSE) and rows
@@ -1071,17 +1100,15 @@ def run_ordinary_kriging_cross_validation(
     with np.errstate(divide='ignore', invalid='ignore'):
         standardized = np.where(se > 0, errors / se, np.nan)
 
-    # Summary uses the same point subset for errors and SEs.
-    if network_indices is not None:
-        summary = compute_cross_validation_summary(
-            errors[included_flags],
-            standard_errors=se[included_flags],
-        )
-    else:
-        summary = compute_cross_validation_summary(
-            errors,
-            standard_errors=se,
-        )
+    # Summary always aggregates over every well with a valid prediction
+    # (network wells via leave-one-out, non-network wells via external
+    # validation against the network) — never only the network subset.
+    # compute_cross_validation_summary() already drops any non-finite
+    # entries internally.
+    summary = compute_cross_validation_summary(
+        errors,
+        standard_errors=se,
+    )
 
     rows = []
     for i in range(n):

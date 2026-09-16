@@ -89,8 +89,10 @@ On the Windows standalone QGIS installer, the embedded Python interpreter runs i
 
 ### Software
 
-- **QGIS** ≥ 3.44 (see `metadata.txt`)
+- **QGIS** ≥ 3.22 "Białowieża" (LTR) — declared in `metadata.txt`; see the note below for why this is the realistic floor
 - Extra Python packages: see **Installation** and `requirements.txt` above
+
+> **Note on the declared minimum:** `qgisMinimumVersion` only controls which QGIS installations the Plugin Manager will offer this plugin to — QGIS does not otherwise enforce it, so the real constraint is Python, not QGIS itself. `requirements.txt`'s **gstools** requires **Python ≥ 3.8**. QGIS bundles its own Python (via the OSGeo4W installer on Windows, or the system/Homebrew Python on Linux/macOS), and that bundled version only reached **Python 3.9** starting around the **3.22 LTR** line (released February 2022) — earlier 3.x releases (3.16–3.20 and older) shipped Python 3.7, which cannot install `gstools`. From 3.22 onward every subsequent release (3.28, 3.34, 3.40, 3.44…) bundles Python 3.9 or newer, so `qgisMinimumVersion=3.22` is set as the realistic minimum where the plugin's dependencies install and the plugin runs without the Qt6/Python-version issues seen on older or newer setups. If you need to support an older QGIS install anyway, pin `gstools` (and the other packages in `requirements.txt`) to a version compatible with that install's Python, and test the full workflow there — it is not expected to work out of the box.
 
 ### Point layer (wells)
 
@@ -236,6 +238,7 @@ Cells for asymmetry/kurtosis are color-coded to match those bands.
 | **Nugget** / **Sill** / **Range** | Editable cells | Continuous | Manual edits refresh the plot and CV. **Range** is GSTools `len_scale` (not always the "practical range") |
 | **Lag size:** | Combo | **Avg D / 3**, **Avg D / 2**, **Avg D**, **1.5 × Avg D**, **2 × Avg D** | Bin spacing for the experimental variogram. Default: **Avg D** if nearest-neighbor index ≥ 1, else **Avg D / 2** |
 | Variogram limit handle | Drag handle on plot | Factor **1.5–5.0**, step **0.5**, default **3.0** | Red dashed vertical line. Cutoff ≈ `max_dist / factor`. Drag to re-bin and re-autofit |
+| Practical range line | Read-only marker on plot | — | Green dash-dot vertical line at the distance where the **fitted model** reaches 95% of its total sill. Recomputed on every redraw, so it moves whenever **Model**, **Nugget**, **Sill**, or **Range** change |
 
 **Avg D** = average nearest-neighbor distance among included wells (map units). Hint under the lag combo shows Avg D, lag size, and max pairwise distance in the data.
 
@@ -243,8 +246,11 @@ Cells for asymmetry/kurtosis are color-coded to match those bands.
 `Lag spacing for the experimental variogram, based on the observed mean nearest-neighbor distance (Avg D).`
 
 **Tooltip — Range:**  
-`Range shown is GSTools length scale (len_scale). It is not necessarily the practical range.`  
-Spherical: `len_scale` = practical range · Exponential ≈ 3× · Gaussian ≈ √3× · Matérn/Stable depends on shape.
+`Range shown is GSTools length scale (len_scale). It is not necessarily the practical range.`
+
+The **red dashed "Variogram limit"** handle and the **green dash-dot "Practical range"** line are two different things and move independently:
+- **Variogram limit** (red, draggable) only depends on the data's max distance and the lag-size factor — it controls experimental-variogram binning, not the model.
+- **Practical range** (green, read-only) is the distance where the *fitted model itself* reaches 95% of its sill, computed directly from GSTools for whichever model is active — spherical, exponential, gaussian, stable, or matérn — so it always reflects the current **Model** and **Range** (not a fixed per-model multiplier of `len_scale`).
 
 **Autofit status**
 
@@ -351,18 +357,22 @@ Hints: *Run Optimize to compute well prioritization before continuing.* / *Click
 
 ### Tab 5 — Map
 
-Uses the parameter selected on Tab 4. Compares **all wells** (left) vs the **first N prioritized wells** (right).
+Uses the parameter(s) selected on Tab 4 for well ranking. When Tab 4 is in **Parameters combined (Weighted)** mode, the **Parameter shown on maps** selector lets you pick which one of the analyzed (combined) parameters the O.K./S.E. maps and cross-validation are built from — the well ranking itself does not change, only which parameter's values and variogram are interpolated. In single-parameter mode the selector just shows that one parameter. Compares **all wells** (left) vs the **first N prioritized wells** (right).
 
 #### Controls
 
 | Control | Type | Default | Effect |
 |---------|------|---------|--------|
+| **Parameter shown on maps:** | Dropdown | First analyzed parameter (combined mode); the selected parameter (single mode) | Switches which analyzed parameter's O.K./S.E. maps and CV are shown. Only enabled/populated once Tab 4 has a parameter (or combined set) selected |
 | **Number of monitoring wells:** | Spin box | Min **3**; default ≈ wells at **95%** of max variance reduction | Rebuilds selected-network OK/SE maps and CV |
 | **Download selected wells as layer** | Button | — | Temporary points: rank, measured value, variance %, coordinates |
 | **Download interpolation as layer** | Button | — | Temporary GeoTIFF of OK surface for the selected *N* wells |
 | **Show kriging standard error maps** | Checkbox | **Off** | Shows/hides SE map panels |
 | **Show monitoring wells on maps** | Checkbox | **On** | Overlay well markers (no re-krige) |
 | **Color O.K. wells by value** | Checkbox | **On** | Same color ramp as the OK surface; off → all wells red |
+
+**Tooltip — parameter shown on maps:**  
+`Choose which analyzed parameter drives the O.K./S.E. maps and cross-validation below. The well ranking stays the same; only the interpolated values and variogram change.`
 
 **Tooltip — download interpolation:**  
 `Download the kriging interpolation map as a temporary layer. The raster resolution is based on the estimation grid spacing.`
@@ -374,11 +384,11 @@ Uses the parameter selected on Tab 4. Compares **all wells** (left) vs the **fir
 
 | Panel | Content |
 |-------|---------|
-| OK maps | Titles like **O.K. – {param}** for all wells and for *N* wells |
+| OK maps | Titles like **O.K. – {param}** for all wells and for *N* wells, where `{param}` is whatever is picked in **Parameter shown on maps** |
 | SE maps | **S.E. – {param}** when the SE checkbox is on |
 | **Cross-Validation Summary / Details** | Same metrics as Tab 2; selected-network CV uses the first *N* wells as the network. **Included?** = Yes/No |
 
-**Combined-parameter note:** OK on Tab 5 is built with the **first listed** parameter of the combined set (status message explains this).
+**Combined-parameter note:** in combined mode, OK/SE maps and CV on Tab 5 are built with **one** parameter's variogram at a time (never a true multivariate model) — the **Parameter shown on maps** selector picks which one; it defaults to the first analyzed parameter until you choose otherwise.
 
 If Optimize is cleared (variogram/weights/grid change), Tab 5 prompts to run Optimize on Tab 4 again.
 
