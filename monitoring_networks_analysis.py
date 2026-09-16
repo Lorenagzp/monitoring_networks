@@ -134,7 +134,7 @@ def extract_coordinates_and_values_from_layer(layer, attribute):
     """
     try:
         from qgis.core import QgsVectorLayer
-        from PyQt5.QtCore import QVariant
+        from qgis.PyQt.QtCore import QVariant
 
         if not isinstance(layer, QgsVectorLayer):
             return None, None, 0
@@ -376,7 +376,7 @@ def extract_point_records_from_layer(
     """
     try:
         from qgis.core import QgsVectorLayer
-        from PyQt5.QtCore import QVariant
+        from qgis.PyQt.QtCore import QVariant
 
         if not isinstance(layer, QgsVectorLayer):
             return None, None, None, 0, None
@@ -482,7 +482,7 @@ def build_point_id_layer_attribute_map(layer, attribute, include_fids=None):
     """
     try:
         from qgis.core import QgsVectorLayer
-        from PyQt5.QtCore import QVariant
+        from qgis.PyQt.QtCore import QVariant
 
         if not isinstance(layer, QgsVectorLayer):
             return [], {}

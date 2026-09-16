@@ -233,7 +233,7 @@ Cells for asymmetry/kurtosis are color-coded to match those bands.
 | Control | Type | Options / range | Effect |
 |---------|------|-----------------|--------|
 | **Model** | Combo | `spherical` (typical default), `exponential`, `gaussian`, `stable`, `matern` | Changing model re-runs auto-fit |
-| **Nugget** / **Sill** / **Range** | Editable cells | Continuous | Manual edits refresh the plot and CV. **Range** is GSTools `len_scale` (not always the “practical range”) |
+| **Nugget** / **Sill** / **Range** | Editable cells | Continuous | Manual edits refresh the plot and CV. **Range** is GSTools `len_scale` (not always the "practical range") |
 | **Lag size:** | Combo | **Avg D / 3**, **Avg D / 2**, **Avg D**, **1.5 × Avg D**, **2 × Avg D** | Bin spacing for the experimental variogram. Default: **Avg D** if nearest-neighbor index ≥ 1, else **Avg D / 2** |
 | Variogram limit handle | Drag handle on plot | Factor **1.5–5.0**, step **0.5**, default **3.0** | Red dashed vertical line. Cutoff ≈ `max_dist / factor`. Drag to re-bin and re-autofit |
 
@@ -267,7 +267,7 @@ Spherical: `len_scale` = practical range · Exponential ≈ 3× · Gaussian ≈ 
 | **MSE** | `Mean Standardized Error (MSE): mean of error/SE. Ideally close to 0 (unbiased standardized residuals).` |
 | **RMSSE** | `Root-Mean-Square Standardized Error (RMSSE): root mean square of error/SE. Ideally close to 1.` |
 
-Prefer CV diagnostics over a “pretty” experimental-vs-model curve alone when judging fit.
+Prefer CV diagnostics over a "pretty" experimental-vs-model curve alone when judging fit.
 
 ---
 

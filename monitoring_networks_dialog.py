@@ -60,11 +60,11 @@ from qgis.core import (QgsProject, QgsVectorLayer, QgsMapLayerProxyModel,
                       QgsFieldProxyModel, QgsFeature, QgsGeometry, QgsPointXY,
                       QgsField, QgsFields, QgsWkbTypes, QgsVectorDataProvider)
 from qgis.gui import QgsMapLayerComboBox, QgsFieldComboBox
-from PyQt5.QtGui import QColor, QBrush
+from qgis.PyQt.QtGui import QColor, QBrush
 import numpy as np
 import gstools as gs
 from scipy import stats
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 
