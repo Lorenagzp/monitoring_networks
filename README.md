@@ -8,10 +8,11 @@ The tool appears on the QGIS toolbar **Monitoring networks** and opens the dialo
 
 - Compute descriptive statistics and experimental/theoretical **variograms** per parameter
 - Run leave-one-out **cross-validation** (OK) to assess model fit
-- Build or import an **estimation grid** (optional node weights)
+- Build or import an **estimation grid** (optional node weights), from an Excel file or from a previously loaded point layer
 - Use optional **well weights** and **parameter weights** (multi-parameter)
 - Rank wells by information gain and show **prioritization order**
 - Map **ordinary kriging (OK)** and optional **standard error** surfaces for all wells vs the first *N* prioritized wells
+- Download the selected-wells network as a layer, its OK interpolation and kriging standard-error surfaces as layers, and its cross-validation details as Excel
 
 ---
 
@@ -57,11 +58,11 @@ Extra packages are listed in [`requirements.txt`](requirements.txt):
 | **gstools** | Variograms and kriging |
 | **shapely** | Estimation-grid hull / node filtering |
 | **openpyxl** | Import estimation grid from Excel |
-| **XlsxWriter** | Export prioritization to Excel |
+| **XlsxWriter** | Export prioritization and cross-validation details to Excel |
 
 **NumPy**, **SciPy**, and **Matplotlib** are normally already included with QGIS.
 
-**gstools** and **shapely** are imported when the plugin loads, so they must be installed before you open the dialog. **openpyxl** and **XlsxWriter** are only needed when you actually import or export an `*.xlsx` file (Tab 3 grid import, Tab 4 **Download prioritization**); if either is missing, the plugin tries to install it automatically into the QGIS Python environment the first time it is needed, so most users never have to do this by hand. If that automatic install doesn't succeed, you'll see a warning asking you to install it manually, using the same command below — check the QGIS **Log Messages** panel, **"Monitoring Networks"** tab, for the specific reason (pip output, missing permissions, etc.) if you want to understand why.
+**gstools** and **shapely** are imported when the plugin loads, so they must be installed before you open the dialog. **openpyxl** and **XlsxWriter** are only needed when you actually import or export an `*.xlsx` file (Tab 3 grid import, Tab 4 **Download prioritization**, Tab 5 **Download cross-validation details**); if either is missing, the plugin tries to install it automatically into the QGIS Python environment the first time it is needed, so most users never have to do this by hand. If that automatic install doesn't succeed, you'll see a warning asking you to install it manually, using the same command below — check the QGIS **Log Messages** panel, **"Monitoring Networks"** tab, for the specific reason (pip output, missing permissions, etc.) if you want to understand why.
 
 Install into the **QGIS Python environment** (not a separate system Python):
 
@@ -102,7 +103,7 @@ On the Windows standalone QGIS installer, the embedded Python interpreter runs i
 | CRS | Shown on Tab 1 (`authid`). Distances are **Euclidean in map units** (not geoidal) |
 | Parameters | Numeric fields only (`Int` / `Double` / `LongLong`) |
 | Inclusion | Tab 1 **Include** column (default: all wells included) |
-| IDs in plots/CV | Prefers fields like `id`, `clave`, `cve`, `pozo`, `well`, `name`, `nombre`; otherwise feature `fid` |
+| IDs in plots/tables/exports | Sequential **1..N** well number — see **Well identifiers (Well_ID)** below |
 | Nulls | Null / non-numeric / NaN / Inf values are **omitted** per parameter |
 | Log transform | Only values **> 0** are kept; ≤ 0 are omitted |
 
@@ -112,6 +113,19 @@ On the Windows standalone QGIS installer, the embedded Python interpreter runs i
 - After log transform, no positive values → recalculation error for that parameter
 - Cross-validation needs **≥ 3** valid points
 - Combined multi-parameter optimize needs the **same valid wells** for every parameter (nulls/log can break alignment)
+
+#### Well identifiers (Well_ID)
+
+Every plot, table and export that needs to identify a well (histogram/spatial-distribution hover labels, the Tab 2/Tab 5 cross-validation "Details" tables, the Tab 4 prioritization order table, Tab 5 map markers, and the **Download prioritization**, **Download selected wells as layer** and **Download cross-validation details** outputs) uses the same identifier: a plain sequential number from **1** to **N**, where **N** is the **total** number of wells loaded in the layer.
+
+This number:
+
+- Never depends on the layer having an `id`-like field (`id`, `clave`, `cve`, `pozo`, `well`, `name`, `nombre`, …) — a layer with no such field, or with one that has gaps or duplicates, is numbered exactly the same way.
+- Never depends on the provider's internal feature ID (`fid`), which can start at 0, skip numbers, or differ between providers/formats. `fid` is used only internally to sort features into a reproducible order before numbering; it is never shown.
+- Is assigned **once**, from the full layer, and reused everywhere — the same well is always "3" on every plot, table and export, even for a parameter where that well's value happens to be null and it drops out of that parameter's own plots/stats.
+- Does **not** renumber when wells are checked/unchecked on Tab 1. Unchecking a well simply leaves a gap: its number stops appearing anywhere while it is excluded, and every other well keeps its own number unchanged. Re-checking it brings it back with the same original number. This way "well 7" always refers to the same physical well, whatever else is currently selected — deselecting still invalidates and recalculates every downstream result as usual (see **Tab 1 — Buttons** below), it just never changes what number a well carries.
+
+Any `id`-like field the layer already has (CVE, POZO, NAME, …) is still exported as a plain data column — in **Download selected wells as layer**'s original-fields block and in `records_by_point_id`-based exports — it is simply no longer used as the *label* for a well.
 
 ### Estimation grid (Tab 3)
 
@@ -136,6 +150,13 @@ On the Windows standalone QGIS installer, the embedded Python interpreter runs i
 - Empty file, fewer than 3 columns, or no valid ID/X/Y rows
 - openpyxl / XlsxWriter missing in the QGIS Python environment and the automatic install (see **Installation**) could not complete — install the package manually and try again
 - **Next →** on Tab 3 disabled until a grid exists
+
+**Use a previously loaded point layer**
+
+- Any point layer already in the project can be used directly as the estimation grid: every feature becomes a grid node.
+- An optional numeric field on that layer can supply per-node weights (same convention as the Excel import: if any feature has a weight, cells without one default to `1.0`).
+- The plugin does **not** reproject the layer — it must already share the wells' CRS / map units.
+- A grid imported this way enables the Tab 4 **Use estimation grid node weights** option exactly like an Excel import with a weight column does, when a weight field was picked.
 
 ### Optional well-weight field (Tab 4)
 
@@ -178,7 +199,7 @@ Analysis attributes and ID-like fields are ignored for detection.
 | **Select all wells** | After loading a layer | Checks every **Include** box; clears downstream Tab 2/4/5 results |
 | **Deselect all wells** | To exclude everyone | Unchecks all; clears downstream results |
 
-Changing **Include** the same way clears stats, variograms, CV, and optimization caches (keeps attribute selection).
+Unchecking any well (or Select/Deselect all) fully invalidates every downstream result, not just the raw statistics: it clears stats, variograms, CV, and optimization caches; it also **drops the Tab 3 estimation grid** (its hull boundary was built from well positions, so a grid calculated before the change would still extend to cover deselected wells' locations until regenerated) and refreshes the nearest-neighbor stats (Avg D) that drive the Tab 2 default lag size and the Tab 3 default node spacing, so those defaults reflect only the wells still included. Tabs 2–5 **lock again** exactly as when the input layer changes — recalculate geostatistics via **Next**, regenerate the grid, and re-run **Optimize** before trusting any later tab. Attribute selection on Tab 1 itself is kept.
 
 #### Hints
 
@@ -202,6 +223,8 @@ Click a **parameter name** in the stats table vertical header to drive plots, va
 | **Weight** | Yes | Relative importance when combining parameters on Tab 4. Default **1/N** (sum = 1). Must be **> 0** |
 | **Transformation** | Combo | **None** (default) or **Logarithmic**. Recalculates stats + variogram for that parameter only |
 | **Count** … **Kurtosis** | No | Descriptive stats (Asymmetry = skewness) |
+
+The table always resizes to show **every** analyzed parameter as its own row — there is no internal scrollbar and no cap on how many rows are shown at once, so with several parameters selected on Tab 1 (e.g. multiple hydrogeochemical species) you always see all of them together, never only a partial subset. If the table (plus the plots below it) ends up taller than the window, the tab's own outer scrollbar handles that — scroll the tab, not the table.
 
 **Tooltip — Weight:**  
 `Relative importance when combining parameters on tab 4. Default: equal share (1/N) so weights sum to 1.`
@@ -303,9 +326,13 @@ The estimation grid is the set of locations where kriging variance is evaluated 
 | **Calculate grid** | Layer selected; spacing/buffer/alpha set | Builds buffered hull + nodes, stores grid, enables **Next →**, shows preview |
 | **Save Grid as Temporary Layer** / **Save grid as layer** | After a grid exists | Adds a memory point layer in the wells CRS |
 | **Select *.XLSX file** / **Load grid as layer** | Optional import | Loads ID, X, Y [, weight]; preview plot |
+| **Load layer as grid** | Optional import | Uses every feature of a previously loaded point layer as a grid node, with an optional numeric field as per-node weight; preview plot |
 
-Import group title: **Or Upload the estimation grid from *.XLSX file [Optional]**  
+Excel import group title: **Or Upload the estimation grid from *.XLSX file [Optional]**  
 Hint: *Required columns: ID, X, Y. Optional column: weight.*
+
+Point-layer import group title: **Or Select a Previously Loaded Point Layer [Optional]**  
+Controls: **Point layer:** (point layers in the project only) and **Node weight field (optional):** (numeric fields of the chosen layer, or none).
 
 **Next →** idle texts
 
@@ -322,7 +349,7 @@ Hint: *Required columns: ID, X, Y. Optional column: weight.*
 |---------|------|---------|--------|
 | **Select parameter to optimize:** | Combo | Disabled until params exist | One Tab-1 attribute, or **Parameters combined (Weighted)** if ≥ 2 parameters |
 | **Use personalized well weight** | Checkbox | Off | Enabled only if a weight field is detected |
-| **Use estimation grid node weights** | Checkbox | Off | Enabled only for Excel grids with a weight column |
+| **Use estimation grid node weights** | Checkbox | Off | Enabled only when the grid was imported (Excel or point layer) with a weight column/field |
 | **Optimize** | Button | — | Runs Kalman ranking + variance-reduction curve |
 | **Download prioritization** | Button | — | Excel export after a successful Optimize |
 
@@ -330,7 +357,7 @@ Hint: *Required columns: ID, X, Y. Optional column: weight.*
 `Detected on the input point layer when a field name matches (case-insensitive): peso_pozo, well_weight, w_pozo, peso_w, well_w, weight_well, pozo_peso, or w. The analysis attribute and ID-like fields are ignored.`
 
 **Tooltip — grid weights:**  
-`Available after importing an estimation grid Excel on tab 3. Required columns in order: ID, X, Y. Optional 4th column: weight (used as per-node grid weight). Generated grids without an imported weight column cannot use this option.`
+`Available after importing an estimation grid on tab 3 with a weight column, either from an Excel file (columns in order: ID, X, Y, weight) or from a point layer with a numeric weight field. Generated grids or grids without a weight column/field cannot use this option.`
 
 Toggling either weight checkbox **clears** the current Optimize result — click **Optimize** again.
 
@@ -351,7 +378,7 @@ Toggling either weight checkbox **clears** the current Optimize result — click
 **Next →** requires Optimize results for the **currently selected** parameter.  
 Hints: *Run Optimize to compute well prioritization before continuing.* / *Click Next to view the optimization map.*
 
-**Download prioritization** writes sheets such as prioritization order + variogram/CV settings (`prioritization_{param}.xlsx` or `prioritization_combined.xlsx`). Needs **XlsxWriter**, which the plugin tries to install automatically the first time you use this button if it isn't already present (see **Installation**).
+**Download prioritization** writes sheets such as prioritization order + variogram/CV settings (`prioritization_{param}.xlsx` or `prioritization_combined.xlsx`). The prioritization-order sheet starts with a `Well_ID` column (the sequential **1..N** identifier — see **Well identifiers (Well_ID)**), followed by the source layer's own fields, then `Priority`, `Variance`, `Adverse_Order`, `Adverse_Variance`, `Use_Well_Weight`, `Use_Grid_Weight`. Needs **XlsxWriter**, which the plugin tries to install automatically the first time you use this button if it isn't already present (see **Installation**).
 
 ---
 
@@ -365,8 +392,10 @@ Uses the parameter(s) selected on Tab 4 for well ranking. When Tab 4 is in **Par
 |---------|------|---------|--------|
 | **Parameter shown on maps:** | Dropdown | First analyzed parameter (combined mode); the selected parameter (single mode) | Switches which analyzed parameter's O.K./S.E. maps and CV are shown. Only enabled/populated once Tab 4 has a parameter (or combined set) selected |
 | **Number of monitoring wells:** | Spin box | Min **3**; default ≈ wells at **95%** of max variance reduction | Rebuilds selected-network OK/SE maps and CV |
-| **Download selected wells as layer** | Button | — | Temporary points: rank, measured value, variance %, coordinates |
-| **Download interpolation as layer** | Button | — | Temporary GeoTIFF of OK surface for the selected *N* wells |
+| **Download selected wells as layer** | Button | — | Temporary point layer for the selected-wells network (see below for its fields) |
+| **Download interpolation as layer** | Button | — | Temporary GeoTIFF of the OK surface for the selected *N* wells, styled with the same continuous viridis-like ramp shown on the in-app O.K. map |
+| **Download kriging standard error as layer** | Button | — | Temporary GeoTIFF of the kriging standard-error surface for the selected *N* wells, for the parameter shown on maps, styled with the same continuous Reds-like ramp shown on the in-app S.E. map |
+| **Download cross-validation details** | Button | — | Excel export (summary + details) of the leave-one-out cross-validation for the selected-wells network, for the parameter shown on maps |
 | **Show kriging standard error maps** | Checkbox | **Off** | Shows/hides SE map panels |
 | **Show monitoring wells on maps** | Checkbox | **On** | Overlay well markers (no re-krige) |
 | **Color O.K. wells by value** | Checkbox | **On** | Same color ramp as the OK surface; off → all wells red |
@@ -377,8 +406,23 @@ Uses the parameter(s) selected on Tab 4 for well ranking. When Tab 4 is in **Par
 **Tooltip — download interpolation:**  
 `Download the kriging interpolation map as a temporary layer. The raster resolution is based on the estimation grid spacing.`
 
+**Tooltip — download kriging standard error:**  
+`Download the kriging standard error surface for the selected-wells network as a temporary raster layer. The raster resolution is based on the estimation grid spacing.`
+
+**Tooltip — download cross-validation details:**  
+`Export the leave-one-out cross-validation summary and details for the selected-wells network of the parameter shown on maps, as an Excel file.`
+
 **Tooltip — color wells:**  
 `When checked, well markers on O.K. interpolation maps use the same color ramp as the surface. When unchecked, all wells are drawn in red.`
+
+##### Download selected wells as layer — field order
+
+The temporary point layer's attribute table starts with **every field the source (input) point layer already has** — the same layer used to generate the well prioritization — followed by:
+
+1. `well_id` — the well's sequential **1..N** identifier (see **Well identifiers (Well_ID)** above); the same number shown for that well everywhere else in the plugin
+2. `prioritization_rank` — 1-based rank in the selected-wells network
+3. `total_variance_pct` — remaining total variance (%) after this well joins the network
+4. `predicted_<parameter>` — one column per analyzed parameter (a single column in single-parameter mode; one per combined parameter in **Parameters combined (Weighted)** mode), holding the leave-one-out cross-validation predicted value for that well within the selected-wells network (same values as the Tab 5 "Selected wells" cross-validation table)
 
 #### Maps & CV
 
@@ -388,7 +432,7 @@ Uses the parameter(s) selected on Tab 4 for well ranking. When Tab 4 is in **Par
 | SE maps | **S.E. – {param}** when the SE checkbox is on |
 | **Cross-Validation Summary / Details** | Same metrics as Tab 2; selected-network CV uses the first *N* wells as the network. **Included?** = Yes/No |
 
-**Combined-parameter note:** in combined mode, OK/SE maps and CV on Tab 5 are built with **one** parameter's variogram at a time (never a true multivariate model) — the **Parameter shown on maps** selector picks which one; it defaults to the first analyzed parameter until you choose otherwise.
+**Combined-parameter note:** in combined mode, OK/SE maps and CV on Tab 5 are built with **one** parameter's variogram at a time (never a true multivariate model) — the **Parameter shown on maps** selector picks which one; it defaults to the first analyzed parameter until you choose otherwise. The **Download selected wells as layer** button is the exception: it adds a `predicted_<parameter>` column for **every** combined parameter, not just the one shown on maps.
 
 If Optimize is cleared (variogram/weights/grid change), Tab 5 prompts to run Optimize on Tab 4 again.
 
@@ -403,7 +447,7 @@ If Optimize is cleared (variogram/weights/grid change), Tab 5 prompts to run Opt
 3. Tab 2 — Adjust **Lag size** / drag the **variogram limit**; confirm **ASE ≈ RMSE**, **MSE ≈ 0**, **RMSSE ≈ 1**  
 4. Tab 3 — Keep default spacing ≈ Avg D and buffer **1.0** → **Calculate grid** → **Next →**  
 5. Tab 4 — **Optimize** → inspect variance curve (90%/95% lines) → **Next →**  
-6. Tab 5 — Set *N* near the 95% line; toggle SE maps if you need uncertainty surfaces; download layers as needed  
+6. Tab 5 — Set *N* near the 95% line; toggle SE maps if you need uncertainty surfaces; download layers/files as needed  
 
 ### Multi-parameter (weighted)
 
@@ -417,7 +461,7 @@ If Optimize is cleared (variogram/weights/grid change), Tab 5 prompts to run Opt
 | Goal | What to do |
 |------|------------|
 | Prefer certain wells | Detected weight field → enable **Use personalized well weight** → Optimize again |
-| Prefer certain areas | Import Excel grid with **weight** column → enable **Use estimation grid node weights** → Optimize again |
+| Prefer certain areas | Import a grid (Excel or point layer) with a **weight** column/field → enable **Use estimation grid node weights** → Optimize again |
 | Generated grid only | Grid-weight checkbox stays disabled (all nodes weight 1) |
 
 ### Gotchas
@@ -425,8 +469,9 @@ If Optimize is cleared (variogram/weights/grid change), Tab 5 prompts to run Opt
 - **Fit vs prediction:** a high R² on the variogram cloud is not enough — trust **cross-validation** (Tab 2 / Tab 5).  
 - **Euclidean distances** in the layer CRS: for geographic CRS (degrees), results are not true ground distances — prefer a projected CRS.  
 - Editing Tab 2 model/nugget/sill/range or Tab 3 grid / Tab 4 weight toggles often **invalidates** Optimize — re-run **Optimize** before trusting Tab 5.  
+- Unchecking a well on Tab 1 locks tabs 2–5 again and drops the Tab 3 grid — re-run **Next** → **Calculate grid** → **Optimize** so the excluded well is actually gone from the variogram, the grid's boundary, and the ranking, not just from the raw stats.  
 - Attribute table preview shows at most **500** rows, but Include still applies to the full layer.  
-- Excel grid XY must already match the wells CRS.  
+- Excel grid XY, and a point layer used as the grid, must already match the wells CRS (no reprojection).  
 - Alpha spinbox cannot go below **0.1** even though the tooltip mentions 0 = fully concave.
 
 ---

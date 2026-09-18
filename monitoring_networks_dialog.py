@@ -117,7 +117,6 @@ STATS_VALUE_HEADERS = (
 
 STATS_COL_ASYMMETRY = STATS_VALUE_COL_OFFSET + STAT_KEYS.index('asymmetry')
 STATS_COL_KURTOSIS = STATS_VALUE_COL_OFFSET + STAT_KEYS.index('kurtosis')
-STATS_TABLE_MAX_VISIBLE_ROWS = 5
 
 # Tab 2 distribution-shape highlight colors (skewness / excess kurtosis cells).
 STATS_SKEWNESS_BG_SYMMETRIC = QColor('#d5f5e3')      # light green
@@ -899,7 +898,51 @@ class MonitoringNetworksDialog(QDialog):
 
         load_grid_group.setLayout(load_grid_layout)
         layout.addWidget(load_grid_group)
-        
+
+        # Option to use a previously loaded point layer as the grid
+        load_grid_layer_group = QGroupBox(
+            QCoreApplication.translate(
+                "Tab 3", "Or Select a Previously Loaded Point Layer [Optional]"
+            )
+        )
+        load_grid_layer_layout = QGridLayout()
+
+        load_grid_layer_layout.addWidget(QLabel(
+            QCoreApplication.translate("Tab 3", "Point layer:")
+        ), 0, 0)
+        self.grid_source_layer_combo = QgsMapLayerComboBox()
+        self.grid_source_layer_combo.setFilters(QgsMapLayerProxyModel.PointLayer)
+        self.grid_source_layer_combo.setAllowEmptyLayer(True)
+        self.grid_source_layer_combo.setCurrentIndex(0)
+        self.grid_source_layer_combo.layerChanged.connect(
+            self._on_grid_source_layer_changed
+        )
+        load_grid_layer_layout.addWidget(self.grid_source_layer_combo, 0, 1)
+
+        load_grid_layer_layout.addWidget(QLabel(
+            QCoreApplication.translate("Tab 3", "Node weight field (optional):")
+        ), 1, 0)
+        self.grid_source_weight_field_combo = QgsFieldComboBox()
+        self.grid_source_weight_field_combo.setFilters(QgsFieldProxyModel.Numeric)
+        self.grid_source_weight_field_combo.setAllowEmptyFieldName(True)
+        load_grid_layer_layout.addWidget(self.grid_source_weight_field_combo, 1, 1)
+
+        self.load_grid_layer_btn = QPushButton(
+            QCoreApplication.translate("Tab 3", "Load layer as grid")
+        )
+        self.load_grid_layer_btn.setToolTip(
+            QCoreApplication.translate(
+                "Tab 3", "Uses every point feature of the selected layer as an estimation-grid node. An optional numeric field can supply per-node weights, same convention as the *.xlsx import."
+            )
+        )
+        self.load_grid_layer_btn.clicked.connect(self.load_grid_from_layer)
+        load_grid_layer_layout.addWidget(self.load_grid_layer_btn, 2, 1)
+
+        load_grid_layer_group.setLayout(load_grid_layer_layout)
+        layout.addWidget(load_grid_layer_group)
+        # Populate the weight-field combo for whatever layer is initially selected.
+        self._on_grid_source_layer_changed(self.grid_source_layer_combo.currentLayer())
+
         # Canvas for visualization
         self.grid_figure = Figure(figsize=(8, 6))
         self.grid_canvas = FigureCanvas(self.grid_figure)
@@ -966,7 +1009,7 @@ class MonitoringNetworksDialog(QDialog):
         )
         self.mn_use_grid_weights.setToolTip(
             QCoreApplication.translate(
-                "Tab 4", "Available after importing an estimation grid Excel on tab 3. Required columns in order: ID, X, Y. Optional 4th column: weight (used as per-node grid weight). Generated grids without an imported weight column cannot use this option."
+                "Tab 4", "Available after importing an estimation grid on tab 3 with a weight column, either from an Excel file (columns in order: ID, X, Y, weight) or from a point layer with a numeric weight field. Generated grids or grids without a weight column/field cannot use this option."
             )
         )
         self.mn_use_grid_weights.setEnabled(False)
@@ -1137,13 +1180,18 @@ class MonitoringNetworksDialog(QDialog):
             #TODO: add a delay after the user stops typing to allow 2 digits to be typed
         )
         wells_row.addWidget(self.results_well_spin)
+        wells_row.addStretch()
+        interp_layout.addLayout(wells_row)
+
+        # Download buttons for the selected-wells network (layers + files).
+        download_buttons_row = QHBoxLayout()
         self.save_selected_wells_btn = QPushButton(
             QCoreApplication.translate("Tab 5", "Download selected wells as layer")
         )
         self.save_selected_wells_btn.clicked.connect(
             self.save_selected_wells_as_layer
         )
-        wells_row.addWidget(self.save_selected_wells_btn)
+        download_buttons_row.addWidget(self.save_selected_wells_btn)
         self.save_interpolation_btn = QPushButton(
             QCoreApplication.translate("Tab 5", "Download interpolation as layer")
         )
@@ -1155,9 +1203,33 @@ class MonitoringNetworksDialog(QDialog):
         self.save_interpolation_btn.clicked.connect(
             self.save_ok_interpolation_as_layer
         )
-        wells_row.addWidget(self.save_interpolation_btn)
-        wells_row.addStretch()
-        interp_layout.addLayout(wells_row)
+        download_buttons_row.addWidget(self.save_interpolation_btn)
+        self.save_se_btn = QPushButton(
+            QCoreApplication.translate("Tab 5", "Download kriging standard error as layer")
+        )
+        self.save_se_btn.setToolTip(
+            QCoreApplication.translate(
+                "Tab 5", "Download the kriging standard error surface for the selected-wells network as a temporary raster layer. The raster resolution is based on the estimation grid spacing."
+            )
+        )
+        self.save_se_btn.clicked.connect(
+            self.save_ok_se_as_layer
+        )
+        download_buttons_row.addWidget(self.save_se_btn)
+        self.save_selected_cv_btn = QPushButton(
+            QCoreApplication.translate("Tab 5", "Download cross-validation details")
+        )
+        self.save_selected_cv_btn.setToolTip(
+            QCoreApplication.translate(
+                "Tab 5", "Export the leave-one-out cross-validation summary and details for the selected-wells network of the parameter shown on maps, as an Excel file."
+            )
+        )
+        self.save_selected_cv_btn.clicked.connect(
+            self.download_selected_wells_cross_validation
+        )
+        download_buttons_row.addWidget(self.save_selected_cv_btn)
+        download_buttons_row.addStretch()
+        interp_layout.addLayout(download_buttons_row)
 
         # Visibility-only controls: toggle existing widgets/artists, never re-krige.
         map_options_row = QHBoxLayout()
@@ -2980,7 +3052,18 @@ class MonitoringNetworksDialog(QDialog):
             raise
 
     def save_selected_wells_as_layer(self):
-        """Adds the Kalman-selected wells as a temporary point layer in QGIS."""
+        """
+        Adds the Kalman-selected wells as a temporary point layer in QGIS.
+
+        Attribute order: every field the source layer already has (used to
+        generate the well prioritization), followed by the computed fields
+        ``prioritization_rank``, ``total_variance_pct``, and one
+        ``predicted_<parameter>`` column per analyzed parameter (a single
+        column in single-parameter mode; one per selected parameter in
+        combined mode). Predicted values come from leave-one-out
+        cross-validation over the selected-wells network, same values shown
+        on the tab 5 "Selected wells" cross-validation table.
+        """
         title = QCoreApplication.translate("Tab 5", "Download selected wells as layer")
         context, error = self._get_ok_interpolation_context()
         if context is None:
@@ -3016,12 +3099,21 @@ class MonitoringNetworksDialog(QDialog):
         attr_name = context['attr_name']
         display_name = self._mn_parameter_display_name(attr_name)
         coordinates = context['coordinates']
-        values = context['values']
         point_ids = context.get('point_ids')
         selected_indices = selection_order[:n_use]
 
         results = self.variance_results[attr_name]
         total_variance = resolve_total_variance_series(results)
+
+        # Parameters whose predicted value gets its own column: every
+        # combined parameter in combined mode, otherwise just the one
+        # parameter being analyzed.
+        if self._is_combined_mn_parameter(attr_name):
+            export_parameters = self._selected_analysis_parameters()
+            reference_attribute = export_parameters[0] if export_parameters else attr_name
+        else:
+            export_parameters = [attr_name]
+            reference_attribute = attr_name
 
         self._set_progress(
             20,
@@ -3030,6 +3122,27 @@ class MonitoringNetworksDialog(QDialog):
             ),
         )
         try:
+            field_names, records_by_point_id = build_point_id_layer_attribute_map(
+                layer,
+                reference_attribute,
+                include_fids=self._included_well_fids_for_extract(),
+            )
+
+            # Leave-one-out CV predictions for the selected-wells network,
+            # one lookup (point_id -> predicted value) per analyzed parameter.
+            predicted_by_param = {}
+            for param_name in export_parameters:
+                cv_result, cv_point_ids, _cv_error = (
+                    self._compute_parameter_cross_validation(
+                        param_name, network_indices=selected_indices
+                    )
+                )
+                predicted_map = {}
+                if cv_result is not None and cv_point_ids is not None:
+                    for pid, row in zip(cv_point_ids, cv_result['rows']):
+                        predicted_map[str(pid)] = row.get('predicted')
+                predicted_by_param[param_name] = predicted_map
+
             crs = layer.crs()
             layer_name = QCoreApplication.translate(
                 "Tab 5", "Selected Monitoring Wells - {param}"
@@ -3040,14 +3153,21 @@ class MonitoringNetworksDialog(QDialog):
                 "memory",
             )
 
+            # Original layer fields first (same types as the source layer),
+            # then the computed prioritization / prediction columns. well_id
+            # is the stable 1..N sequential identifier used consistently on
+            # every plot, table and export in the plugin (never the layer's
+            # own id-like field or the provider's raw feature id).
             fields = QgsFields()
-            fields.append(QgsField('Well_ID', QVariant.String))
-            fields.append(QgsField('Prioritization_Rank', QVariant.Int))
-            fields.append(QgsField('Parameter', QVariant.String))
-            fields.append(QgsField('Measured', QVariant.Double))
-            fields.append(QgsField('Total_Variance_pct', QVariant.Double))
-            fields.append(QgsField('Coord_X', QVariant.Double))
-            fields.append(QgsField('Coord_Y', QVariant.Double))
+            for source_field in layer.fields():
+                fields.append(QgsField(source_field))
+            fields.append(QgsField('well_id', QVariant.Int))
+            fields.append(QgsField('prioritization_rank', QVariant.Int))
+            fields.append(QgsField('total_variance_pct', QVariant.Double))
+            for param_name in export_parameters:
+                fields.append(
+                    QgsField(f'predicted_{param_name}', QVariant.Double)
+                )
 
             temp_layer.dataProvider().addAttributes(fields)
             temp_layer.updateFields()
@@ -3066,20 +3186,29 @@ class MonitoringNetworksDialog(QDialog):
                     if rank < total_variance.size
                     else None
                 )
+                layer_attrs = records_by_point_id.get(well_id, {})
 
-                feature = QgsFeature()
+                try:
+                    well_id_value = int(well_id)
+                except (TypeError, ValueError):
+                    well_id_value = None
+
+                attr_values = [layer_attrs.get(name) for name in field_names]
+                attr_values.append(well_id_value)
+                attr_values.append(rank)
+                attr_values.append(total_var)
+                for param_name in export_parameters:
+                    predicted_val = predicted_by_param.get(param_name, {}).get(well_id)
+                    if predicted_val is not None and np.isfinite(predicted_val):
+                        attr_values.append(float(predicted_val))
+                    else:
+                        attr_values.append(None)
+
+                feature = QgsFeature(fields)
                 feature.setGeometry(
                     QgsGeometry.fromPointXY(QgsPointXY(float(coord[0]), float(coord[1])))
                 )
-                feature.setAttributes([
-                    well_id,
-                    rank,
-                    display_name,
-                    float(values[well_idx]),
-                    total_var,
-                    float(coord[0]),
-                    float(coord[1]),
-                ])
+                feature.setAttributes(attr_values)
                 features.append(feature)
 
             temp_layer.dataProvider().addFeatures(features)
@@ -3214,6 +3343,55 @@ class MonitoringNetworksDialog(QDialog):
                 vmin + 0.5 * (vmax - vmin), QColor(33, 145, 140)
             ),
             QgsColorRampShader.ColorRampItem(vmax, QColor(253, 231, 37)),
+        ])
+
+        shader = QgsRasterShader()
+        shader.setRasterShaderFunction(color_ramp)
+        renderer = QgsSingleBandPseudoColorRenderer(
+            raster_layer.dataProvider(), 1, shader
+        )
+        renderer.setClassificationMin(vmin)
+        renderer.setClassificationMax(vmax)
+        raster_layer.setRenderer(renderer)
+        raster_layer.triggerRepaint()
+
+    def _style_ok_se_raster(self, raster_layer, std_error):
+        """
+        Applies a continuous Reds-like color ramp to the kriging standard-error
+        raster, matching the ``cmap='Reds'`` used for the SE map inside the
+        plugin (tab 5) — kept visually distinct from the OK interpolation's
+        viridis ramp, same as on the in-app maps.
+        """
+        from qgis.core import (
+            QgsColorRampShader,
+            QgsRasterShader,
+            QgsSingleBandPseudoColorRenderer,
+        )
+
+        valid = np.asarray(std_error, dtype=float)
+        valid = valid[np.isfinite(valid)]
+        if valid.size == 0:
+            return
+
+        vmin = float(np.min(valid))
+        vmax = float(np.max(valid))
+        if vmin == vmax:
+            pad = max(abs(vmin) * 0.05, 0.5)
+            vmin -= pad
+            vmax += pad
+
+        # Approximate matplotlib/ColorBrewer "Reds" at low / mid / high values.
+        color_ramp = QgsColorRampShader()
+        color_ramp.setColorRampType(QgsColorRampShader.Interpolated)
+        color_ramp.setClassificationMode(QgsColorRampShader.Continuous)
+        color_ramp.setMinimumValue(vmin)
+        color_ramp.setMaximumValue(vmax)
+        color_ramp.setColorRampItemList([
+            QgsColorRampShader.ColorRampItem(vmin, QColor(255, 245, 240)),
+            QgsColorRampShader.ColorRampItem(
+                vmin + 0.5 * (vmax - vmin), QColor(251, 106, 74)
+            ),
+            QgsColorRampShader.ColorRampItem(vmax, QColor(103, 0, 13)),
         ])
 
         shader = QgsRasterShader()
@@ -3363,6 +3541,297 @@ class MonitoringNetworksDialog(QDialog):
                 title,
                 QCoreApplication.translate(
                     "Tab 5", "Could not create the interpolation layer:\n{error}\n{details}"
+                ).format(error=str(exc), details=traceback.format_exc()),
+            )
+
+    def save_ok_se_as_layer(self):
+        """
+        Adds the selected-wells kriging standard-error surface as a
+        temporary raster layer, for the parameter currently shown on maps.
+        """
+        title = QCoreApplication.translate(
+            "Tab 5", "Download kriging standard error as layer"
+        )
+        context, error = self._get_ok_interpolation_context()
+        if context is None:
+            QMessageBox.warning(self, title, error)
+            return
+
+        layer = self.input_data_layer.currentLayer()
+        if not layer:
+            QMessageBox.warning(
+                self,
+                title,
+                QCoreApplication.translate(
+                    "Tab 5", "No input point layer is selected."
+                ),
+            )
+            return
+
+        n_requested = self.results_well_spin.value()
+        selection_order = np.asarray(context['selection_order'], dtype=int)
+        n_use = min(n_requested, selection_order.size)
+        if n_use < 1:
+            QMessageBox.warning(
+                self,
+                title,
+                QCoreApplication.translate(
+                    "Tab 5", "No selected wells are available for interpolation."
+                ),
+            )
+            return
+
+        indices = selection_order[:n_use]
+        self._set_progress(
+            15,
+            QCoreApplication.translate(
+                "Tab 5", "State: Downloading standard error layer..."
+            ),
+        )
+        try:
+            _estimates, std_error = self._compute_ok_estimates_and_se(context, indices)
+        except Exception:
+            std_error = None
+
+        if std_error is None or std_error.size != context['grid'].shape[0]:
+            self._reset_progress(
+                QCoreApplication.translate("Tab 5", "State: Error")
+            )
+            QMessageBox.warning(
+                self,
+                title,
+                QCoreApplication.translate(
+                    "Tab 5", "Standard error could not be computed."
+                ),
+            )
+            return
+
+        self._set_progress(
+            50,
+            QCoreApplication.translate(
+                "Tab 5", "State: Building standard error raster..."
+            ),
+        )
+        nodata = -9999.0
+        raster, geotransform = self._ok_estimates_to_raster_grid(
+            context['grid'], std_error, nodata=nodata
+        )
+        if raster is None:
+            self._reset_progress(
+                QCoreApplication.translate("Tab 5", "State: Error")
+            )
+            QMessageBox.warning(
+                self,
+                title,
+                QCoreApplication.translate(
+                    "Tab 5", "Could not build a regular raster from the estimation grid. Use a rectangular or regularly spaced grid."
+                ),
+            )
+            return
+
+        # Layer name/band use the interpolated parameter, not "Parameters combined".
+        display_name = context.get('ok_parameter') or context['attr_name']
+        try:
+            from qgis.core import QgsRasterLayer
+
+            tif_path = self._write_temp_geotiff(
+                raster,
+                geotransform,
+                layer.crs(),
+                nodata=nodata,
+                band_description=QCoreApplication.translate(
+                    "Tab 5", "SE - {param}"
+                ).format(param=display_name),
+            )
+            layer_name = QCoreApplication.translate(
+                "Tab 5", "OK Standard Error - {param} ({n} wells)"
+            ).format(param=display_name, n=n_use)
+
+            raster_layer = QgsRasterLayer(tif_path, layer_name)
+            if not raster_layer.isValid():
+                self._reset_progress(
+                    QCoreApplication.translate("Tab 5", "State: Error")
+                )
+                QMessageBox.warning(
+                    self,
+                    title,
+                    QCoreApplication.translate(
+                        "Tab 5", "The temporary raster layer could not be loaded."
+                    ),
+                )
+                return
+
+            self._style_ok_se_raster(raster_layer, std_error)
+            QgsProject.instance().addMapLayer(raster_layer)
+
+            self._set_progress(
+                100,
+                QCoreApplication.translate("Tab 5", "State: Completed"),
+            )
+            QTimer.singleShot(1000, self._reset_progress)
+            QMessageBox.information(
+                self,
+                title,
+                QCoreApplication.translate(
+                    "Tab 5", "Saved the kriging standard error for «{param}» ({n} wells) as a temporary raster layer."
+                ).format(param=display_name, n=n_use),
+            )
+        except Exception as exc:
+            import traceback
+            self._reset_progress(
+                QCoreApplication.translate("Tab 5", "State: Error")
+            )
+            QMessageBox.warning(
+                self,
+                title,
+                QCoreApplication.translate(
+                    "Tab 5", "Could not create the standard error layer:\n{error}\n{details}"
+                ).format(error=str(exc), details=traceback.format_exc()),
+            )
+
+    def download_selected_wells_cross_validation(self):
+        """
+        Exports leave-one-out cross-validation summary + details for the
+        selected-wells network of the parameter currently shown on maps,
+        as an Excel file (same values as the tab 5 "Selected wells" CV
+        tables).
+        """
+        title = QCoreApplication.translate(
+            "Tab 5", "Download cross-validation details"
+        )
+        context, error = self._get_ok_interpolation_context()
+        if context is None:
+            QMessageBox.warning(
+                self,
+                title,
+                QCoreApplication.translate("Tab 5", "Error: {error}").format(error=str(error)),
+            )
+            return
+
+        n_requested = self.results_well_spin.value()
+        selection_order = np.asarray(context['selection_order'], dtype=int)
+        n_use = min(n_requested, selection_order.size)
+        if n_use < 1:
+            QMessageBox.warning(
+                self,
+                title,
+                QCoreApplication.translate(
+                    "Tab 5", "No selected wells are available for cross-validation."
+                ),
+            )
+            return
+        selected_indices = selection_order[:n_use]
+
+        cv_result, point_ids, cv_error = self._compute_parameter_cross_validation(
+            context['attr_name'], network_indices=selected_indices
+        )
+        if cv_result is None:
+            QMessageBox.warning(
+                self,
+                title,
+                cv_error or QCoreApplication.translate(
+                    "Tab 5", "Cross-validation could not be computed."
+                ),
+            )
+            return
+
+        if point_ids is None:
+            point_ids = context.get('point_ids')
+        if point_ids is None:
+            point_ids = [str(i) for i in range(len(cv_result['rows']))]
+
+        display_name = context.get('ok_parameter') or context['attr_name']
+        safe_param = str(display_name).replace(' ', '_')
+        default_name = f"cross_validation_{safe_param}_selected_{n_use}wells.xlsx"
+        file_path = self._prompt_save_xlsx(
+            QCoreApplication.translate("Tab 5", "Save cross-validation details"),
+            default_name,
+        )
+        if not file_path:
+            return
+
+        details_columns = [
+            'Well_ID', 'Included', 'Measured', 'Predicted', 'Error', 'SE', 'Standardized_Error',
+        ]
+        details_rows = []
+        for pid, row in zip(point_ids, cv_result['rows']):
+            details_rows.append({
+                'Well_ID': str(pid),
+                'Included': bool(row.get('included')),
+                'Measured': row.get('measured'),
+                'Predicted': row.get('predicted'),
+                'Error': row.get('error'),
+                'SE': row.get('se'),
+                'Standardized_Error': row.get('standardized_error'),
+            })
+
+        summary_columns = ['Metric', 'Value']
+        summary_export_labels = {
+            'min': 'Min_Error',
+            'max': 'Max_Error',
+            'mean': 'Mean_Error',
+            'mae': 'MAE',
+            'rmse': 'RMSE',
+            'ase': 'ASE',
+            'mse': 'MSE',
+            'rmsse': 'RMSSE',
+        }
+        summary_rows = []
+        summary_rows.append({'Metric': 'Parameter', 'Value': display_name})
+        summary_rows.append({'Metric': 'Network_Wells', 'Value': int(n_use)})
+        summary_rows.append({'Metric': 'Total_Points', 'Value': int(context['values'].size)})
+        for key in CV_SUMMARY_KEYS:
+            value = cv_result['summary'].get(key, np.nan)
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                number = np.nan
+            summary_rows.append({
+                'Metric': summary_export_labels[key],
+                'Value': number if np.isfinite(number) else '',
+            })
+
+        try:
+            # XlsxWriter export avoids openpyxl style-init crashes on some
+            # QGIS builds; see download_prioritization for the same pattern.
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                write_excel_sheets(
+                    file_path,
+                    [
+                        ('CV_Summary', summary_columns, summary_rows),
+                        ('CV_Details', details_columns, details_rows),
+                    ],
+                )
+            finally:
+                QApplication.restoreOverrideCursor()
+            QMessageBox.information(
+                self,
+                title,
+                QCoreApplication.translate(
+                    "Tab 5", "Cross-validation details saved to:\n{path}"
+                ).format(path=file_path),
+            )
+        except ImportError:
+            QMessageBox.warning(
+                self,
+                title,
+                QCoreApplication.translate(
+                    "Tab 5",
+                    "XlsxWriter is required to export Excel files. Automatic "
+                    "installation was attempted and did not succeed (see the "
+                    "QGIS Log Messages panel, 'Monitoring Networks' tab, for "
+                    "details). Install it manually in the QGIS Python "
+                    "environment (pip install XlsxWriter) and try again."
+                ),
+            )
+        except Exception as exc:
+            import traceback
+            QMessageBox.warning(
+                self,
+                title,
+                QCoreApplication.translate(
+                    "Tab 5", "Could not save the Excel file:\n{error}\n{details}"
                 ).format(error=str(exc), details=traceback.format_exc()),
             )
 
@@ -3516,15 +3985,19 @@ class MonitoringNetworksDialog(QDialog):
             if hasattr(self, 'input_data_layer')
             else None
         )
-        if not layer or self._included_well_fids is None:
+        # getattr guards callers that can run before __init__ has reached the
+        # line that sets self._included_well_fids (e.g. setup_grid_tab's
+        # initial _apply_default_node_spacing call during dialog construction).
+        included_well_fids = getattr(self, '_included_well_fids', None)
+        if not layer or included_well_fids is None:
             return None
 
         all_fids = self._all_layer_feature_ids(layer)
         if not all_fids:
             return None
-        if self._included_well_fids >= all_fids:
+        if included_well_fids >= all_fids:
             return None
-        return set(self._included_well_fids)
+        return set(included_well_fids)
 
     def _set_layer_fields_include_checks(self, checked):
         """Updates visible Include checkboxes without emitting reset signals."""
@@ -3578,10 +4051,28 @@ class MonitoringNetworksDialog(QDialog):
 
     def _on_included_wells_changed(self):
         """
-        Clears Tab 2 / 4 / 5 results after the included-well set changes.
+        Fully invalidates every downstream result after the included-well
+        set changes (individual checkbox, or Select/Deselect all).
+
+        Excluding a well must remove its influence everywhere, not just from
+        the raw stats/variogram extraction:
+          - Stats, variogram, cross-validation and optimization caches are
+            cleared (same as before).
+          - The Tab 3 estimation grid is cleared too: its concave-hull
+            boundary was built from well positions, so a grid calculated
+            before the change would still extend to cover deselected wells'
+            locations (and Optimize would keep evaluating variance there)
+            until it is regenerated.
+          - The nearest-neighbor stats (Avg D) that drive the Tab 2 default
+            lag size and the Tab 3 default node spacing are recomputed from
+            only the currently included wells.
+          - Tabs 2-5 are locked again, same as changing the input layer, so
+            the guided workflow (Next -> recalculate) must be redone with
+            the corrected well set before any stale, wider-scope result can
+            be reused.
 
         Does not clear Tab 1 attribute selection; the user recalculates
-        geostatistics on Tab 2 as usual.
+        geostatistics via Next as usual.
         """
         self._cached_layer = None
         self._cached_attribute = None
@@ -3604,6 +4095,29 @@ class MonitoringNetworksDialog(QDialog):
         self._update_mn_grid_weight_info()
         self._clear_stats_plots()
         self._clear_cross_validation()
+
+        # The estimation grid's hull boundary depends on well positions
+        # (including deselected ones, until regenerated) — drop it so a
+        # stale grid can't keep evaluating variance around excluded wells.
+        self._clear_estimation_grid()
+
+        # Avg D (nearest-neighbor stats) and the defaults derived from it
+        # (Tab 2 lag-size choices, Tab 3 default node spacing) must reflect
+        # only the wells still included, same as a fresh layer selection.
+        layer = (
+            self.input_data_layer.currentLayer()
+            if hasattr(self, 'input_data_layer')
+            else None
+        )
+        self._refresh_ann_for_layer(layer)
+        self._apply_default_node_spacing(layer)
+        if hasattr(self, 'update_estimated_points'):
+            self.update_estimated_points()
+
+        # Force the guided workflow to be redone (Next -> Tab 2 -> Calculate
+        # grid -> Optimize) so no tab can show results computed before the
+        # well set changed. Mirrors what changing the input layer already does.
+        self._set_workflow_tabs_locked()
 
     def _refresh_layer_fields_table(self, layer, max_rows=500):
         """Fills the tab 1 table with Include checkboxes and attribute values."""
@@ -4219,7 +4733,9 @@ class MonitoringNetworksDialog(QDialog):
         Grid weights can be used when the grid was imported with a weight column.
         """
         grid_info = getattr(self, 'current_grid_info', None)
-        if not grid_info or grid_info.get('grid_type') != 'imported_from_xlsx':
+        if not grid_info or grid_info.get('grid_type') not in (
+            'imported_from_xlsx', 'imported_from_layer',
+        ):
             return False
         return self._get_current_grid_weights() is not None
 
@@ -5174,7 +5690,9 @@ class MonitoringNetworksDialog(QDialog):
             and self.mn_use_grid_weights.isChecked()
         )
 
-        # Layer attributes first; prioritization metrics appended .
+        # Well_ID (the stable 1..N sequential identifier, same one shown on
+        # every plot/table) first, then the original layer attributes, then
+        # the computed prioritization metrics.
         prioritization_suffix_columns = [
             'Priority',
             'Parameter',
@@ -5184,7 +5702,7 @@ class MonitoringNetworksDialog(QDialog):
             'Use_Well_Weight',
             'Use_Grid_Weight',
         ]
-        prioritization_columns = field_names + prioritization_suffix_columns
+        prioritization_columns = ['Well_ID'] + field_names + prioritization_suffix_columns
 
         prioritization_rows = []
         for rank, well_idx in enumerate(selection_order, start=1):
@@ -5204,6 +5722,10 @@ class MonitoringNetworksDialog(QDialog):
                 for field_name in field_names
             }
             # Prioritization columns override any same-named layer fields.
+            try:
+                row['Well_ID'] = int(well_id)
+            except (TypeError, ValueError):
+                row['Well_ID'] = well_id
             row['Priority'] = rank
             row['Parameter'] = parameter_label
             row['Variance'] = float(total_variance[rank])
@@ -5942,6 +6464,7 @@ class MonitoringNetworksDialog(QDialog):
 
     def _stats_table_estimated_viewport_width(self, row_count):
         """Estimate stats_table viewport width before the first layout pass."""
+        del row_count  # kept for call-site compatibility; unused (see body)
         table = self.stats_table
         width = table.viewport().width()
         if width > 0:
@@ -5958,8 +6481,9 @@ class MonitoringNetworksDialog(QDialog):
         width -= 2 * table.frameWidth()
         if table.verticalHeader().isVisible():
             width -= table.verticalHeader().width()
-        if row_count > STATS_TABLE_MAX_VISIBLE_ROWS:
-            width -= table.verticalScrollBar().sizeHint().width()
+        # The table always sizes to fit every row (no internal vertical
+        # scrollbar — see _adjust_stats_table_height), so its width is never
+        # narrowed by one.
         return max(width, 0)
 
     def _stats_table_horizontal_scrollbar_height(self, row_count):
@@ -6028,9 +6552,12 @@ class MonitoringNetworksDialog(QDialog):
             if row_count == 0:
                 height = header_height + frame + 4
             else:
-                visible_rows = min(row_count, STATS_TABLE_MAX_VISIBLE_ROWS)
+                # Every row counts, never just a capped "visible" subset —
+                # the table always sizes to fit ALL of its rows (no internal
+                # vertical scrollbar), so every analyzed parameter is shown
+                # at once and the outer tab scroll area handles overflow.
                 rows_height = sum(
-                    table.rowHeight(row) for row in range(visible_rows)
+                    table.rowHeight(row) for row in range(row_count)
                 )
                 height = header_height + rows_height + frame
                 content_width = table.horizontalHeader().length()
@@ -6056,7 +6583,12 @@ class MonitoringNetworksDialog(QDialog):
             self._adjusting_stats_table_height = False
 
     def _adjust_stats_table_height(self):
-        """Set stats_table height to fit visible rows and reserve scrollbar space."""
+        """
+        Set stats_table height to fit every row (plus scrollbar space when
+        needed), so all analyzed parameters are always visible without an
+        internal vertical scrollbar — only the tab's own outer scroll area
+        scrolls when the table (or the rest of the tab) grows tall.
+        """
         if getattr(self, '_adjusting_stats_table_height', False):
             return
         if not hasattr(self, 'stats_table'):
@@ -6077,20 +6609,19 @@ class MonitoringNetworksDialog(QDialog):
             frame = table.frameWidth() * 2
             row_count = table.rowCount()
 
+            # Never show an internal vertical scrollbar: the table is always
+            # sized to fit every parameter row, so nothing needs it, and a
+            # nested scrollbar inside the tab's own scroll area is exactly
+            # what made rows look "half hidden" before.
+            table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
             if row_count == 0:
                 height = header_height + frame + 4
-                table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
             else:
-                visible_rows = min(row_count, STATS_TABLE_MAX_VISIBLE_ROWS)
                 rows_height = sum(
-                    table.rowHeight(row) for row in range(visible_rows)
+                    table.rowHeight(row) for row in range(row_count)
                 )
                 height = header_height + rows_height + frame
-                if row_count <= STATS_TABLE_MAX_VISIBLE_ROWS:
-                    table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-                else:
-                    table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-
                 height += self._stats_table_horizontal_scrollbar_height(
                     row_count
                 )
@@ -6683,13 +7214,27 @@ class MonitoringNetworksDialog(QDialog):
         )
 
     def _layer_coordinates_for_ann(self, layer=None):
-        """Extract point coordinates from the input layer for ANN."""
+        """
+        Extract point coordinates from the currently included wells, for ANN.
+
+        Deselected (Tab 1 Include unchecked) wells are excluded, same as
+        every other extraction in the plugin — otherwise Avg D (and the
+        Tab 2 default lag size / Tab 3 default node spacing derived from it)
+        would keep reflecting wells the user asked to discriminate out.
+        """
         if layer is None and hasattr(self, 'input_data_layer'):
             layer = self.input_data_layer.currentLayer()
         if layer is None:
             return None
+        include_fids = (
+            self._included_well_fids_for_extract()
+            if hasattr(self, '_included_well_fids_for_extract')
+            else None
+        )
         coords = []
         for feature in layer.getFeatures():
+            if include_fids is not None and feature.id() not in include_fids:
+                continue
             geom = feature.geometry()
             if geom is None or geom.isEmpty() or geom.isMultipart():
                 continue
@@ -8299,6 +8844,179 @@ class MonitoringNetworksDialog(QDialog):
                 title,
                 QCoreApplication.translate(
                     "Tab 3", "Failed to load grid:\n{error}\n{details}"
+                ).format(error=str(e), details=traceback.format_exc()),
+            )
+
+    def _on_grid_source_layer_changed(self, layer):
+        """Points the tab-3 grid weight-field combo at the newly picked layer."""
+        if not hasattr(self, 'grid_source_weight_field_combo'):
+            return
+        self.grid_source_weight_field_combo.setLayer(layer)
+
+    def load_grid_from_layer(self):
+        """
+        Load the estimation grid from a previously loaded point layer.
+
+        Uses every point feature of the selected layer as a grid node. An
+        optional numeric field on that layer supplies per-node weights,
+        using the same convention as the *.xlsx import: when any weight is
+        present, missing/invalid cells default to 1.0.
+        """
+        title = QCoreApplication.translate("Tab 3", "Load layer as grid")
+
+        try:
+            layer = self.grid_source_layer_combo.currentLayer()
+            if not layer:
+                QMessageBox.warning(
+                    self,
+                    title,
+                    QCoreApplication.translate(
+                        "Tab 3", "Select a point layer to use as the estimation grid."
+                    ),
+                )
+                return
+
+            if QgsWkbTypes.geometryType(layer.wkbType()) != QgsWkbTypes.PointGeometry:
+                QMessageBox.warning(
+                    self,
+                    title,
+                    QCoreApplication.translate(
+                        "Tab 3", "The selected layer must be a point layer."
+                    ),
+                )
+                return
+
+            weight_field = self.grid_source_weight_field_combo.currentField()
+            weight_index = layer.fields().indexOf(weight_field) if weight_field else -1
+
+            self._set_progress(
+                10,
+                QCoreApplication.translate(
+                    "Tab 3", "State: Importing estimation grid from layer..."
+                ),
+            )
+
+            ids = []
+            xs = []
+            ys = []
+            row_weights = []
+
+            for feature in layer.getFeatures():
+                geom = feature.geometry()
+                if not geom or geom.isEmpty():
+                    continue
+                point = geom.asPoint()
+                x_f = float(point.x())
+                y_f = float(point.y())
+                if not np.isfinite(x_f) or not np.isfinite(y_f):
+                    continue
+
+                weight_val = None
+                if weight_index >= 0:
+                    raw_weight = feature[weight_field]
+                    if raw_weight is not None and not (
+                        isinstance(raw_weight, QVariant) and raw_weight.isNull()
+                    ):
+                        try:
+                            w_f = float(raw_weight)
+                            if np.isfinite(w_f):
+                                weight_val = w_f
+                        except (ValueError, TypeError):
+                            pass
+
+                ids.append(feature.id())
+                xs.append(x_f)
+                ys.append(y_f)
+                row_weights.append(weight_val)
+
+            if not ids:
+                self._reset_progress()
+                QMessageBox.warning(
+                    self,
+                    title,
+                    QCoreApplication.translate(
+                        "Tab 3", "The selected layer has no usable point features."
+                    ),
+                )
+                return
+
+            self._set_progress(
+                50,
+                QCoreApplication.translate(
+                    "Tab 3", "State: Parsing grid points..."
+                ),
+            )
+
+            xs = np.asarray(xs, dtype=float)
+            ys = np.asarray(ys, dtype=float)
+            grid_points = np.column_stack([xs, ys])
+            n_nodes = grid_points.shape[0]
+
+            has_weights = any(weight is not None for weight in row_weights)
+            weights = None
+            if has_weights:
+                weights = np.asarray(
+                    [weight if weight is not None else 1.0 for weight in row_weights],
+                    dtype=float,
+                )
+
+            # Save grid information for workflow integration. 'imported_from_layer'
+            # is treated the same as 'imported_from_xlsx' for grid-weight availability.
+            self.current_grid_info = {
+                'grid_points': grid_points,
+                'n_nodes': n_nodes,
+                'ids': np.asarray(ids),
+                'grid_type': "imported_from_layer",
+                'buffer': 0.0,
+                'n_x': None,  # unknown for a layer-derived grid
+                'n_y': None,
+            }
+            if has_weights:
+                self.current_grid_info['weights'] = weights
+                self.current_ceg_values = weights
+            else:
+                self.current_ceg_values = None
+
+            self.current_grid_points = grid_points
+            self.grid_type_saved = QCoreApplication.translate(
+                "Tab 3", "Imported from layer"
+            )
+
+            self._update_mn_grid_weight_info()
+
+            # Plot on Tab 3 (Estimation Grid Visualization)
+            self._draw_imported_estimation_grid(xs, ys, weights)
+
+            if has_weights:
+                success_message = QCoreApplication.translate(
+                    "Tab 3", "Grid loaded successfully with {count} points from layer «{layer}» (with node weights)."
+                ).format(count=n_nodes, layer=layer.name())
+            else:
+                success_message = QCoreApplication.translate(
+                    "Tab 3", "Grid loaded successfully with {count} points from layer «{layer}» (no node weights)."
+                ).format(count=n_nodes, layer=layer.name())
+
+            self._set_progress(
+                100,
+                QCoreApplication.translate("Tab 3", "State: Completed"),
+            )
+            QTimer.singleShot(1500, self._reset_progress)
+            self._update_workflow_navigation_state()
+            QMessageBox.information(
+                self,
+                title,
+                success_message,
+            )
+        except Exception as e:
+            import traceback
+            self._reset_progress(
+                QCoreApplication.translate("Tab 3", "State: Error")
+            )
+            QMessageBox.warning(
+                self,
+                title,
+                QCoreApplication.translate(
+                    "Tab 3", "Failed to load grid from layer:\n{error}\n{details}"
                 ).format(error=str(e), details=traceback.format_exc()),
             )
 

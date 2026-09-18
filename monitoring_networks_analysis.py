@@ -211,6 +211,57 @@ def extract_layer_coordinates(layer, include_fids=None):
         return None
 
 
+def assign_sequential_point_ids(layer):
+    """
+    Assigns a stable sequential well number 1..N to every feature in the
+    layer, where N is the TOTAL number of features currently loaded in it.
+
+    The number is a pure position among ALL of the layer's features — it
+    never depends on any attribute of the layer (no "id"-like field is
+    read) and never depends on the provider's internal ``feature.id()``
+    value (which can start at 0, skip numbers, or differ between
+    providers). ``feature.id()`` is used ONLY to sort features into a
+    deterministic, reproducible order before numbering; the numbers handed
+    out are always 1, 2, 3, ... N.
+
+    This is the single source of truth for the well identifier shown and
+    exported everywhere in the plugin (plots, tables, cross-validation
+    details, prioritization order, layer/Excel exports), so the same well
+    always carries the same number across every tab and every analyzed
+    parameter.
+
+    Deliberately independent of Tab 1's "Include" checkboxes: the numbering
+    always covers the FULL layer, not just the currently-included wells.
+    Deselecting a well does not shrink N or renumber anything else — that
+    well's number simply stops appearing (a gap) in analyses/exports while
+    it is excluded, and comes back with its original number if it is
+    re-included later. This way a given well keeps the same identity ("well
+    7") no matter what else is selected at any point in time; callers that
+    need to filter to only the included wells do so separately (see
+    ``include_fids`` on ``extract_point_records_from_layer`` and
+    ``build_point_id_layer_attribute_map``), after the numbering below has
+    already been fixed.
+
+    Args:
+        layer: QgsVectorLayer with point geometries.
+
+    Returns:
+        dict mapping ``feature.id() -> sequential_id`` (int, starting at 1).
+        Empty dict when the layer is invalid or has no features.
+    """
+    try:
+        from qgis.core import QgsVectorLayer
+
+        if not isinstance(layer, QgsVectorLayer):
+            return {}
+
+        fids = [feature.id() for feature in layer.getFeatures()]
+        fids.sort()
+        return {fid: seq for seq, fid in enumerate(fids, start=1)}
+    except Exception:
+        return {}
+
+
 def apply_value_transform(values, transform='none'):
     """
     Applies a transformation to an array of values.
@@ -302,6 +353,13 @@ def resolve_point_id_field(layer, attribute):
 
     Prefers common identifier field names; skips the analysis attribute.
     Returns None when no dedicated ID field is found (fid is used).
+
+    Kept only so a layer's own "id"-like column (e.g. CVE, POZO) can still
+    be shown or exported as a plain reference attribute. It is no longer
+    used to build the well identifier shown in plots/tables/exports — that
+    identifier always comes from ``assign_sequential_point_ids`` instead,
+    so labeling stays consistent everywhere and never depends on this field
+    existing.
     """
     from qgis.core import QgsVectorLayer
 
@@ -366,13 +424,28 @@ def extract_point_records_from_layer(
     """
     Extracts point IDs, coordinates, values and optional well weights.
 
+    Point IDs are always the stable sequential well number (1..N, N = total
+    features in the layer) from ``assign_sequential_point_ids`` — the same
+    scheme used everywhere else in the plugin — so a well keeps the same
+    displayed/exported identifier across every parameter, tab and Tab 1
+    inclusion state, and the numbering never depends on any "id"-like layer
+    field or on the provider's raw ``feature.id()``. ``id_field`` is
+    accepted for backward compatibility with existing call sites but is
+    otherwise unused.
+
     Args:
         include_fids: optional set of feature IDs to keep; None keeps all.
-            Unchecked wells on Tab 1 are excluded before null/value filtering.
+            Unchecked wells on Tab 1 are excluded before null/value
+            filtering. This only removes rows from the result — it never
+            changes the sequential number assigned to any well, so
+            deselecting a well leaves a gap (its number is simply absent
+            from ``point_ids``) instead of shifting the remaining wells'
+            numbers down.
 
     Returns:
         tuple: (point_ids, coordinates, values, null_count, well_weights)
-        well_weights are 1.0 when no weight field is available.
+        well_weights are 1.0 when no weight field is available. point_ids
+        are strings holding the sequential well number ("1", "2", ...).
     """
     try:
         from qgis.core import QgsVectorLayer
@@ -385,9 +458,7 @@ def extract_point_records_from_layer(
         if field_index == -1:
             return None, None, None, 0, None
 
-        if id_field is None:
-            id_field = resolve_point_id_field(layer, attribute)
-        id_index = layer.fields().indexOf(id_field) if id_field else -1
+        sequential_ids = assign_sequential_point_ids(layer)
 
         if weight_field is None:
             weight_field = resolve_well_weight_field(layer, attribute)
@@ -423,16 +494,8 @@ def extract_point_records_from_layer(
                 null_count += 1
                 continue
 
-            if id_index >= 0:
-                raw_id = feature[id_field]
-                if raw_id is None or (
-                    isinstance(raw_id, QVariant) and raw_id.isNull()
-                ):
-                    point_id = str(feature.id())
-                else:
-                    point_id = str(raw_id)
-            else:
-                point_id = str(feature.id())
+            seq_id = sequential_ids.get(feature.id())
+            point_id = str(seq_id) if seq_id is not None else str(feature.id())
 
             weight = 1.0
             if weight_index >= 0:
@@ -468,8 +531,12 @@ def build_point_id_layer_attribute_map(layer, attribute, include_fids=None):
     """
     Map point ID strings to full layer attribute dicts for valid analysis points.
 
-    Uses the same point-ID assignment and attribute validity rules as
-    ``extract_point_records_from_layer`` so export rows align with optimization.
+    Uses the same sequential well-numbering scheme as
+    ``extract_point_records_from_layer`` (via ``assign_sequential_point_ids``)
+    so export rows align with optimization, plots and every other table.
+    The numbering always covers the full layer, so a deselected well's
+    number is simply absent from this map rather than reassigned to
+    another well.
 
     Args:
         include_fids: optional set of feature IDs to keep; None keeps all.
@@ -496,8 +563,7 @@ def build_point_id_layer_attribute_map(layer, attribute, include_fids=None):
         if field_index == -1:
             return [], {}
 
-        id_field = resolve_point_id_field(layer, attribute)
-        id_index = fields.indexOf(id_field) if id_field else -1
+        sequential_ids = assign_sequential_point_ids(layer)
 
         records_by_point_id = {}
         for feature in layer.getFeatures():
@@ -517,16 +583,8 @@ def build_point_id_layer_attribute_map(layer, attribute, include_fids=None):
             except (ValueError, TypeError):
                 continue
 
-            if id_index >= 0:
-                raw_id = feature[id_field]
-                if raw_id is None or (
-                    isinstance(raw_id, QVariant) and raw_id.isNull()
-                ):
-                    point_id = str(feature.id())
-                else:
-                    point_id = str(raw_id)
-            else:
-                point_id = str(feature.id())
+            seq_id = sequential_ids.get(feature.id())
+            point_id = str(seq_id) if seq_id is not None else str(feature.id())
 
             records_by_point_id[point_id] = {
                 name: feature[name] for name in field_names
